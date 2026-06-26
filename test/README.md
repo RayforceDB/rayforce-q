@@ -56,14 +56,12 @@ server address. Each `.rfl` file runs under a fresh runtime, so handles and
 | --------------------- | ---------------------------------------------------------- |
 | `01_connection.rfl`   | connect / send / close lifecycle, closed-handle + dead-port errors |
 | `02_atoms.rfl`        | long/int/short, float/real, bool, byte, char, symbol atoms |
-| `03_vectors.rfl`      | int/float/bool/byte/symbol/char vectors, lengths           |
-| `04_collections.rfl`  | general list, tables (whole-value), dict (known divergence) |
+| `03_vectors.rfl`      | int/float/bool/byte/symbol/char vectors, lengths, large (100k) response |
+| `04_collections.rfl`  | general list, tables (whole-value), native dict            |
 | `05_temporal.rfl`     | date / time / timestamp (epoch + width compatibility)      |
 | `06_errors.rfl`       | server-side error decode (`-128`), post-error reuse        |
+| `07_auth.rfl`         | login with credentials, wrong-password + no-credentials rejection |
+| `08_nulls.rfl`        | typed null atoms / nulls in vectors, empty typed vectors   |
 
-### Known divergence
-
-A KDB+ **dict** decodes as `RAY_LIST + ATTR_DICT` (a 2-element `(keys values)`
-list) rather than a native rayforce dict — the same limitation the Python
-binding marks `xfail`. `04_collections.rfl` asserts the actual decoded shape so
-a future native-dict fix will trip the test.
+The auth tests need a second q started with `-u`; `run_tests.sh` handles both
+servers and injects `kxhost`/`kxport`/`kxauthport`/`kxuser`/`kxpass`.

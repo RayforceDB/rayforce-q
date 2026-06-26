@@ -12,12 +12,15 @@
 #include "table/sym.h" /* RAY_SYM_W64 */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 /* Two helpers the rayforce core public header does not (yet) export. Defined
@@ -90,28 +93,7 @@ typedef struct {
   uint32_t size;
 } kdb_header_t;
 
-#define KDB_MAX_CONNS 256
-static int kdb_conn_fd[KDB_MAX_CONNS];
-static int kdb_conn_init = 0;
-
-static void kdb_init_table(void) {
-  if (kdb_conn_init)
-    return;
-  for (int i = 0; i < KDB_MAX_CONNS; i++)
-    kdb_conn_fd[i] = -1;
-  kdb_conn_init = 1;
-}
-
-static int kdb_alloc_slot(int fd) {
-  kdb_init_table();
-  for (int i = 0; i < KDB_MAX_CONNS; i++) {
-    if (kdb_conn_fd[i] == -1) {
-      kdb_conn_fd[i] = fd;
-      return i;
-    }
-  }
-  return -1;
-}
+#define KDB_LITTLE_ENDIAN 1
 
 static void kx_set_err(char *err, size_t errlen, const char *msg) {
   if (err != NULL && errlen > 0)
@@ -181,7 +163,47 @@ static ssize_t kdb_send_all(int fd, const void *buf, size_t n) {
   return (ssize_t)total;
 }
 
-static int kdb_open_socket(const char *host, int port) {
+/* Connect one address with an optional timeout (ms). 0/negative blocks.
+ * Returns 0 on success, -1 on plain failure, -2 on timeout. */
+static int kdb_connect_one(const struct addrinfo *p, int timeout_ms, int fd) {
+  if (timeout_ms <= 0)
+    return connect(fd, p->ai_addr, p->ai_addrlen) == 0 ? 0 : -1;
+
+  int flags = fcntl(fd, F_GETFL, 0);
+  if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
+    return -1;
+
+  int rc = connect(fd, p->ai_addr, p->ai_addrlen);
+  if (rc == 0) {
+    fcntl(fd, F_SETFL, flags);
+    return 0;
+  }
+  if (errno != EINPROGRESS)
+    return -1;
+
+  struct pollfd pfd = {.fd = fd, .events = POLLOUT};
+  int pr;
+  do {
+    pr = poll(&pfd, 1, timeout_ms);
+  } while (pr < 0 && errno == EINTR);
+  if (pr == 0)
+    return -2; /* timeout */
+  if (pr < 0)
+    return -1;
+
+  int soerr = 0;
+  socklen_t slen = sizeof soerr;
+  if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &slen) < 0 || soerr != 0)
+    return -1;
+
+  fcntl(fd, F_SETFL, flags); /* back to blocking */
+  return 0;
+}
+
+/* Open a TCP connection. *timed_out is set when the failure was a timeout. */
+static int kdb_open_socket(const char *host, int port, int timeout_ms,
+                           int *timed_out) {
+  *timed_out = 0;
   char service[16];
   snprintf(service, sizeof(service), "%d", port);
 
@@ -194,17 +216,33 @@ static int kdb_open_socket(const char *host, int port) {
     return -1;
 
   int fd = -1;
+  int any_timeout = 0;
   for (struct addrinfo *p = res; p != NULL; p = p->ai_next) {
     fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
     if (fd < 0)
       continue;
-    if (connect(fd, p->ai_addr, p->ai_addrlen) == 0)
+    int rc = kdb_connect_one(p, timeout_ms, fd);
+    if (rc == 0)
       break;
+    if (rc == -2)
+      any_timeout = 1;
     close(fd);
     fd = -1;
   }
   freeaddrinfo(res);
+  if (fd < 0)
+    *timed_out = any_timeout;
   return fd;
+}
+
+/* Apply a send/recv timeout (ms) to a connected socket. */
+static void kdb_set_timeout(int fd, int timeout_ms) {
+  if (timeout_ms <= 0)
+    return;
+  struct timeval tv = {.tv_sec = timeout_ms / 1000,
+                       .tv_usec = (timeout_ms % 1000) * 1000};
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
 }
 
 /* ================================================================
@@ -843,15 +881,21 @@ static ray_t *kdb_des_obj(uint8_t **buf, int64_t *len) {
       ray_release(keys);
       return vals;
     }
-    /* Plain dict — represent as RAY_LIST + RAY_ATTR_DICT. */
-    ray_t *dict = ray_list_new(0);
-    dict = ray_list_append(dict, keys);
-    ray_release(keys); /* append retains; drop our ref */
-    dict = ray_list_append(dict, vals);
-    ray_release(vals);
-    if (dict && !RAY_IS_ERR(dict))
-      dict->attrs |= RAY_ATTR_DICT;
-    return dict;
+    /* A plain dict (e.g. `a`b!1 2) becomes a native rayforce dict. A keyed
+     * table arrives as a dict whose key and value are both tables; rayforce
+     * has no keyed-table type here, so keep that as a 2-element
+     * RAY_LIST + ATTR_DICT (key-table, value-table). */
+    if (keys->type == RAY_TABLE && vals->type == RAY_TABLE) {
+      ray_t *kt = ray_list_new(0);
+      kt = ray_list_append(kt, keys);
+      ray_release(keys); /* append retains; drop our ref */
+      kt = ray_list_append(kt, vals);
+      ray_release(vals);
+      if (kt && !RAY_IS_ERR(kt))
+        kt->attrs |= RAY_ATTR_DICT;
+      return kt;
+    }
+    return ray_dict_new(keys, vals); /* consumes both refs */
   }
 
   case KDB_ERR: {
@@ -863,7 +907,10 @@ static ray_t *kdb_des_obj(uint8_t **buf, int64_t *len) {
       i++;
     if (i == *len)
       return ray_error("kdb: malformed error frame", NULL);
-    return ray_error(s, NULL);
+    /* Put the q error text in both the code (short, shown by ray_fmt) and the
+     * message (full), so bindings reading the message field get the whole
+     * string even though the displayed code is length-capped. */
+    return ray_error(s, "%s", s);
   }
 
   default:
@@ -944,121 +991,186 @@ static int kdb_decompress(const uint8_t *src, int64_t src_len,
  * Public entry points (see kx.h)
  * ================================================================ */
 
-int kx_connect(const char *host, int port) {
-  int fd = kdb_open_socket(host, port);
+int kx_connect(const char *host, int port, const char *user,
+               const char *password, int timeout_ms) {
+  int timed_out = 0;
+  int fd = kdb_open_socket(host, port, timeout_ms, &timed_out);
   if (fd < 0)
-    return KX_ERR_SOCKET;
+    return timed_out ? KX_ERR_TIMEOUT : KX_ERR_SOCKET;
 
-  /* KDB+ handshake: send {0x03, 0x00}, read 1 byte. */
-  uint8_t hello[2] = {0x03, 0x00};
-  if (kdb_send_all(fd, hello, 2) < 0 || kdb_recv_all(fd, hello, 1) < 0) {
+  kdb_set_timeout(fd, timeout_ms);
+
+  /* KDB+ login: send "user:password" + capability byte (0x03) + 0x00, then
+   * read one capability byte back. A server that rejects the credentials
+   * closes the socket, so the read fails -> KX_ERR_HANDSHAKE. Empty
+   * credentials degrade to the original no-auth handshake ({0x03, 0x00}). */
+  size_t ulen = user ? strlen(user) : 0;
+  size_t plen = password ? strlen(password) : 0;
+  size_t creds = ulen + (plen ? 1 + plen : 0);
+  uint8_t stackbuf[256];
+  uint8_t *login = stackbuf;
+  if (creds + 2 > sizeof stackbuf) {
+    login = (uint8_t *)malloc(creds + 2);
+    if (login == NULL) {
+      close(fd);
+      return KX_ERR_HANDSHAKE;
+    }
+  }
+  size_t off = 0;
+  if (ulen) {
+    memcpy(login + off, user, ulen);
+    off += ulen;
+    if (plen) {
+      login[off++] = ':';
+      memcpy(login + off, password, plen);
+      off += plen;
+    }
+  }
+  login[off++] = 0x03; /* capability: compression + timestamp + GUID + ... */
+  login[off++] = 0x00;
+
+  int sent_ok = kdb_send_all(fd, login, off) >= 0;
+  if (login != stackbuf)
+    free(login);
+
+  uint8_t cap;
+  if (!sent_ok || kdb_recv_all(fd, &cap, 1) < 0) {
     close(fd);
     return KX_ERR_HANDSHAKE;
   }
-
-  int slot = kdb_alloc_slot(fd);
-  if (slot < 0) {
-    close(fd);
-    return KX_ERR_FULL;
-  }
-  return slot;
+  return fd;
 }
 
-int kx_close(int slot) {
-  kdb_init_table();
-  if (slot < 0 || slot >= KDB_MAX_CONNS || kdb_conn_fd[slot] < 0)
+int kx_close(int fd) {
+  if (fd < 0)
     return -1;
-  close(kdb_conn_fd[slot]);
-  kdb_conn_fd[slot] = -1;
-  return 0;
+  return close(fd) == 0 ? 0 : -1;
 }
 
-ray_t *kx_send(int slot, ray_t *msg, char *err, size_t errlen) {
-  kdb_init_table();
-  if (slot < 0 || slot >= KDB_MAX_CONNS || kdb_conn_fd[slot] < 0) {
-    kx_set_err(err, errlen, "kdb: invalid handle");
-    return NULL;
-  }
-  int fd = kdb_conn_fd[slot];
-
+int kx_encode(ray_t *msg, uint8_t **req, int64_t *req_len, char *err,
+              size_t errlen) {
   int64_t body_size = kdb_size_obj(msg);
   if (body_size <= 0) {
     kx_set_err(err, errlen, "kdb: cannot serialize message");
-    return NULL;
+    return -1;
   }
-
-  size_t total = sizeof(kdb_header_t) + (size_t)body_size;
-  uint8_t *buf = (uint8_t *)malloc(total);
+  int64_t total = (int64_t)sizeof(kdb_header_t) + body_size;
+  if (total > (int64_t)UINT32_MAX) {
+    kx_set_err(err, errlen, "kdb: message too large for the wire (>4GiB)");
+    return -1;
+  }
+  uint8_t *buf = (uint8_t *)malloc((size_t)total);
   if (buf == NULL) {
     kx_set_err(err, errlen, "kdb: out of memory");
-    return NULL;
+    return -1;
   }
-
   int64_t written = kdb_ser_obj(buf + sizeof(kdb_header_t), msg);
   if (written < 0) {
     free(buf);
     kx_set_err(err, errlen, "kdb: serialization failed");
-    return NULL;
+    return -1;
   }
   kdb_header_t header = {
-      .endianness = 1,
+      .endianness = KDB_LITTLE_ENDIAN,
       .msgtype = KDB_MSG_SYNC,
       .compressed = 0,
       .reserved = 0,
-      .size = (uint32_t)(written + sizeof(kdb_header_t)),
+      .size = (uint32_t)(written + (int64_t)sizeof(kdb_header_t)),
   };
-  memcpy(buf, &header, sizeof(header));
+  memcpy(buf, &header, sizeof header);
+  *req = buf;
+  *req_len = (int64_t)header.size;
+  return 0;
+}
 
-  if (kdb_send_all(fd, buf, header.size) < 0) {
-    free(buf);
-    kx_set_err(err, errlen, "kdb: send failed");
-    return NULL;
+int kx_exchange(int fd, const uint8_t *req, int64_t req_len, uint8_t **resp,
+                int64_t *resp_len, int *compressed, char *err, size_t errlen) {
+  if (fd < 0) {
+    kx_set_err(err, errlen, "kdb: invalid handle");
+    return -1;
   }
-  free(buf);
+  if (kdb_send_all(fd, req, (size_t)req_len) < 0) {
+    kx_set_err(err, errlen,
+               (errno == EAGAIN || errno == EWOULDBLOCK) ? "kdb: send timed out"
+               : (errno == EBADF || errno == ENOTSOCK)   ? "kdb: invalid handle"
+                                                         : "kdb: send failed");
+    return -1;
+  }
 
-  /* Receive response. */
-  if (kdb_recv_all(fd, &header, sizeof(header)) < 0) {
-    kx_set_err(err, errlen, "kdb: recv header failed");
-    return NULL;
+  kdb_header_t header;
+  if (kdb_recv_all(fd, &header, sizeof header) < 0) {
+    kx_set_err(err, errlen,
+               (errno == EAGAIN || errno == EWOULDBLOCK)
+                   ? "kdb: recv timed out"
+                   : "kdb: recv header failed");
+    return -1;
   }
-  int64_t body_len = (int64_t)header.size - (int64_t)sizeof(header);
+  if (header.endianness != KDB_LITTLE_ENDIAN) {
+    kx_set_err(err, errlen, "kdb: big-endian peer not supported");
+    return -1;
+  }
+  int64_t body_len = (int64_t)header.size - (int64_t)sizeof header;
   if (body_len <= 0) {
     kx_set_err(err, errlen, "kdb: empty response body");
-    return NULL;
+    return -1;
   }
-
   uint8_t *body = (uint8_t *)malloc((size_t)body_len);
   if (body == NULL) {
     kx_set_err(err, errlen, "kdb: out of memory");
-    return NULL;
+    return -1;
   }
   if (kdb_recv_all(fd, body, (size_t)body_len) < 0) {
     free(body);
-    kx_set_err(err, errlen, "kdb: recv body failed");
-    return NULL;
+    kx_set_err(err, errlen,
+               (errno == EAGAIN || errno == EWOULDBLOCK)
+                   ? "kdb: recv timed out"
+                   : "kdb: recv body failed");
+    return -1;
   }
+  *resp = body;
+  *resp_len = body_len;
+  *compressed = header.compressed;
+  return 0;
+}
 
-  uint8_t *decoded = body;
-  int64_t decoded_len = body_len;
+ray_t *kx_decode(uint8_t *resp, int64_t resp_len, int compressed, char *err,
+                 size_t errlen) {
+  uint8_t *decoded = resp;
+  int64_t decoded_len = resp_len;
   uint8_t *decompressed = NULL;
-  if (header.compressed) {
-    if (kdb_decompress(body, body_len, &decompressed, &decoded_len) < 0) {
-      free(body);
+  if (compressed) {
+    if (kdb_decompress(resp, resp_len, &decompressed, &decoded_len) < 0) {
       kx_set_err(err, errlen, "kdb: decompression failed");
       return NULL;
     }
     decoded = decompressed;
   }
-
   uint8_t *cursor = decoded;
   int64_t remaining = decoded_len;
   ray_t *result = kdb_des_obj(&cursor, &remaining);
-  free(body);
   if (decompressed)
     free(decompressed);
-  if (result == NULL) {
+  if (result == NULL)
     kx_set_err(err, errlen, "kdb: deserialization returned null");
+  return result;
+}
+
+ray_t *kx_send(int fd, ray_t *msg, char *err, size_t errlen) {
+  uint8_t *req = NULL;
+  int64_t req_len = 0;
+  if (kx_encode(msg, &req, &req_len, err, errlen) < 0)
     return NULL;
-  }
+
+  uint8_t *resp = NULL;
+  int64_t resp_len = 0;
+  int compressed = 0;
+  int rc =
+      kx_exchange(fd, req, req_len, &resp, &resp_len, &compressed, err, errlen);
+  free(req);
+  if (rc < 0)
+    return NULL;
+
+  ray_t *result = kx_decode(resp, resp_len, compressed, err, errlen);
+  free(resp);
   return result;
 }

@@ -218,23 +218,32 @@ static int run_rfl_file(const char *path) {
   return failed;
 }
 
-/* Bind the server coordinates the .rfl files connect to as `kxhost`/`kxport`
- * in the current runtime, so tests stay free of hard-coded host/port. */
-static void inject_server(const char *host, const char *port) {
+/* Eval one setup expression, discarding the result. */
+static void eval_setup(const char *fmt, const char *arg) {
   char buf[256];
-  snprintf(buf, sizeof buf, "(set kxhost \"%s\")", host);
+  snprintf(buf, sizeof buf, fmt, arg);
   ray_t *r = ray_eval_str(buf);
-  if (r && !RAY_IS_ERR(r))
-    ray_release(r);
-  snprintf(buf, sizeof buf, "(set kxport %s)", port);
-  r = ray_eval_str(buf);
   if (r && !RAY_IS_ERR(r))
     ray_release(r);
 }
 
+/* Bind the server coordinates the .rfl files connect to (kxhost/kxport) plus
+ * the auth server (kxauthport) and credentials (kxuser/kxpass), so tests stay
+ * free of hard-coded values. */
+static void inject_server(const char *host, const char *port,
+                          const char *authport, const char *user,
+                          const char *pass) {
+  eval_setup("(set kxhost \"%s\")", host);
+  eval_setup("(set kxport %s)", port);
+  eval_setup("(set kxauthport %s)", authport);
+  eval_setup("(set kxuser \"%s\")", user);
+  eval_setup("(set kxpass \"%s\")", pass);
+}
+
 int main(int argc, char **argv) {
   const char *host = "127.0.0.1";
-  const char *port = "0";
+  const char *port = "0", *authport = "0";
+  const char *user = "", *pass = "";
   int first = 1;
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
@@ -243,6 +252,15 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
       port = argv[++i];
       first = i + 1;
+    } else if (strcmp(argv[i], "--authport") == 0 && i + 1 < argc) {
+      authport = argv[++i];
+      first = i + 1;
+    } else if (strcmp(argv[i], "--user") == 0 && i + 1 < argc) {
+      user = argv[++i];
+      first = i + 1;
+    } else if (strcmp(argv[i], "--pass") == 0 && i + 1 < argc) {
+      pass = argv[++i];
+      first = i + 1;
     } else {
       first = i;
       break;
@@ -250,7 +268,8 @@ int main(int argc, char **argv) {
   }
   if (first >= argc) {
     fprintf(stderr,
-            "usage: %s [--host H] [--port P] file.rfl [file.rfl ...]\n",
+            "usage: %s [--host H] [--port P] [--authport P] [--user U] "
+            "[--pass P] file.rfl [file.rfl ...]\n",
             argv[0]);
     return 2;
   }
@@ -260,7 +279,7 @@ int main(int argc, char **argv) {
     /* Fresh runtime per file: isolates handles and `set` bindings. */
     ray_runtime_t *rt = ray_runtime_create(0, NULL);
     kx_register_builtins();
-    inject_server(host, port);
+    inject_server(host, port, authport, user, pass);
     failures += run_rfl_file(argv[i]);
     ray_runtime_destroy(rt);
     files++;

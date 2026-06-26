@@ -54,26 +54,53 @@ call into it.
 
 ## 3. Write a thin glue layer
 
-`kx.h` exposes exactly three entry points over rayforce core `ray_t`:
+`kx.h` exposes these entry points over rayforce core `ray_t`. The connection
+handle is the raw socket fd (>= 0), so there is no shared connection table —
+the client is thread-safe and unbounded.
 
 ```c
-int    kx_connect(const char *host, int port);              /* -> slot >= 0, or KX_ERR_* */
-int    kx_close(int slot);                                  /* -> 0, or -1 (bad handle)  */
-ray_t *kx_send(int slot, ray_t *msg, char *err, size_t n);  /* -> ray_t*, or NULL + err  */
+int    kx_connect(const char *host, int port, const char *user,
+                  const char *password, int timeout_ms);   /* -> fd >= 0, or KX_ERR_* */
+int    kx_close(int fd);
+ray_t *kx_send(int fd, ray_t *msg, char *err, size_t n);   /* convenience: encode+exchange+decode */
 ```
 
 Your glue does two jobs:
 
-1. **Convert** your binding's native values to/from `ray_t` (host string + port
-   in; decoded `ray_t` out).
+1. **Convert** your binding's native values to/from `ray_t` (host/port/creds in;
+   decoded `ray_t` out). `user`/`password` may be `NULL`/`""`; `timeout_ms <= 0`
+   blocks.
 2. **Map results onto your error model:**
    - `kx_connect` < 0 → branch on `KX_ERR_SOCKET` / `KX_ERR_HANDSHAKE` /
-     `KX_ERR_FULL`.
+     `KX_ERR_TIMEOUT`.
    - `kx_send` returns `NULL` → transport/serialization failure; the reason is
      in your `err` buffer.
    - `kx_send` returns a `ray_t` that is itself a `RAY_ERROR` → a KDB+
-     server-side error (carries the q error text). Surface it as a normal
-     error, not a value.
+     server-side error (the q error text is in both the error code and message).
+     Surface it as a normal error, not a value.
+
+### Releasing a runtime lock around the network wait
+
+`kx_send` runs everything under the caller's current lock. If your runtime has a
+global lock that should be released during the blocking server round-trip (the
+CPython GIL is the canonical case), call the three-step form instead — encode
+and decode touch the rayforce symbol table (hold the lock); `kx_exchange` is
+pure socket I/O (release the lock):
+
+```c
+uint8_t *req; int64_t req_len;
+if (kx_encode(msg, &req, &req_len, err, sizeof err) < 0) { /* error */ }
+
+uint8_t *resp; int64_t resp_len; int compressed; int rc;
+Py_BEGIN_ALLOW_THREADS;                       /* release the GIL */
+rc = kx_exchange(fd, req, req_len, &resp, &resp_len, &compressed, err, sizeof err);
+Py_END_ALLOW_THREADS;
+free(req);
+if (rc < 0) { /* error */ }
+
+ray_t *result = kx_decode(resp, resp_len, compressed, err, sizeof err);
+free(resp);
+```
 
 ### Reference: CPython binding
 
@@ -124,9 +151,10 @@ cc::Build::new()
 
 // FFI
 extern "C" {
-    fn kx_connect(host: *const c_char, port: c_int) -> c_int;
-    fn kx_close(slot: c_int) -> c_int;
-    fn kx_send(slot: c_int, msg: *mut RayT, err: *mut c_char, n: usize) -> *mut RayT;
+    fn kx_connect(host: *const c_char, port: c_int, user: *const c_char,
+                  password: *const c_char, timeout_ms: c_int) -> c_int;
+    fn kx_close(fd: c_int) -> c_int;
+    fn kx_send(fd: c_int, msg: *mut RayT, err: *mut c_char, n: usize) -> *mut RayT;
 }
 ```
 

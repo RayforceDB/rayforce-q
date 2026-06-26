@@ -26,4 +26,7 @@
 ;; vector length round-trips
 (count (kxsend h "til 100")) -- 100
 
+;; large response: exercises multi-recv (and decompression for remote peers)
+(count (kxsend h "til 100000")) -- 100000
+
 (kxclose h)

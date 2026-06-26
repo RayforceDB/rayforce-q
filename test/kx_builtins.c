@@ -5,10 +5,10 @@
  * way to drive kx from the rayfall language is to compile it into a small
  * rayforce-linked binary and register the functions in the global environment
  * with the runtime `ray_env_set` API. This file is that registration shim; it
- * is test-only and lives on the kx `tests` branch, never shipped to bindings.
+ * is test-only (lives under test/) and is never shipped to bindings.
  *
  * Bound names (plain identifiers — `ray_env_set` rejects the reserved `.`-root):
- *   (kxconnect host port)  -> int handle, or error
+ *   (kxconnect host port [user password [timeout_ms]]) -> int handle, or error
  *   (kxsend    handle msg) -> decoded rayforce object (may be a server error)
  *   (kxclose   handle)     -> null
  */
@@ -47,45 +47,73 @@ static int64_t kx_atom_i64(ray_t *a, int *ok) {
   }
 }
 
-static ray_t *kxb_connect(ray_t *host, ray_t *port) {
-  if (host == NULL || host->type != -RAY_STR)
+/* Copy a RAY_STR atom into a NUL-terminated C buffer; "" if not a string. */
+static void kx_str_arg(ray_t *a, char *buf, size_t cap) {
+  buf[0] = '\0';
+  if (a == NULL || a->type != -RAY_STR)
+    return;
+  size_t n = ray_str_len(a);
+  if (n >= cap)
+    n = cap - 1;
+  memcpy(buf, ray_str_ptr(a), n);
+  buf[n] = '\0';
+}
+
+/* (kxconnect host port [user password [timeout_ms]]) */
+static ray_t *kxb_connect(ray_t **args, int64_t n) {
+  if (n < 2 || n > 5)
+    return ray_error("arity",
+                     "kxconnect: host port [user password [timeout_ms]]");
+  if (args[0] == NULL || args[0]->type != -RAY_STR)
     return ray_error("type", "kxconnect: host must be a string");
   int ok;
-  int64_t p = kx_atom_i64(port, &ok);
+  int64_t p = kx_atom_i64(args[1], &ok);
   if (!ok)
     return ray_error("type", "kxconnect: port must be an integer");
 
   char hbuf[256];
-  size_t hn = ray_str_len(host);
+  size_t hn = ray_str_len(args[0]);
   if (hn >= sizeof hbuf)
     return ray_error("length", "kxconnect: host too long");
-  memcpy(hbuf, ray_str_ptr(host), hn);
+  memcpy(hbuf, ray_str_ptr(args[0]), hn);
   hbuf[hn] = '\0';
 
-  int slot = kx_connect(hbuf, (int)p);
-  if (slot < 0) {
+  char ubuf[128], pbuf[128];
+  kx_str_arg(n >= 3 ? args[2] : NULL, ubuf, sizeof ubuf);
+  kx_str_arg(n >= 4 ? args[3] : NULL, pbuf, sizeof pbuf);
+  int timeout_ms = 0;
+  if (n >= 5) {
+    int tok;
+    timeout_ms = (int)kx_atom_i64(args[4], &tok);
+    if (!tok)
+      timeout_ms = 0;
+  }
+
+  int fd = kx_connect(hbuf, (int)p, ubuf, pbuf, timeout_ms);
+  if (fd < 0) {
     /* Error code (not message) is what ray_fmt renders, so make it the
      * meaningful, assertable token. */
-    switch (slot) {
-    case KX_ERR_SOCKET:
-      return ray_error("connect", "kxconnect: connect failed");
+    switch (fd) {
+    case KX_ERR_TIMEOUT:
+      return ray_error("timeout", "kxconnect: connect timed out");
     case KX_ERR_HANDSHAKE:
-      return ray_error("handshake", "kxconnect: handshake failed");
+      /* short code: ray_fmt caps the displayed error code length */
+      return ray_error("auth", "kxconnect: handshake/auth failed");
     default:
-      return ray_error("full", "kxconnect: connection table full");
+      return ray_error("connect", "kxconnect: connect failed");
     }
   }
-  return ray_i64(slot);
+  return ray_i64(fd);
 }
 
 static ray_t *kxb_send(ray_t *handle, ray_t *msg) {
   int ok;
-  int64_t slot = kx_atom_i64(handle, &ok);
+  int64_t fd = kx_atom_i64(handle, &ok);
   if (!ok)
     return ray_error("type", "kxsend: handle must be an integer");
 
   char err[128] = {0};
-  ray_t *res = kx_send((int)slot, msg, err, sizeof err);
+  ray_t *res = kx_send((int)fd, msg, err, sizeof err);
   if (res == NULL) {
     /* Surface a meaningful code: a closed/invalid slot vs a send failure. */
     const char *code = strstr(err, "handle") ? "handle" : "send";
@@ -98,10 +126,10 @@ static ray_t *kxb_send(ray_t *handle, ray_t *msg) {
 
 static ray_t *kxb_close(ray_t *handle) {
   int ok;
-  int64_t slot = kx_atom_i64(handle, &ok);
+  int64_t fd = kx_atom_i64(handle, &ok);
   if (!ok)
     return ray_error("type", "kxclose: handle must be an integer");
-  kx_close((int)slot);
+  kx_close((int)fd);
   return RAY_NULL_OBJ;
 }
 
@@ -111,7 +139,7 @@ static ray_t *kxb_close(ray_t *handle) {
 void kx_register_builtins(void) {
   ray_t *f;
 
-  f = ray_fn_binary("kxconnect", RAY_FN_NONE, kxb_connect);
+  f = ray_fn_vary("kxconnect", RAY_FN_NONE, kxb_connect);
   ray_env_set(ray_sym_intern("kxconnect", 9), f);
   ray_release(f);
 

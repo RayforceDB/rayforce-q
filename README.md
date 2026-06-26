@@ -23,15 +23,26 @@ CPython, no Rust FFI). A binding provides a thin glue layer that:
 ```c
 #include "kx.h"
 
-int    kx_connect(const char *host, int port);              /* -> slot >= 0, or KX_ERR_* */
-int    kx_close(int slot);                                  /* -> 0, or -1 (bad handle)  */
-ray_t *kx_send(int slot, ray_t *msg, char *err, size_t n);  /* -> ray_t*, or NULL + err  */
+/* host/port + optional auth + connect/op timeout (ms; <=0 blocks). */
+int    kx_connect(const char *host, int port, const char *user,
+                  const char *password, int timeout_ms);   /* -> fd >= 0, or KX_ERR_* */
+int    kx_close(int fd);                                    /* -> 0, or -1 (bad fd)     */
+ray_t *kx_send(int fd, ray_t *msg, char *err, size_t n);    /* -> ray_t*, or NULL + err */
+
+/* Split form, so a binding can release a runtime lock (e.g. the CPython GIL)
+ * around just the blocking network wait: */
+int    kx_encode(ray_t *msg, uint8_t **req, int64_t *req_len, char *err, size_t n);
+int    kx_exchange(int fd, const uint8_t *req, int64_t req_len, uint8_t **resp,
+                   int64_t *resp_len, int *compressed, char *err, size_t n);
+ray_t *kx_decode(uint8_t *resp, int64_t resp_len, int compressed, char *err, size_t n);
 ```
 
-`kx_send` returns a freshly-owned `ray_t`. That object may itself be a
-`RAY_ERROR` carrying a KDB+ server-side error string; a `NULL` return instead
-signals a transport/serialization failure, with a short reason written to
-`err`.
+The connection handle is the raw socket fd, so the client is thread-safe and
+unbounded (no shared connection table). `kx_send` returns a freshly-owned
+`ray_t`, which may itself be a `RAY_ERROR` carrying a KDB+ server-side error; a
+`NULL` return instead signals a transport/serialization failure, with a short
+reason written to `err`. `kx_encode`/`kx_decode` touch the rayforce symbol
+table (hold the lock); `kx_exchange` is pure socket I/O (release the lock).
 
 ## Building into a binding
 
