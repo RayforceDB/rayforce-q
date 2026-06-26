@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# rayforce-q pre-commit hook: clang-format lint + the rayfall test suite.
+# Enable with: make hooks
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+FMT_FILES="q.c q.h embed/q_env.c test/q_builtins.c test/q_test.c"
+
+# --- lint: C sources must be clang-format clean ---
+if command -v clang-format >/dev/null 2>&1; then
+  bad=""
+  for f in $FMT_FILES; do
+    [ -f "$f" ] || continue
+    diff -q <(clang-format "$f") "$f" >/dev/null 2>&1 || bad="$bad $f"
+  done
+  if [ -n "$bad" ]; then
+    echo "pre-commit: clang-format needed for:$bad" >&2
+    echo "            run: make lint" >&2
+    exit 1
+  fi
+else
+  echo "pre-commit: clang-format not found — skipping lint" >&2
+fi
+
+# --- tests: fast path against an already-built core ---
+if [ -f test/tmp/rayforce-c/librayforce.a ]; then
+  make recheck
+else
+  echo "pre-commit: rayforce core not built — skipping tests" >&2
+  echo "            run 'make test' once to enable them" >&2
+fi

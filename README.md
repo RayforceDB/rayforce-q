@@ -36,5 +36,20 @@ unbounded (no shared connection table). `q_send` returns a freshly-owned
 
 `rayforce-q` is not a standalone library — bindings compile `q.c`/`q.h` **into**
 their native extension, alongside the rayforce core (which supplies
-`<rayforce.h>` and `table/sym.h`). See **[INTEGRATING.md](./docs/INTEGRATING.md)** for 
-more details
+`<rayforce.h>` and `table/sym.h`). See **[INTEGRATING.md](./docs/INTEGRATING.md)**
+for more details.
+
+## Embedded binary
+
+`make rayforce` builds a `rayforce` binary with the Q client compiled in and
+exposed as `.q.*` rayfall env functions, so any script or REPL session can query
+a Q server:
+
+```clojure
+(set h (.q.connect "localhost" 5000 "" "" 0))   ;; host port [user password [timeout_ms]]
+(.q.send h "([] a:1 2 3; b:`x`y`z)")             ;; -> a rayforce table
+(.q.close h)
+```
+
+It clones the rayforce core, drops `q.c`/`q.h`/`embed/q_env.c` into its build,
+and registers the functions at startup ([`embed/q_env.c`](./embed/q_env.c)).

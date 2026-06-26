@@ -7,7 +7,7 @@ is a stable point they can build against.
 
 ## [1.0.0]
 
-First stable release of the Q (kdb+) IPC wire-format core: a language-neutral
+First stable release of the Q IPC wire-format core: a language-neutral
 `q.c` / `q.h` pair that bindings compile into their native extension alongside
 the rayforce core.
 
@@ -36,6 +36,10 @@ the rayforce core.
   and message both carry the q error text; transport/serialization failures
   return a short reason in the caller's `err` buffer.
 - **Safety guards**: rejects messages larger than 4 GiB and big-endian peers.
+- **Embedded binary** (`make rayforce`): a `rayforce` binary with the Q client
+  compiled in and exposed as the `.q.connect` / `.q.send` / `.q.close` rayfall
+  env functions, so any script or REPL session can query a Q server
+  (`embed/q_env.c` is the registration shim).
 - **Tests**: rayfall integration suite (`test/`) — connection lifecycle, every
   atom/vector type, temporal, collections, server errors, authentication, and
   nulls — run against a live `q` server, with a GitHub Actions workflow.
@@ -48,7 +52,7 @@ the rayforce core.
 - Not a standalone library: it requires the rayforce core's `<rayforce.h>` and
   `table/sym.h` on the include path and links nothing else (defines its own
   `RAY_ATTR_DICT` / `ray_scalar_elem_size` fallbacks).
-- A kdb+ keyed table decodes to a 2-element `(keys, values)` list (rayforce has
+- A Q keyed table decodes to a 2-element `(keys, values)` list (rayforce has
   no keyed-table type); vector attributes (`s#`/`u#`/`p#`) are not preserved.
 
 [1.0.0]: https://github.com/RayforceDB/rayforce-q/releases/tag/v1.0.0

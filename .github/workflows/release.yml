@@ -1,0 +1,57 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang rsync libreadline-dev libncurses-dev
+
+      - name: Resolve version
+        id: v
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      # Build a rayforce binary with Q IPC compiled in (.q.* env functions).
+      - name: Build the Q-enabled rayforce binary
+        env:
+          RAYFORCE_GITHUB: ${{ secrets.RAYFORCE_GITHUB || 'https://github.com/RayforceDB/rayforce.git' }}
+          RAYFORCE_REF: ${{ vars.RAYFORCE_REF }}
+          CC: clang
+        run: |
+          make rayforce
+          mv rayforce "rayforce-q-linux-x86_64"
+
+      - name: Extract release notes from CHANGELOG
+        run: ./scripts/changelog-section.sh "${{ steps.v.outputs.version }}" | tee RELEASE_NOTES.md
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "rayforce-q ${GITHUB_REF_NAME}" \
+            --notes-file RELEASE_NOTES.md \
+            "rayforce-q-linux-x86_64"
+
+      # Same releases bot the Python lib uses. Skipped if the secret is unset.
+      - name: Announce on Zulip
+        env:
+          ZULIP_BOT_TOKEN: ${{ secrets.ZULIP_RELEASES_BOT_TOKEN }}
+        run: |
+          if [ -z "$ZULIP_BOT_TOKEN" ]; then
+            echo "ZULIP_RELEASES_BOT_TOKEN not set — skipping announcement"
+            exit 0
+          fi
+          ./scripts/announce-release.sh "${{ steps.v.outputs.version }}" "$ZULIP_BOT_TOKEN"
