@@ -55,4 +55,4 @@ the rayforce core.
 - A Q keyed table decodes to a 2-element `(keys, values)` list (rayforce has
   no keyed-table type); vector attributes (`s#`/`u#`/`p#`) are not preserved.
 
-[1.0.0]: https://github.com/RayforceDB/rayforce-q/releases/tag/v1.0.0
+[1.0.0]: https://github.com/RayforceDB/rayforce-q/releases/tag/1.0.0

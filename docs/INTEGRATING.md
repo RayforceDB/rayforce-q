@@ -11,7 +11,7 @@ consumes it so every binding ships the identical wire implementation.
 
 All bindings must build the *same* `q.c`, so pin a tag or commit — never track
 a moving branch. The current version is in [`VERSION`](./VERSION); releases are
-git tags (e.g. `v1.0.0`).
+git tags (e.g. `1.0.0`).
 
 ---
 
@@ -100,7 +100,7 @@ The build pattern, distilled:
 
 ```make
 RAYFORCE_Q_GITHUB     ?= https://github.com/RayforceDB/rayforce-q.git
-RAYFORCE_Q_REF        ?= v0.2.0          # pin
+RAYFORCE_Q_REF        ?= 0.2.0           # pin
 RAYFORCE_Q_LOCAL_PATH ?=                 # local-checkout override
 
 pull_q:
