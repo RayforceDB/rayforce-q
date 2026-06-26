@@ -48,7 +48,6 @@ jobs:
           fi
 
       - name: Build and run tests
-        working-directory: test
         env:
           RAYFORCE_GITHUB: ${{ secrets.RAYFORCE_GITHUB || 'https://github.com/RayforceDB/rayforce.git' }}
           RAYFORCE_REF: ${{ vars.RAYFORCE_REF }}
