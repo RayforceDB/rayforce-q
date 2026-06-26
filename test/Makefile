@@ -1,6 +1,6 @@
-# Test build for rayforce-kx (lives on the `tests` branch only).
+# Test build for rayforce-q (lives on the `tests` branch only).
 #
-# Builds a small rayforce-linked binary that registers the kx KDB+ client as
+# Builds a small rayforce-linked binary that registers the q Q client as
 # rayfall builtins, then runs the .rfl tests against a live q server. The
 # native rayforce engine is cloned (or copied from a local checkout) and built
 # as a static lib that this driver links against.
@@ -12,7 +12,7 @@
 #   RAYFORCE_GITHUB      core git URL (default: public repo)
 #   RAYFORCE_REF         branch/tag to check out (optional)
 #   RAYFORCE_LOCAL_PATH  rsync this checkout instead of cloning
-#   Q_BINARY             path to the q (kdb+) binary (run_tests.sh autodetects)
+#   Q_BINARY             path to the q binary (run_tests.sh autodetects)
 #   PORT                 q listen port (run_tests.sh picks a free one if unset)
 
 UNAME_S := $(shell uname -s)
@@ -32,7 +32,7 @@ else
   LIBS = -lm
 endif
 
-SRCS = $(ROOT)/kx.c kx_builtins.c kx_test.c
+SRCS = $(ROOT)/q.c q_builtins.c q_test.c
 
 pull_core:
 	@rm -rf $(CORE)
@@ -52,14 +52,14 @@ core_lib: pull_core
 	@echo "🔨 Building librayforce.a..."
 	@$(MAKE) -C $(CORE) lib
 
-kx_test: core_lib
-	@echo "🔧 Building kx_test driver..."
-	@$(CC) $(CFLAGS) -o kx_test $(SRCS) $(CORE)/librayforce.a $(LIBS)
+q_test: core_lib
+	@echo "🔧 Building q_test driver..."
+	@$(CC) $(CFLAGS) -o q_test $(SRCS) $(CORE)/librayforce.a $(LIBS)
 
-test: kx_test
-	@./run_tests.sh ./kx_test rfl
+test: q_test
+	@./run_tests.sh ./q_test rfl
 
 clean:
-	@rm -rf $(ROOT)/test/tmp kx_test *.o
+	@rm -rf $(ROOT)/test/tmp q_test *.o
 
 .PHONY: pull_core core_lib test clean

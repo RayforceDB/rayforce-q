@@ -1,21 +1,21 @@
-;; Null + empty-collection decode. kx copies KDB+ payloads verbatim and
-;; re-tags them; rayforce's null sentinels (INT64_MIN, NaN, ...) match KDB+'s,
+;; Null + empty-collection decode. q copies Q payloads verbatim and
+;; re-tags them; rayforce's null sentinels (INT64_MIN, NaN, ...) match Q's,
 ;; so typed nulls should round-trip to rayforce nulls.
 
-(set h (kxconnect kxhost kxport))
+(set h (qconnect qhost qport))
 
 ;; typed null atoms
-(nil? (kxsend h "0N"))  -- true
-(nil? (kxsend h "0Nh")) -- true
-(nil? (kxsend h "0Ni")) -- true
-(nil? (kxsend h "0n"))  -- true
+(nil? (qsend h "0N"))  -- true
+(nil? (qsend h "0Nh")) -- true
+(nil? (qsend h "0Ni")) -- true
+(nil? (qsend h "0n"))  -- true
 
 ;; empty typed vectors
-(count (kxsend h "`long$()"))  -- 0
-(count (kxsend h "`float$()")) -- 0
-(count (kxsend h "0#`sym"))    -- 0
+(count (qsend h "`long$()"))  -- 0
+(count (qsend h "`float$()")) -- 0
+(count (qsend h "0#`sym"))    -- 0
 
 ;; a null inside a vector survives
-(nil? (at (kxsend h "1 0N 3") 1)) -- true
+(nil? (at (qsend h "1 0N 3") 1)) -- true
 
-(kxclose h)
+(qclose h)

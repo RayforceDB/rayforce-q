@@ -1,6 +1,6 @@
-# rayforce-kx
+# rayforce-q
 
-KDB+ IPC wire-format client for [RayforceDB](https://github.com/RayforceDB),
+Q IPC wire-format client for [RayforceDB](https://github.com/RayforceDB),
 factored out as a small **language-neutral C core** so every RayforceDB
 language binding (Python, Rust, …) can link the *same* version of the plugin.
 
@@ -8,59 +8,59 @@ language binding (Python, Rust, …) can link the *same* version of the plugin.
 
 | File    | Purpose                                                            |
 | ------- | ----------------------------------------------------------------- |
-| `kx.h`  | Public API: `kx_connect`, `kx_close`, `kx_send`.                  |
-| `kx.c`  | KDB+ wire-format serialize/deserialize + blocking-socket client.  |
+| `q.h`  | Public API: `q_connect`, `q_close`, `q_send`.                  |
+| `q.c`  | Q wire-format serialize/deserialize + blocking-socket client.  |
 
 The core operates purely on rayforce core `ray_t` objects and the rayforce
 public API (`<rayforce.h>`). It contains **no** binding-specific code (no
 CPython, no Rust FFI). A binding provides a thin glue layer that:
 
 1. converts its native values to/from `ray_t`, and
-2. maps `kx_*` return codes / error strings onto its own exception model.
+2. maps `q_*` return codes / error strings onto its own exception model.
 
 ## API
 
 ```c
-#include "kx.h"
+#include "q.h"
 
 /* host/port + optional auth + connect/op timeout (ms; <=0 blocks). */
-int    kx_connect(const char *host, int port, const char *user,
-                  const char *password, int timeout_ms);   /* -> fd >= 0, or KX_ERR_* */
-int    kx_close(int fd);                                    /* -> 0, or -1 (bad fd)     */
-ray_t *kx_send(int fd, ray_t *msg, char *err, size_t n);    /* -> ray_t*, or NULL + err */
+int    q_connect(const char *host, int port, const char *user,
+                  const char *password, int timeout_ms);   /* -> fd >= 0, or Q_ERR_* */
+int    q_close(int fd);                                    /* -> 0, or -1 (bad fd)     */
+ray_t *q_send(int fd, ray_t *msg, char *err, size_t n);    /* -> ray_t*, or NULL + err */
 
 /* Split form, so a binding can release a runtime lock (e.g. the CPython GIL)
  * around just the blocking network wait: */
-int    kx_encode(ray_t *msg, uint8_t **req, int64_t *req_len, char *err, size_t n);
-int    kx_exchange(int fd, const uint8_t *req, int64_t req_len, uint8_t **resp,
+int    q_encode(ray_t *msg, uint8_t **req, int64_t *req_len, char *err, size_t n);
+int    q_exchange(int fd, const uint8_t *req, int64_t req_len, uint8_t **resp,
                    int64_t *resp_len, int *compressed, char *err, size_t n);
-ray_t *kx_decode(uint8_t *resp, int64_t resp_len, int compressed, char *err, size_t n);
+ray_t *q_decode(uint8_t *resp, int64_t resp_len, int compressed, char *err, size_t n);
 ```
 
 The connection handle is the raw socket fd, so the client is thread-safe and
-unbounded (no shared connection table). `kx_send` returns a freshly-owned
-`ray_t`, which may itself be a `RAY_ERROR` carrying a KDB+ server-side error; a
+unbounded (no shared connection table). `q_send` returns a freshly-owned
+`ray_t`, which may itself be a `RAY_ERROR` carrying a Q server-side error; a
 `NULL` return instead signals a transport/serialization failure, with a short
-reason written to `err`. `kx_encode`/`kx_decode` touch the rayforce symbol
-table (hold the lock); `kx_exchange` is pure socket I/O (release the lock).
+reason written to `err`. `q_encode`/`q_decode` touch the rayforce symbol
+table (hold the lock); `q_exchange` is pure socket I/O (release the lock).
 
 ## Building into a binding
 
-`rayforce-kx` is not a standalone library — it is compiled **into** a binding's
+`rayforce-q` is not a standalone library — it is compiled **into** a binding's
 build alongside the rayforce core, which supplies `<rayforce.h>` and the
-`table/sym.h` internal header. Drop `kx.c`/`kx.h` next to the binding's sources
+`table/sym.h` internal header. Drop `q.c`/`q.h` next to the binding's sources
 and compile with the core's include paths.
 
 See **[INTEGRATING.md](./INTEGRATING.md)** for the full pin → compile → glue
 guide, with Python (reference), rayfall, and Rust examples. The RayforceDB
-Python binding (`Makefile` / `scripts/prepare_build.sh` + `raypy_kdb.c`) is the
-canonical integration: it pulls this repo at a pinned ref and copies `kx.*` into
+Python binding (`Makefile` / `scripts/prepare_build.sh` + its C glue) is the
+canonical integration: it pulls this repo at a pinned ref and copies `q.*` into
 its `pyext/` build dir.
 
 ## Tests
 
 Integration tests (rayfall, run against a live `q` server) live in
-[`test/`](./test) and run in CI. Bindings only ever compile `kx.c` / `kx.h`, so
+[`test/`](./test) and run in CI. Bindings only ever compile `q.c` / `q.h`, so
 the test scaffolding is inert for them. See [`test/README.md`](./test/README.md).
 
 ## Versioning

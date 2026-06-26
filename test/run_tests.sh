@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# run_tests.sh — start throwaway q (kdb+) servers (one open, one with
-# authentication), run the kx .rfl tests against them, then tear them down.
+# run_tests.sh — start throwaway q servers (one open, one with
+# authentication), run the q .rfl tests against them, then tear them down.
 #
-#   ./run_tests.sh ./kx_test rfl
+#   ./run_tests.sh ./q_test rfl
 #
-# Args: $1 = path to the kx_test driver, $2 = directory of .rfl files.
-# Env:  Q_BINARY (q path), QHOME, PORT / AUTHPORT (default: free ports), KX_HOST.
+# Args: $1 = path to the q_test driver, $2 = directory of .rfl files.
+# Env:  Q_BINARY (q path), QHOME, PORT / AUTHPORT (default: free ports), Q_HOST.
 set -euo pipefail
 
 DRIVER="${1:?usage: run_tests.sh <driver> <rfl-dir>}"
 RFL_DIR="${2:?usage: run_tests.sh <driver> <rfl-dir>}"
-HOST="${KX_HOST:-127.0.0.1}"
-KX_USER="kxtest"
-KX_PASS="secret"
+HOST="${Q_HOST:-127.0.0.1}"
+Q_USER="qtest"
+Q_PASS="secret"
 
 # Locate the q binary.
 Q_BINARY="${Q_BINARY:-}"
@@ -22,7 +22,7 @@ if [[ -z "$Q_BINARY" ]]; then
   done
 fi
 if [[ -z "$Q_BINARY" || ! -x "$Q_BINARY" ]]; then
-  echo "SKIP: q (kdb+) binary not found — set Q_BINARY or install kdb+" >&2
+  echo "SKIP: q binary not found — set Q_BINARY or install q" >&2
   exit 0
 fi
 export QHOME="${QHOME:-$(dirname "$(dirname "$Q_BINARY")")}"
@@ -39,7 +39,7 @@ AUTHPORT="${AUTHPORT:-$(free_port)}"
 
 WORK="$(mktemp -d)"
 USERFILE="$WORK/users.txt"
-printf '%s:%s\n' "$KX_USER" "$KX_PASS" > "$USERFILE"
+printf '%s:%s\n' "$Q_USER" "$Q_PASS" > "$USERFILE"
 
 PIDS=()
 FDS=()
@@ -78,8 +78,8 @@ for p in "$PORT" "$AUTHPORT"; do
   [[ "$ok" == 1 ]] || { echo "q server on $HOST:$p did not come up" >&2; exit 1; }
 done
 
-echo "q servers up: open=$HOST:$PORT auth=$HOST:$AUTHPORT; running kx tests..."
+echo "q servers up: open=$HOST:$PORT auth=$HOST:$AUTHPORT; running q tests..."
 exec "$DRIVER" \
   --host "$HOST" --port "$PORT" \
-  --authport "$AUTHPORT" --user "$KX_USER" --pass "$KX_PASS" \
+  --authport "$AUTHPORT" --user "$Q_USER" --pass "$Q_PASS" \
   "$RFL_DIR"/*.rfl

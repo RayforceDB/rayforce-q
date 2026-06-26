@@ -1,32 +1,32 @@
 ;; Vector decode coverage.
 
-(set h (kxconnect kxhost kxport))
+(set h (qconnect qhost qport))
 
 ;; integer vectors: long / int
-(kxsend h "til 5")   -- [0 1 2 3 4]
-(kxsend h "1 2 3")   -- [1 2 3]
-(kxsend h "1 2 3i")  -- [1 2 3]
+(qsend h "til 5")   -- [0 1 2 3 4]
+(qsend h "1 2 3")   -- [1 2 3]
+(qsend h "1 2 3i")  -- [1 2 3]
 
 ;; float vectors: float / real (real is widened to f64)
-(kxsend h "1.5 2.5 3.5")  -- [1.5 2.5 3.5]
-(kxsend h "1.5 2.5 3.5e") -- [1.5 2.5 3.5]
+(qsend h "1.5 2.5 3.5")  -- [1.5 2.5 3.5]
+(qsend h "1.5 2.5 3.5e") -- [1.5 2.5 3.5]
 
 ;; boolean vector
-(kxsend h "101b") -- [true false true]
+(qsend h "101b") -- [true false true]
 
 ;; byte vector
-(kxsend h "0x010203") -- [0x01 0x02 0x03]
+(qsend h "0x010203") -- [0x01 0x02 0x03]
 
 ;; symbol vector
-(kxsend h "`a`b`c") -- ['a 'b 'c]
+(qsend h "`a`b`c") -- ['a 'b 'c]
 
 ;; char vector -> rayforce string
-(kxsend h "\"hello\"") -- "hello"
+(qsend h "\"hello\"") -- "hello"
 
 ;; vector length round-trips
-(count (kxsend h "til 100")) -- 100
+(count (qsend h "til 100")) -- 100
 
 ;; large response: exercises multi-recv (and decompression for remote peers)
-(count (kxsend h "til 100000")) -- 100000
+(count (qsend h "til 100000")) -- 100000
 
-(kxclose h)
+(qclose h)

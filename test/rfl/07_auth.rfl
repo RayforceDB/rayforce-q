@@ -1,15 +1,15 @@
-;; Authentication. The driver starts a second q with `-u users` on kxauthport;
-;; kxuser/kxpass are the valid credentials it injects.
+;; Authentication. The driver starts a second q with `-u users` on qauthport;
+;; quser/qpass are the valid credentials it injects.
 
 ;; valid credentials -> a usable connection
-(set h (kxconnect kxhost kxauthport kxuser kxpass))
+(set h (qconnect qhost qauthport quser qpass))
 (>= h 0) -- true
-(kxsend h "6*7") -- 42
-(kxclose h)
+(qsend h "6*7") -- 42
+(qclose h)
 
 ;; wrong password -> the server rejects the login (closes the socket mid
 ;; handshake, so the capability read fails)
-(kxconnect kxhost kxauthport kxuser "wrongpass") !- auth
+(qconnect qhost qauthport quser "wrongpass") !- auth
 
 ;; no credentials at all against an auth server -> rejected
-(kxconnect kxhost kxauthport) !- auth
+(qconnect qhost qauthport) !- auth

@@ -21,26 +21,26 @@ jobs:
         with:
           python-version: '3.x'
 
-      # kdb+ is proprietary, so the q binary is provisioned only when the repo
+      # q is proprietary, so the q binary is provisioned only when the repo
       # supplies it via secrets. Without them the build still runs (compiling
-      # kx.c + the driver against the real core is meaningful coverage) and the
+      # q.c + the driver against the real core is meaningful coverage) and the
       # harness skips the q-backed assertions.
       #
-      #   KX_Q_URL        URL to a zip/tarball containing the linux-64 q binary
-      #   KX_LICENSE_B64  base64-encoded kc.lic
-      - name: Provision kdb+ (optional)
+      #   Q_URL        URL to a zip/tarball containing the linux-64 q binary
+      #   Q_LICENSE_B64  base64-encoded kc.lic
+      - name: Provision q (optional)
         env:
-          KX_Q_URL: ${{ secrets.KX_Q_URL }}
-          KX_LICENSE_B64: ${{ secrets.KX_LICENSE_B64 }}
+          Q_URL: ${{ secrets.Q_URL }}
+          Q_LICENSE_B64: ${{ secrets.Q_LICENSE_B64 }}
         run: |
-          if [ -n "$KX_Q_URL" ] && [ -n "$KX_LICENSE_B64" ]; then
+          if [ -n "$Q_URL" ] && [ -n "$Q_LICENSE_B64" ]; then
             mkdir -p "$HOME/q"
-            curl -fsSL "$KX_Q_URL" -o /tmp/q.archive
-            case "$KX_Q_URL" in
+            curl -fsSL "$Q_URL" -o /tmp/q.archive
+            case "$Q_URL" in
               *.zip) unzip -q -o /tmp/q.archive -d "$HOME/q" ;;
               *)     tar -xf /tmp/q.archive -C "$HOME/q" ;;
             esac
-            printf '%s' "$KX_LICENSE_B64" | base64 -d > "$HOME/q/kc.lic"
+            printf '%s' "$Q_LICENSE_B64" | base64 -d > "$HOME/q/kc.lic"
             QBIN="$(find "$HOME/q" -type f -name q -perm -u+x | head -1)"
             chmod +x "$QBIN" || true
             {
@@ -50,7 +50,7 @@ jobs:
             } >> "$GITHUB_ENV"
             echo "Provisioned q at $QBIN"
           else
-            echo "::notice::No kdb+ secrets (KX_Q_URL / KX_LICENSE_B64) set — building only; q-backed tests will skip."
+            echo "::notice::No q secrets (Q_URL / Q_LICENSE_B64) set — building only; q-backed tests will skip."
           fi
 
       - name: Build and run rayfall tests

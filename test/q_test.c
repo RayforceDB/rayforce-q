@@ -1,7 +1,7 @@
 /*
- * kx_test.c — rayfall test runner for the kx KDB+ client.
+ * q_test.c — rayfall test runner for the q Q client.
  *
- * Embeds the rayforce engine, registers the kx builtins (see kx_builtins.c),
+ * Embeds the rayforce engine, registers the q builtins (see q_builtins.c),
  * and runs one or more `.rfl` test files. The assertion DSL mirrors the
  * rayforce core's own .rfl harness:
  *
@@ -21,7 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-void kx_register_builtins(void);
+void q_register_builtins(void);
 
 /* ---- formatting helpers (mirrors core test/main.c) ---- */
 
@@ -227,17 +227,17 @@ static void eval_setup(const char *fmt, const char *arg) {
     ray_release(r);
 }
 
-/* Bind the server coordinates the .rfl files connect to (kxhost/kxport) plus
- * the auth server (kxauthport) and credentials (kxuser/kxpass), so tests stay
+/* Bind the server coordinates the .rfl files connect to (qhost/qport) plus
+ * the auth server (qauthport) and credentials (quser/qpass), so tests stay
  * free of hard-coded values. */
 static void inject_server(const char *host, const char *port,
                           const char *authport, const char *user,
                           const char *pass) {
-  eval_setup("(set kxhost \"%s\")", host);
-  eval_setup("(set kxport %s)", port);
-  eval_setup("(set kxauthport %s)", authport);
-  eval_setup("(set kxuser \"%s\")", user);
-  eval_setup("(set kxpass \"%s\")", pass);
+  eval_setup("(set qhost \"%s\")", host);
+  eval_setup("(set qport %s)", port);
+  eval_setup("(set qauthport %s)", authport);
+  eval_setup("(set quser \"%s\")", user);
+  eval_setup("(set qpass \"%s\")", pass);
 }
 
 int main(int argc, char **argv) {
@@ -278,7 +278,7 @@ int main(int argc, char **argv) {
   for (int i = first; i < argc; i++) {
     /* Fresh runtime per file: isolates handles and `set` bindings. */
     ray_runtime_t *rt = ray_runtime_create(0, NULL);
-    kx_register_builtins();
+    q_register_builtins();
     inject_server(host, port, authport, user, pass);
     failures += run_rfl_file(argv[i]);
     ray_runtime_destroy(rt);

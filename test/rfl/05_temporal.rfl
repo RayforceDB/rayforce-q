@@ -1,17 +1,17 @@
-;; Temporal decode coverage (date / time / timestamp). kx copies the raw
-;; KDB+ payload and re-tags it; these assertions confirm the epoch and width
+;; Temporal decode coverage (date / time / timestamp). q copies the raw
+;; Q payload and re-tags it; these assertions confirm the epoch and width
 ;; line up with rayforce's own temporal types.
 
-(set h (kxconnect kxhost kxport))
+(set h (qconnect qhost qport))
 
 ;; date atom + vector
-(kxsend h "2025.01.01")            -- 2025.01.01
-(kxsend h "2025.01.01 2025.01.02") -- [2025.01.01 2025.01.02]
+(qsend h "2025.01.01")            -- 2025.01.01
+(qsend h "2025.01.01 2025.01.02") -- [2025.01.01 2025.01.02]
 
 ;; time atom
-(kxsend h "12:34:56.000") -- 12:34:56.000
+(qsend h "12:34:56.000") -- 12:34:56.000
 
 ;; timestamp atom
-(kxsend h "2025.01.01D12:00:00.000000000") -- 2025.01.01D12:00:00.000000000
+(qsend h "2025.01.01D12:00:00.000000000") -- 2025.01.01D12:00:00.000000000
 
-(kxclose h)
+(qclose h)
