@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # Copyright (c) 2026 RayforceDB Team
 # All rights reserved.
 #
@@ -19,7 +20,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-#!/usr/bin/env bash
 # run_tests.sh — start throwaway q servers (one open, one with
 # authentication), run the q .rfl tests against them, then tear them down.
 #
