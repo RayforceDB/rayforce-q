@@ -1,0 +1,22 @@
+;; Server-side error decode: a q error response (-128) must surface as a
+;; rayforce error carrying the q error text.
+;;
+;; Note: ray_fmt renders an error by its *code*, and the rayforce error code
+;; is short (longer KDB+ error text is truncated in the formatted display),
+;; so these assertions use short error tokens.
+
+(set h (kxconnect kxhost kxport))
+
+;; explicit q signal: 'myerr  -> error text "myerr"
+(kxsend h "'myerr") !- myerr
+
+;; type error from a bad operation
+(kxsend h "`a+1") !- type
+
+;; undefined variable -> q signals the name
+(kxsend h "xyzzy") !- xyzzy
+
+;; the connection stays usable after a server error
+(kxsend h "2+2") -- 4
+
+(kxclose h)

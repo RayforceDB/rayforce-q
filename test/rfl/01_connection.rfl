@@ -1,0 +1,22 @@
+;; Connection lifecycle and basic round-trips against a live q server.
+;; kxhost / kxport are injected by the test driver (--host/--port).
+
+(set h (kxconnect kxhost kxport))
+
+;; A handle is a non-negative integer slot.
+(>= h 0) -- true
+
+;; Basic synchronous query evaluation.
+(kxsend h "1+2") -- 3
+(kxsend h "first 1 2 3") -- 1
+(kxsend h "count til 10") -- 10
+
+(kxclose h)
+
+;; Sending on a closed handle is a transport error.
+(set h2 (kxconnect kxhost kxport))
+(kxclose h2)
+(kxsend h2 "1+1") !- handle
+
+;; Connecting to a closed port fails at the socket level.
+(kxconnect kxhost 1) !- connect

@@ -48,9 +48,9 @@ its `pyext/` build dir.
 
 ## Tests
 
-Integration tests (rayfall, run against a live `q` server) live on the
-[`tests`](https://github.com/RayforceDB/rayforce-kx/tree/tests) branch, kept off
-`main` so bindings pull only `kx.c` / `kx.h`.
+Integration tests (rayfall, run against a live `q` server) live in
+[`test/`](./test) and run in CI. Bindings only ever compile `kx.c` / `kx.h`, so
+the test scaffolding is inert for them. See [`test/README.md`](./test/README.md).
 
 ## Versioning
 

@@ -105,9 +105,9 @@ pull_kx:
 
 ### Reference: rayfall builtins
 
-The [`tests`](https://github.com/RayforceDB/rayforce-kx/tree/tests) branch shows
-a second, non-Python glue: `test/kx_builtins.c` binds the three calls as rayfall
-language builtins. It is a compact template for a glue layer that isn't CPython.
+The [`test/`](./test) directory shows a second, non-Python glue:
+`test/kx_builtins.c` binds the three calls as rayfall language builtins. It is a
+compact template for a glue layer that isn't CPython.
 
 ### Sketch: Rust binding
 

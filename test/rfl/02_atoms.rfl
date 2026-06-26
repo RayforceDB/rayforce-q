@@ -1,0 +1,28 @@
+;; Atom decode coverage: each q expression returns a scalar that kx must
+;; decode into the matching rayforce atom. Compared by formatted value.
+
+(set h (kxconnect kxhost kxport))
+
+;; integers: long / int / short
+(kxsend h "42")  -- 42
+(kxsend h "42i") -- 42
+(kxsend h "42h") -- 42
+
+;; floats: float / real
+(kxsend h "3.25")  -- 3.25
+(kxsend h "3.25e") -- 3.25
+
+;; booleans
+(kxsend h "1b") -- true
+(kxsend h "0b") -- false
+
+;; byte
+(kxsend h "0x2a") -- 0x2a
+
+;; char atom (q "z" is a single char)
+(kxsend h "\"z\"") -- "z"
+
+;; symbol atom
+(kxsend h "`abc") -- 'abc
+
+(kxclose h)

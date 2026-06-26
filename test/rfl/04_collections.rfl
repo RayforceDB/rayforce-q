@@ -1,0 +1,21 @@
+;; Nested structures: general list, table, dict.
+
+(set h (kxconnect kxhost kxport))
+
+;; mixed general list -> rayforce list
+(kxsend h "(1;`a;1.5)") -- (list 1 'a 1.5)
+
+;; table -> rayforce table (compared whole, including column types)
+(kxsend h "([] a:1 2 3; b:`x`y`z)") -- (table ['a 'b] (list [1 2 3] ['x 'y 'z]))
+
+;; empty-ish / single-column table
+(kxsend h "([] x:1 2)") -- (table ['x] (list [1 2]))
+
+;; dict -> KNOWN DIVERGENCE: a KDB+ dict decodes as RAY_LIST + ATTR_DICT, i.e.
+;; a 2-element (keys values) list, which the formatter renders as a plain list
+;; rather than a native {a:1 b:2} dict. This mirrors the Python binding's
+;; xfail (kx.c builds the dict via ray_list_append + ATTR_DICT). Asserting the
+;; actual decoded shape so a future native-dict fix trips this test.
+(kxsend h "`a`b!1 2") -- (list ['a 'b] [1 2])
+
+(kxclose h)
