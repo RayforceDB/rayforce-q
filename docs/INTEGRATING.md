@@ -2,11 +2,8 @@
 
 `rayforce-q` is the shared Q wire-format core for RayforceDB. It is **not a
 standalone library** — it is C source you compile *into* a binding's native
-extension, next to the rayforce core. This guide shows how a binding
-(Python, Rust, …) consumes it so every binding ships the identical wire
-implementation.
-
-The whole integration is three steps: **pin → compile → glue.**
+extension, next to the rayforce core. This guide shows how a binding 
+consumes it so every binding ships the identical wire implementation.
 
 ---
 
@@ -14,18 +11,7 @@ The whole integration is three steps: **pin → compile → glue.**
 
 All bindings must build the *same* `q.c`, so pin a tag or commit — never track
 a moving branch. The current version is in [`VERSION`](./VERSION); releases are
-git tags (e.g. `v0.1.0`).
-
-Pick whichever fetch mechanism fits your build:
-
-| Mechanism            | When to use                                              |
-| -------------------- | ------------------------------------------------------- |
-| Clone at build time  | Default. Clone `--branch <tag> --depth 1` into a temp dir. |
-| Git submodule        | If you want the pinned commit tracked in your repo tree. |
-| Vendoring            | If your build must be fully offline; copy `q.c`/`q.h` and record the version. |
-
-Expose an override so developers can build against a local checkout (see the
-Python reference below).
+git tags (e.g. `v1.0.0`).
 
 ---
 
@@ -47,8 +33,7 @@ flags as the rest of your native code, e.g.:
 cc -c q.c -I<core>/include -I<core>/src -o q.o
 ```
 
-Then link `q.o` into your extension/binary. Your glue includes `"q.h"` to
-call into it.
+Then link `q.o` into your extension/binary. Your glue includes `"q.h"` to call into it.
 
 ---
 
@@ -71,13 +56,9 @@ Your glue does two jobs:
    decoded `ray_t` out). `user`/`password` may be `NULL`/`""`; `timeout_ms <= 0`
    blocks.
 2. **Map results onto your error model:**
-   - `q_connect` < 0 → branch on `Q_ERR_SOCKET` / `Q_ERR_HANDSHAKE` /
-     `Q_ERR_TIMEOUT`.
-   - `q_send` returns `NULL` → transport/serialization failure; the reason is
-     in your `err` buffer.
-   - `q_send` returns a `ray_t` that is itself a `RAY_ERROR` → a Q
-     server-side error (the q error text is in both the error code and message).
-     Surface it as a normal error, not a value.
+   - `q_connect` < 0: branch on `Q_ERR_SOCKET` / `Q_ERR_HANDSHAKE` / `Q_ERR_TIMEOUT`.
+   - `q_send` returns `NULL` → transport/serialization failure; the reason is in your `err` buffer.
+   - `q_send` returns a `ray_t` that is itself a `RAY_ERROR`: a Q server-side error (the q error text is in both the error code and message). Surface it as a normal error, not a value.
 
 ### Releasing a runtime lock around the network wait
 
@@ -87,6 +68,7 @@ CPython GIL is the canonical case), call the three-step form instead — encode
 and decode touch the rayforce symbol table (hold the lock); `q_exchange` is
 pure socket I/O (release the lock):
 
+Python example:
 ```c
 uint8_t *req; int64_t req_len;
 if (q_encode(msg, &req, &req_len, err, sizeof err) < 0) { /* error */ }
@@ -118,7 +100,7 @@ The build pattern, distilled:
 
 ```make
 RAYFORCE_Q_GITHUB     ?= https://github.com/RayforceDB/rayforce-q.git
-RAYFORCE_Q_REF        ?= v0.1.0          # pin
+RAYFORCE_Q_REF        ?= v0.2.0          # pin
 RAYFORCE_Q_LOCAL_PATH ?=                 # local-checkout override
 
 pull_q:
@@ -135,38 +117,3 @@ pull_q:
 The [`test/`](./test) directory shows a second, non-Python glue:
 `test/q_builtins.c` binds the three calls as rayfall language builtins. It is a
 compact template for a glue layer that isn't CPython.
-
-### Sketch: Rust binding
-
-A Rust binding follows the same shape — compile `q.c` in `build.rs` (via `cc`),
-declare the three functions, and convert at the `ray_t` boundary:
-
-```rust
-// build.rs
-cc::Build::new()
-    .file("vendor/rayforce-q/q.c")
-    .include(core_include_dir)   // <rayforce.h>
-    .include(core_src_dir)       // table/sym.h
-    .compile("q");
-
-// FFI
-extern "C" {
-    fn q_connect(host: *const c_char, port: c_int, user: *const c_char,
-                  password: *const c_char, timeout_ms: c_int) -> c_int;
-    fn q_close(fd: c_int) -> c_int;
-    fn q_send(fd: c_int, msg: *mut RayT, err: *mut c_char, n: usize) -> *mut RayT;
-}
-```
-
-Map `q_send`'s `NULL`/`RAY_ERROR`/value triple onto a `Result<RayValue, QError>`
-exactly as the C and Python glue do.
-
----
-
-## Checklist
-
-- [ ] Pinned to a tag/commit (not a branch).
-- [ ] `q.c` compiled with the core's `include/` **and** `src/` on the include path.
-- [ ] `q.o` linked into the extension.
-- [ ] Glue maps `Q_ERR_*`, `NULL`, and a returned `RAY_ERROR` to your error model.
-- [ ] A local-checkout override for development.

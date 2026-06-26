@@ -2,7 +2,6 @@
 *.so
 *.a
 *.dylib
-
-# test build
 test/tmp/
 test/q_test
+CLAUDE.md

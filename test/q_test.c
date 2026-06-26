@@ -1,18 +1,32 @@
 /*
- * q_test.c — rayfall test runner for the q Q client.
+ * Copyright (c) 2026 RayforceDB Team
+ * All rights reserved.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ */
+
+/*
+ * q_test.c — rayfall test runner for the Q client.
  *
  * Embeds the rayforce engine, registers the q builtins (see q_builtins.c),
  * and runs one or more `.rfl` test files. The assertion DSL mirrors the
- * rayforce core's own .rfl harness:
- *
- *   EXPR -- VALUE     pass if format(EXPR) == format(VALUE)
- *   EXPR !- SUBSTR    pass if EXPR raises an error whose text contains SUBSTR
- *   EXPR              raw setup line; fails the file if it raises
- *   ;; ...            comment; blank lines ignored
- *
- * A fresh runtime is created per file so connection handles and `set`
- * bindings don't leak across files. Exit status is the number of failing
- * files (0 = all pass).
+ * rayforce core's own .rfl harness.
  */
 
 #include <rayforce.h>
@@ -22,8 +36,6 @@
 #include <string.h>
 
 void q_register_builtins(void);
-
-/* ---- formatting helpers (mirrors core test/main.c) ---- */
 
 static int fmt_eq(ray_t *a, ray_t *b) {
   if (a == NULL && b == NULL)
@@ -94,7 +106,7 @@ static char *find_top_sep(char *s, const char *marker) {
   return NULL;
 }
 
-/* Run one .rfl file. Returns 0 on pass, 1 on failure (message printed). */
+/* Run one .rfl file. Returns 0 on pass, 1 on failure. */
 static int run_rfl_file(const char *path) {
   FILE *f = fopen(path, "rb");
   if (!f) {

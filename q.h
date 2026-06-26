@@ -1,24 +1,39 @@
+/*
+ * Copyright (c) 2026 RayforceDB Team
+ * All rights reserved.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ */
+
 #ifndef RAYFORCE_Q_H
 #define RAYFORCE_Q_H
 /*
  * rayforce-q — Q IPC wire-format client for RayforceDB.
  *
- * Language-neutral C core shared across RayforceDB language bindings
- * (Python, Rust, ...). It speaks the documented Q wire format over
- * blocking sockets and converts between the wire and rayforce core
- * `ray_t` objects. There is no binding-specific (e.g. CPython) code here;
- * each binding wraps these entry points in its own glue.
+ * Language-neutral C core shared across RayforceDB language bindings.
+ *
+ * It speaks the documented Q wire format over blocking sockets and
+ * converts between the wire and rayforce core `ray_t` objects.
  *
  * A connection handle is the raw socket file descriptor (>= 0). There is no
  * global connection table, so the client is thread-safe and unbounded: each
  * fd is independent and owned by the caller.
- *
- * Supported Q wire types
- *   atoms:   -KB -KG -KH -KI -KJ -KE -KF -KC -KS -KP -KM -KD -KN -KU -KV
- *            -KT -UU
- *   vectors: KB UU KG KH KI KJ KE KF KC KS KP KM KD KZ KN KU KV KT
- *   nested:  0 (general list), XT (table), XD (dict)
- *   error:   -128
  */
 
 #include <rayforce.h>
@@ -30,13 +45,7 @@
 #define Q_ERR_HANDSHAKE (-2) /* socket connected but handshake/auth failed */
 #define Q_ERR_TIMEOUT (-3)   /* connect timed out                        */
 
-/* Open a TCP connection to a Q server and perform the login handshake.
- *
- *   user / password  may be NULL or "" for servers without authentication.
- *   timeout_ms       connect timeout and per-operation send/recv timeout;
- *                    <= 0 means block indefinitely (no timeout).
- *
- * Returns a connection fd (>= 0), or one of the Q_ERR_* codes. */
+/* Open a TCP connection to a Q server and perform the login handshake. */
 int q_connect(const char *host, int port, const char *user,
               const char *password, int timeout_ms);
 
@@ -45,22 +54,16 @@ int q_close(int fd);
 
 /* Serialize `msg` into a complete Q wire request (header + body). Touches
  * the rayforce symbol table, so call it with any runtime lock held (e.g. the
- * CPython GIL). On success returns 0 and sets *req (malloc'd; caller frees)
- * and *req_len; on failure returns -1 and writes err. */
+ * CPython GIL). */
 int q_encode(ray_t *msg, uint8_t **req, int64_t *req_len, char *err,
              size_t errlen);
 
-/* Send a pre-encoded request on `fd` and read the raw response body. This is
- * pure blocking socket I/O plus malloc — no rayforce object access — so it is
- * safe to run with a runtime lock released (release the GIL around this to
- * keep other threads live during the server round-trip). On success returns 0
- * and sets *resp (malloc'd; caller frees), *resp_len and *compressed; on
- * failure returns -1 and writes err. */
+/* Send a pre-encoded request on `fd` and read the raw response body. */
 int q_exchange(int fd, const uint8_t *req, int64_t req_len, uint8_t **resp,
                int64_t *resp_len, int *compressed, char *err, size_t errlen);
 
 /* Decompress (if needed) and deserialize a response body obtained from
- * q_exchange into a freshly-owned rayforce object. The result may itself be a
+ * q_exchange into a freshly-owned rayforce object. The result may be a
  * RAY_ERROR carrying a Q server-side error. Touches the symbol table, so
  * call it with the runtime lock held. Returns NULL on a decode failure. */
 ray_t *q_decode(uint8_t *resp, int64_t resp_len, int compressed, char *err,

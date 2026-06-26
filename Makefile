@@ -1,6 +1,6 @@
-# Test build for rayforce-q (lives on the `tests` branch only).
+# Test build for rayforce-q.
 #
-# Builds a small rayforce-linked binary that registers the q Q client as
+# Builds a small rayforce-linked binary that registers the Q client as
 # rayfall builtins, then runs the .rfl tests against a live q server. The
 # native rayforce engine is cloned (or copied from a local checkout) and built
 # as a static lib that this driver links against.
@@ -16,7 +16,7 @@
 #   PORT                 q listen port (run_tests.sh picks a free one if unset)
 
 UNAME_S := $(shell uname -s)
-ROOT    := $(shell cd .. && pwd)
+ROOT    := $(shell pwd)
 CORE    := $(ROOT)/test/tmp/rayforce-c
 
 RAYFORCE_GITHUB ?= https://github.com/RayforceDB/rayforce.git
@@ -32,7 +32,7 @@ else
   LIBS = -lm
 endif
 
-SRCS = $(ROOT)/q.c q_builtins.c q_test.c
+SRCS = q.c test/q_builtins.c test/q_test.c
 
 pull_core:
 	@rm -rf $(CORE)
@@ -54,12 +54,15 @@ core_lib: pull_core
 
 q_test: core_lib
 	@echo "🔧 Building q_test driver..."
-	@$(CC) $(CFLAGS) -o q_test $(SRCS) $(CORE)/librayforce.a $(LIBS)
+	@$(CC) $(CFLAGS) -o test/q_test $(SRCS) $(CORE)/librayforce.a $(LIBS)
+
+lint:
+	clang-format -i ./q.c ./q.h ./test/q_builtins.c ./test/q_test.c
 
 test: q_test
-	@./run_tests.sh ./q_test rfl
+	@./test/run_tests.sh ./test/q_test test/rfl
 
 clean:
-	@rm -rf $(ROOT)/test/tmp q_test *.o
+	@rm -rf test/tmp test/q_test *.o
 
 .PHONY: pull_core core_lib test clean

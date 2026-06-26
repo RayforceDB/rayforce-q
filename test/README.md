@@ -1,16 +1,14 @@
 # rayforce-q tests
 
-Integration tests for the q Q client, written in the **rayfall** language
-and run against a real `q` server, wired into GitHub CI. Bindings only
-ever compile `q.c` / `q.h`, so this scaffolding is inert for them.
+Integration tests for the Q client, written in the **rayfall** language
+and run against a real `q` server. Bindings only ever compile `q.c` / `q.h`, so this scaffolding is inert for them.
 
 ## How it works
 
 The pinned rayforce core has no runtime `.so` loading, so to drive `q_*` from
 rayfall we compile it into a small rayforce-linked binary:
 
-1. `make` clones (or copies) the native rayforce core and builds it as a static
-   library (`librayforce.a`).
+1. `make` clones the native rayforce core and builds it as a static library (`librayforce.a`).
 2. `q.c` + [`q_builtins.c`](q_builtins.c) + [`q_test.c`](q_test.c) are
    compiled and linked against that library into a `q_test` driver.
    `q_builtins.c` registers `q_connect`/`q_send`/`q_close` as the rayfall
@@ -23,12 +21,10 @@ rayfall we compile it into a small rayforce-linked binary:
 ## Running
 
 ```sh
-cd test
-
 # clone the core from GitHub, build, and run:
 make test
 
-# or build against a local rayforce checkout (no network):
+# or build against a local rayforce checkout:
 RAYFORCE_LOCAL_PATH=/path/to/rayforce make test
 ```
 
@@ -49,19 +45,3 @@ EXPR              raw setup line; fails the file if it raises
 `qhost` / `qport` are bound by the driver so the tests don't hard-code the
 server address. Each `.rfl` file runs under a fresh runtime, so handles and
 `set` bindings don't leak between files.
-
-## Coverage
-
-| File                  | What it covers                                             |
-| --------------------- | ---------------------------------------------------------- |
-| `01_connection.rfl`   | connect / send / close lifecycle, closed-handle + dead-port errors |
-| `02_atoms.rfl`        | long/int/short, float/real, bool, byte, char, symbol atoms |
-| `03_vectors.rfl`      | int/float/bool/byte/symbol/char vectors, lengths, large (100k) response |
-| `04_collections.rfl`  | general list, tables (whole-value), native dict            |
-| `05_temporal.rfl`     | date / time / timestamp (epoch + width compatibility)      |
-| `06_errors.rfl`       | server-side error decode (`-128`), post-error reuse        |
-| `07_auth.rfl`         | login with credentials, wrong-password + no-credentials rejection |
-| `08_nulls.rfl`        | typed null atoms / nulls in vectors, empty typed vectors   |
-
-The auth tests need a second q started with `-u`; `run_tests.sh` handles both
-servers and injects `qhost`/`qport`/`qauthport`/`quser`/`qpass`.

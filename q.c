@@ -1,10 +1,29 @@
+/*
+ * Copyright (c) 2026 RayforceDB Team
+ * All rights reserved.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ */
+
 #define _GNU_SOURCE
 /*
- * q.c — Q IPC wire-format client core (see q.h).
- *
- * Language-neutral: depends only on the rayforce core public API (`ray_t`
- * and friends), never on a specific binding runtime. Blocking sockets, no
- * event loop.
+ * Q IPC wire-format client core (see q.h). Language-neutral
  */
 
 #include "q.h"
@@ -58,9 +77,6 @@ static inline size_t ray_scalar_elem_size(int8_t type) {
   }
 }
 
-/* ================================================================
- * Q wire-format constants
- * ================================================================ */
 #define Q_KB 1  /* boolean      */
 #define Q_UU 2  /* guid (16B)   */
 #define Q_KG 4  /* byte         */
@@ -127,10 +143,6 @@ static ray_t *q_build_table(const int64_t *col_ids, ray_t *const *cols,
   return tbl;
 }
 
-/* ================================================================
- * Socket helpers
- * ================================================================ */
-
 static ssize_t q_recv_all(int fd, void *buf, size_t n) {
   size_t total = 0;
   uint8_t *p = (uint8_t *)buf;
@@ -163,7 +175,7 @@ static ssize_t q_send_all(int fd, const void *buf, size_t n) {
   return (ssize_t)total;
 }
 
-/* Connect one address with an optional timeout (ms). 0/negative blocks.
+/* Connect one address with an optional timeout (ms)
  * Returns 0 on success, -1 on plain failure, -2 on timeout. */
 static int q_connect_one(const struct addrinfo *p, int timeout_ms, int fd) {
   if (timeout_ms <= 0)
@@ -200,7 +212,7 @@ static int q_connect_one(const struct addrinfo *p, int timeout_ms, int fd) {
   return 0;
 }
 
-/* Open a TCP connection. *timed_out is set when the failure was a timeout. */
+/* Open a TCP connection. */
 static int q_open_socket(const char *host, int port, int timeout_ms,
                          int *timed_out) {
   *timed_out = 0;
@@ -245,10 +257,6 @@ static void q_set_timeout(int fd, int timeout_ms) {
   setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
 }
 
-/* ================================================================
- * Wire-format size + serialize (rayforce v2 → Q)
- * ================================================================ */
-
 static int8_t q_type_of(int8_t ray_type) {
   int sign = (ray_type < 0) ? -1 : 1;
   int t = (ray_type < 0) ? -ray_type : ray_type;
@@ -292,13 +300,11 @@ static int8_t q_type_of(int8_t ray_type) {
   }
 }
 
-/* Forward */
 static int64_t q_size_obj(ray_t *obj);
 static int64_t q_ser_obj(uint8_t *buf, ray_t *obj);
 static ray_t *q_des_obj(uint8_t **buf, int64_t *len);
 
-/* Build a v2 table from a RAY_SYM-vec of column names and a RAY_LIST of
- * column vectors. Consumes references to `keys` and `vals`. */
+/* Build a v2 table from RAY_SYM-vec of names and RAY_LIST of vectors. */
 static ray_t *q_make_table(ray_t *keys, ray_t *vals) {
   if (keys == NULL || vals == NULL || keys->type != RAY_SYM ||
       vals->type != RAY_LIST || keys->len != vals->len) {
@@ -380,7 +386,7 @@ static int64_t q_size_obj(ray_t *obj) {
   }
   if (t == RAY_TABLE) {
     /* Wire form: XT byte + attrs(0) + XD marker + KS-vec of names +
-     * list-0 of column vectors. v2 RAY_TABLE is opaque — extract via the
+     * list-0 of column vectors. RAY_TABLE is opaque - extract via the
      * public accessors instead of indexing ray_data directly. */
     int64_t ncols = ray_table_ncols(obj);
     int64_t names = 1 + 1 + 4; /* KS type + attrs + count */
@@ -467,7 +473,7 @@ static int64_t q_ser_obj(uint8_t *buf, ray_t *obj) {
         *buf++ = (uint8_t)ray_str_ptr(obj)[0];
         return buf - start;
       }
-      /* RAY_STR atom (n>1) → KC vector */
+      /* RAY_STR atom (n>1) -> KC vector */
       start[0] = (uint8_t)Q_KC;
       *buf++ = 0; /* attrs */
       uint32_t len32 = (uint32_t)n;
@@ -577,19 +583,13 @@ static int64_t q_ser_obj(uint8_t *buf, ray_t *obj) {
   return buf + n - start;
 }
 
-/* ================================================================
- * Wire-format deserialize (Q → rayforce v2)
- * ================================================================ */
-
 #define Q_NEED(n)                                                              \
   do {                                                                         \
     if (*len < (int64_t)(n))                                                   \
       return ray_error("q: buffer underflow", NULL);                           \
   } while (0)
 
-/* Decode a width-byte atom and re-tag as the requested ray_type. Works
- * because v2's atom union shares storage by width: BOOL/U8 → u8;
- * I16 → i16; I32/DATE/TIME → i32; I64/TIMESTAMP → i64. */
+/* Decode a width-byte atom and re-tag as the requested ray_type */
 static ray_t *q_des_atom_i(uint8_t **buf, int64_t *len, int8_t ray_type,
                            int width) {
   Q_NEED(width);
@@ -881,7 +881,7 @@ static ray_t *q_des_obj(uint8_t **buf, int64_t *len) {
       return vals;
     }
     /* A plain dict (e.g. `a`b!1 2) becomes a native rayforce dict. A keyed
-     * table arrives as a dict whose key and value are both tables; rayforce
+     * table arrives as a dict whose key and value are both tables. Rayforce
      * has no keyed-table type here, so keep that as a 2-element
      * RAY_LIST + ATTR_DICT (key-table, value-table). */
     if (keys->type == RAY_TABLE && vals->type == RAY_TABLE) {
@@ -898,8 +898,8 @@ static ray_t *q_des_obj(uint8_t **buf, int64_t *len) {
   }
 
   case Q_ERR: {
-    /* Error string is NUL-terminated on the wire; ensure the terminator is
-     * within the remaining buffer before handing it to ray_error (#H4 OOB). */
+    /* The error string is NUL-terminated on the wire. Ensure the terminator is
+     * within the remaining buffer before handing it to ray_error. */
     const char *s = (const char *)*buf;
     int64_t i = 0;
     while (i < *len && s[i] != '\0')
@@ -917,10 +917,7 @@ static ray_t *q_des_obj(uint8_t **buf, int64_t *len) {
   }
 }
 
-/* ================================================================
- * IPC decompression for compressed Q responses.
- * ================================================================ */
-
+/* Decompression */
 static int q_decompress(const uint8_t *src, int64_t src_len, uint8_t **out_buf,
                         int64_t *out_len) {
   if (src_len < 4)
@@ -986,10 +983,7 @@ static int q_decompress(const uint8_t *src, int64_t src_len, uint8_t **out_buf,
   return 0;
 }
 
-/* ================================================================
- * Public entry points (see q.h)
- * ================================================================ */
-
+/* Public API */
 int q_connect(const char *host, int port, const char *user,
               const char *password, int timeout_ms) {
   int timed_out = 0;

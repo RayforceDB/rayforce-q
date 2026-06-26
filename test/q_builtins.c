@@ -1,16 +1,34 @@
 /*
- * q_builtins.c — exposes the q Q client as rayfall builtins.
+ * Copyright (c) 2026 RayforceDB Team
+ * All rights reserved.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ */
+
+/*
+ * q_builtins.c — exposes the Q client as rayfall builtins.
  *
  * The pinned rayforce core has no runtime .so loading, so a binding-independent
  * way to drive q from the rayfall language is to compile it into a small
  * rayforce-linked binary and register the functions in the global environment
  * with the runtime `ray_env_set` API. This file is that registration shim; it
  * is test-only (lives under test/) and is never shipped to bindings.
- *
- * Bound names (plain identifiers — `ray_env_set` rejects the reserved
- * `.`-root): (qconnect host port [user password [timeout_ms]]) -> int handle,
- * or error (qsend    handle msg) -> decoded rayforce object (may be a server
- * error) (qclose   handle)     -> null
  */
 
 #include "q.h"
@@ -20,8 +38,7 @@
 
 #include <string.h>
 
-/* Read a signed integer out of any fixed-width rayforce integer/temporal atom.
- * Sets *ok = 0 if the object is not such an atom. */
+/* Read a signed integer out of fixed-width rayforce integer/temporal atom */
 static int64_t q_atom_i64(ray_t *a, int *ok) {
   *ok = 1;
   if (a == NULL) {
@@ -115,7 +132,7 @@ static ray_t *qb_send(ray_t *handle, ray_t *msg) {
   char err[128] = {0};
   ray_t *res = q_send((int)fd, msg, err, sizeof err);
   if (res == NULL) {
-    /* Surface a meaningful code: a closed/invalid slot vs a send failure. */
+    /* Surface a meaningful code: a closed/invalid fd vs a send failure. */
     const char *code = strstr(err, "handle") ? "handle" : "send";
     return ray_error(code, err[0] ? err : "qsend: send failed");
   }

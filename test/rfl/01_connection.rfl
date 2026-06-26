@@ -3,7 +3,7 @@
 
 (set h (qconnect qhost qport))
 
-;; A handle is a non-negative integer slot.
+;; A handle is a non-negative integer (the socket fd).
 (>= h 0) -- true
 
 ;; Basic synchronous query evaluation.

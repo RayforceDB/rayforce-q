@@ -16,19 +16,13 @@ jobs:
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y build-essential clang rsync unzip
 
-      # run_tests.sh uses python3 for free-port selection and readiness checks.
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
 
-      # q is proprietary, so the q binary is provisioned only when the repo
-      # supplies it via secrets. Without them the build still runs (compiling
-      # q.c + the driver against the real core is meaningful coverage) and the
-      # harness skips the q-backed assertions.
-      #
       #   Q_URL        URL to a zip/tarball containing the linux-64 q binary
       #   Q_LICENSE_B64  base64-encoded kc.lic
-      - name: Provision q (optional)
+      - name: Provision Q
         env:
           Q_URL: ${{ secrets.Q_URL }}
           Q_LICENSE_B64: ${{ secrets.Q_LICENSE_B64 }}
@@ -53,10 +47,9 @@ jobs:
             echo "::notice::No q secrets (Q_URL / Q_LICENSE_B64) set — building only; q-backed tests will skip."
           fi
 
-      - name: Build and run rayfall tests
+      - name: Build and run tests
         working-directory: test
         env:
-          # Core source. Override with a tokenized URL via secret if private.
           RAYFORCE_GITHUB: ${{ secrets.RAYFORCE_GITHUB || 'https://github.com/RayforceDB/rayforce.git' }}
           RAYFORCE_REF: ${{ vars.RAYFORCE_REF }}
           CC: clang
