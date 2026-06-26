@@ -33,14 +33,24 @@ ray_t *kx_send(int slot, ray_t *msg, char *err, size_t n);  /* -> ray_t*, or NUL
 signals a transport/serialization failure, with a short reason written to
 `err`.
 
-## Building
+## Building into a binding
 
 `rayforce-kx` is not a standalone library — it is compiled **into** a binding's
 build alongside the rayforce core, which supplies `<rayforce.h>` and the
 `table/sym.h` internal header. Drop `kx.c`/`kx.h` next to the binding's sources
-and compile with the core's include paths. See the RayforceDB Python binding's
-build (`Makefile` / `scripts/prepare_build.sh`) for a reference integration:
-it pulls this repo at a pinned ref and copies `kx.*` into its `pyext/` build dir.
+and compile with the core's include paths.
+
+See **[INTEGRATING.md](./INTEGRATING.md)** for the full pin → compile → glue
+guide, with Python (reference), rayfall, and Rust examples. The RayforceDB
+Python binding (`Makefile` / `scripts/prepare_build.sh` + `raypy_kdb.c`) is the
+canonical integration: it pulls this repo at a pinned ref and copies `kx.*` into
+its `pyext/` build dir.
+
+## Tests
+
+Integration tests (rayfall, run against a live `q` server) live on the
+[`tests`](https://github.com/RayforceDB/rayforce-kx/tree/tests) branch, kept off
+`main` so bindings pull only `kx.c` / `kx.h`.
 
 ## Versioning
 
