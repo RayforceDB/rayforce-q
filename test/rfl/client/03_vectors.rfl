@@ -1,0 +1,32 @@
+;; Vector decode coverage.
+
+(set h (.q.connect qhost qport))
+
+;; integer vectors: long / int
+(.q.send h "til 5")   -- [0 1 2 3 4]
+(.q.send h "1 2 3")   -- [1 2 3]
+(.q.send h "1 2 3i")  -- [1 2 3]
+
+;; float vectors: float / real (real is widened to f64)
+(.q.send h "1.5 2.5 3.5")  -- [1.5 2.5 3.5]
+(.q.send h "1.5 2.5 3.5e") -- [1.5 2.5 3.5]
+
+;; boolean vector
+(.q.send h "101b") -- [true false true]
+
+;; byte vector
+(.q.send h "0x010203") -- [0x01 0x02 0x03]
+
+;; symbol vector
+(.q.send h "`a`b`c") -- ['a 'b 'c]
+
+;; char vector -> rayforce string
+(.q.send h "\"hello\"") -- "hello"
+
+;; vector length round-trips
+(count (.q.send h "til 100")) -- 100
+
+;; large response: exercises multi-recv (and decompression for remote peers)
+(count (.q.send h "til 100000")) -- 100000
+
+(.q.close h)

@@ -1,11 +1,9 @@
-# Build targets for rayforce-q. The native rayforce engine is cloned (or
-# copied from a local checkout) and built; both targets reuse that checkout.
+# Build targets for rayforce-q
 #
 #   make test       # build the rayfall test driver and run the .rfl suite
-#   make recheck    # re-run the suite against an already-built core (fast)
-#   make rayforce   # build a rayforce binary with Q IPC as .q.* env functions
+#   make recheck    # re-run the suite against an already-built core
+#   make rayforce   # build a rayforce binary with the Q IPC client+server in
 #   make lint       # clang-format the sources
-#   make hooks      # install the lint+test pre-commit hook
 #
 #   RAYFORCE_LOCAL_PATH=/path/to/core make test   # use a local core checkout
 #
@@ -13,8 +11,6 @@
 #   RAYFORCE_GITHUB      core git URL (default: public repo)
 #   RAYFORCE_REF         branch/tag to check out (optional)
 #   RAYFORCE_LOCAL_PATH  rsync this checkout instead of cloning
-#   Q_BINARY             path to the q binary (run_tests.sh autodetects)
-#   PORT                 q listen port (run_tests.sh picks a free one if unset)
 
 UNAME_S := $(shell uname -s)
 ROOT    := $(shell pwd)
@@ -33,7 +29,11 @@ else
   LIBS = -lm
 endif
 
-SRCS = q.c test/q_builtins.c test/q_test.c
+# The test driver links the reusable client (q.c), the reusable server
+# (q_server.c), and the shipped `.q.*` verb glue (embed/rayforce_q.c)
+DRIVER_SRCS = q.c q_server.c embed/rayforce_q.c test/driver.c
+
+FMT_SRCS = q.c q.h q_server.c q_server.h embed/rayforce_q.c test/driver.c
 
 pull_core:
 	@rm -rf $(CORE)
@@ -49,50 +49,40 @@ pull_core:
 			--depth 1 $(RAYFORCE_GITHUB) "$(CORE)"; \
 	fi
 
-core_lib: pull_core
+test: pull_core
 	@echo "🔨 Building librayforce.a..."
 	@$(MAKE) -C $(CORE) lib
-
-q_test: core_lib
-	@echo "🔧 Building q_test driver..."
-	@$(CC) $(CFLAGS) -o test/q_test $(SRCS) $(CORE)/librayforce.a $(LIBS)
-
-test: q_test
-	@./test/run_tests.sh ./test/q_test test/rfl
+	@echo "🔧 Building test/driver (client + --serve)..."
+	@$(CC) $(CFLAGS) -o test/driver $(DRIVER_SRCS) $(CORE)/librayforce.a $(LIBS)
+	@./test/run.sh ./test/driver test/rfl
 
 # Re-run the suite against an already-built core (fast; no clone/rebuild).
 # Requires a prior `make test`. Used by the pre-commit hook.
 recheck:
 	@test -f $(CORE)/librayforce.a || { echo "no core build — run 'make test' first" >&2; exit 1; }
 	@test ! -d $(CORE)/src/q || { echo "core was used by 'make rayforce' — run 'make clean && make test'" >&2; exit 1; }
-	@$(CC) $(CFLAGS) -o test/q_test $(SRCS) $(CORE)/librayforce.a $(LIBS)
-	@./test/run_tests.sh ./test/q_test test/rfl
+	@$(CC) $(CFLAGS) -o test/driver $(DRIVER_SRCS) $(CORE)/librayforce.a $(LIBS)
+	@./test/run.sh ./test/driver test/rfl
 
-# Build a rayforce binary with the Q IPC client compiled in and exposed as the
-# .q.connect / .q.send / .q.close rayfall env functions. Drops q.c/q.h/q_env.c
-# into the core's src/ (auto-picked up by its wildcard build) and patches main.c
-# to register them once, right after the runtime is created.
+# Build a rayforce binary with the Q IPC client AND the Q-protocol server compiled in.
 rayforce: pull_core
 	@echo "🔧 Embedding Q IPC into the rayforce binary..."
 	@mkdir -p $(CORE)/src/q
-	@cp q.c q.h embed/q_env.c $(CORE)/src/q/
-	@sed 's@ray_runtime_t\* rt = ray_runtime_create(argc, argv);@& extern void q_env_register(void); if (rt) q_env_register();@' \
+	@cp q.c q.h q_server.c q_server.h embed/rayforce_q.c $(CORE)/src/q/
+	@sed -e 's@ray_runtime_t\* rt = ray_runtime_create(argc, argv);@& extern void q_env_register(void); if (rt) q_env_register();@' \
+	     -e 's@        else if (strcmp(argv\[i\], "--") == 0)@        else if ((strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--q-serve") == 0) \&\& i + 1 < argc) { i++; } &@' \
+	     -e 's@if (poll) ray_runtime_set_poll(poll);@& { extern int64_t q_serve_from_args(ray_poll_t*, int, char**); if (poll) q_serve_from_args(poll, argc, argv); }@' \
 		$(CORE)/src/app/main.c > $(CORE)/src/app/main.c.q && \
 		mv $(CORE)/src/app/main.c.q $(CORE)/src/app/main.c
 	@$(MAKE) -C $(CORE) release
 	@cp $(CORE)/rayforce ./rayforce
-	@echo '✓ ./rayforce ready — e.g. (.q.connect "localhost" 5000 "" "" 0)'
+	@if [ "$(UNAME_S)" = "Darwin" ]; then codesign --force --sign - ./rayforce >/dev/null 2>&1 || true; fi
+	@echo './rayforce is ready'
 
 lint:
-	clang-format -i ./q.c ./q.h ./embed/q_env.c ./test/q_builtins.c ./test/q_test.c
-
-# Enable the pre-commit hook (clang-format check + fast tests).
-hooks:
-	@git config core.hooksPath .githooks
-	@chmod +x .githooks/pre-commit
-	@echo "✓ pre-commit hook enabled (lint + tests)"
+	clang-format -i $(addprefix ./,$(FMT_SRCS))
 
 clean:
-	@rm -rf test/tmp test/q_test rayforce *.o
+	@rm -rf test/tmp test/driver rayforce *.o
 
-.PHONY: pull_core core_lib test recheck rayforce lint hooks clean
+.PHONY: pull_core core_lib driver test recheck rayforce lint hooks clean

@@ -22,26 +22,16 @@
  */
 
 /*
- * q_env.c — register the Q IPC client as `.q.*` rayfall builtins.
- *
- * Compiled into a rayforce binary (see `make rayforce`) and called once at
- * startup, so any rayfall script or REPL session can talk to a Q server:
- *
- *   (set h (.q.connect "localhost" 5000 "" "" 0))
- *   (.q.send h "([] a:1 2 3; b:`x`y`z)")
- *   (.q.close h)
- *
- * This is the binary-side counterpart of a binding's glue layer: it converts
- * rayfall arguments to/from `ray_t` and calls into q.c. `.q.*` lives in the
- * reserved system namespace (like `.ipc.*` / `.os.*`), so it is bound with
- * ray_env_bind rather than the user-facing ray_env_set.
+ * rayforce_q.c — the glue that turns a plain rayforce binary into rayforce-q.
  */
 
-#include "q.h"
+#include "q.h"        /* q_connect / q_send / q_close            */
+#include "q_server.h" /* q_serve, ray_poll_t                     */
 
-#include "lang/env.h"  /* ray_fn_*, ray_env_bind, ray_env_bind_flat */
-#include "lang/eval.h" /* RAY_FN_NONE */
+#include "lang/env.h"  /* ray_env_bind, ray_env_bind_flat        */
+#include "lang/eval.h" /* ray_fn_*, RAY_FN_NONE                  */
 
+#include <stdlib.h> /* atoi  */
 #include <string.h>
 
 static int64_t q_atom_i64(ray_t *a, int *ok) {
@@ -80,22 +70,22 @@ static void q_str_arg(ray_t *a, char *buf, size_t cap) {
   buf[n] = '\0';
 }
 
-/* (.q.connect host port [user password [timeout_ms]]) -> fd, or error. */
+/* (.q.connect host port [user password [timeout_ms]]) -> fd */
 static ray_t *qb_connect(ray_t **args, int64_t n) {
   if (n < 2 || n > 5)
-    return ray_error(".q.connect: host port [user password [timeout_ms]]",
-                     NULL);
+    return ray_error("arity",
+                     ".q.connect: host port [user password [timeout_ms]]");
   if (args[0] == NULL || args[0]->type != -RAY_STR)
-    return ray_error(".q.connect: host must be a string", NULL);
+    return ray_error("type", ".q.connect: host must be a string");
   int ok;
   int64_t port = q_atom_i64(args[1], &ok);
   if (!ok)
-    return ray_error(".q.connect: port must be an integer", NULL);
+    return ray_error("type", ".q.connect: port must be an integer");
 
   char host[256];
   size_t hn = ray_str_len(args[0]);
   if (hn >= sizeof host)
-    return ray_error(".q.connect: host too long", NULL);
+    return ray_error("length", ".q.connect: host too long");
   memcpy(host, ray_str_ptr(args[0]), hn);
   host[hn] = '\0';
 
@@ -114,27 +104,30 @@ static ray_t *qb_connect(ray_t **args, int64_t n) {
   if (fd < 0) {
     switch (fd) {
     case Q_ERR_TIMEOUT:
-      return ray_error(".q.connect: connect timed out", NULL);
+      return ray_error("timeout", ".q.connect: connect timed out");
     case Q_ERR_HANDSHAKE:
-      return ray_error(".q.connect: handshake/auth failed", NULL);
+      return ray_error("auth", ".q.connect: handshake/auth failed");
     default:
-      return ray_error(".q.connect: connect failed", NULL);
+      return ray_error("connect", ".q.connect: connect failed");
     }
   }
   return ray_i64(fd);
 }
 
-/* (.q.send handle msg) -> decoded response (may be a server error). */
+/* (.q.send handle msg) -> decoded response (may itself be a Q server error). */
 static ray_t *qb_send(ray_t *handle, ray_t *msg) {
   int ok;
   int64_t fd = q_atom_i64(handle, &ok);
   if (!ok)
-    return ray_error(".q.send: handle must be an integer", NULL);
+    return ray_error("type", ".q.send: handle must be an integer");
 
   char err[128] = {0};
   ray_t *res = q_send((int)fd, msg, err, sizeof err);
-  if (res == NULL)
-    return ray_error(err[0] ? err : ".q.send: send failed", NULL);
+  if (res == NULL) {
+    /* Distinguish a closed/invalid fd from a transport failure. */
+    const char *code = strstr(err, "handle") ? "handle" : "send";
+    return ray_error(code, "%s", err[0] ? err : ".q.send: send failed");
+  }
   return res;
 }
 
@@ -143,14 +136,14 @@ static ray_t *qb_close(ray_t *handle) {
   int ok;
   int64_t fd = q_atom_i64(handle, &ok);
   if (!ok)
-    return ray_error(".q.close: handle must be an integer", NULL);
+    return ray_error("type", ".q.close: handle must be an integer");
   q_close((int)fd);
   return RAY_NULL_OBJ;
 }
 
 /* Bind a builtin under its reserved-namespace name (`.q.*`): ray_env_bind
- * builds the namespace dict, ray_env_bind_flat registers the flat name for
- * REPL completion. Mirrors how the core registers `.sys.*` / `.os.*`. */
+ * builds the namespace dict, ray_env_bind_flat registers the flat name for REPL
+ * completion. */
 static void q_bind(const char *name, ray_t *fn) {
   int64_t id = ray_sym_intern(name, strlen(name));
   ray_env_bind(id, fn);
@@ -172,4 +165,15 @@ void q_env_register(void) {
   f = ray_fn_unary(".q.close", RAY_FN_NONE, qb_close);
   q_bind(".q.close", f);
   ray_release(f);
+}
+
+/* Folded entry point, called from the rayforce binary's main()
+ * Starts the Q server when `-q PORT` / `--q-serve PORT` is present */
+int64_t q_serve_from_args(ray_poll_t *poll, int argc, char **argv) {
+  for (int i = 1; i < argc; i++) {
+    if ((strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--q-serve") == 0) &&
+        i + 1 < argc)
+      return q_serve(poll, atoi(argv[++i]));
+  }
+  return -1;
 }

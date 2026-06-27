@@ -1,9 +1,19 @@
 # Changelog
 
-All notable changes to `rayforce-q` are documented here. The format follows
-[Keep a Changelog](https://keepachangelog.com/), and the project adheres to
-[Semantic Versioning](https://semver.org/). Bindings pin a tag, so each release
-is a stable point they can build against.
+All notable changes to `rayforce-q` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/), and the project adheres to [Semantic Versioning](https://semver.org/). Bindings pin a tag, so each release is a stable point they can build against.
+
+## [2.0.0]
+
+### Added
+
+- **Q server core** — a second language-neutral pair, `q_server.c` / `q_server.h`, mirroring the client: `q_serve(poll, port)` registers a non-blocking Q listener on a rayforce poll, evaluating each request as Rayfall and replying Q-encoded.
+- **Embedded server**: `rayforce -q PORT` serves Rayfall over the Q wire on the REPL's own event loop (REPL stays interactive).
+- **String-column wire support**: a column of strings (`RAY_STR`) serializes as a q general list of char-vectors and round-trips back.
+
+### Fixed
+
+- **GUID atom serialization**: a GUID *atom* keeps its 16 bytes in a child block, so `q_encode` was emitting pointer bytes for a single GUID
+
 
 ## [1.0.0]
 

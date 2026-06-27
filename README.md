@@ -1,12 +1,37 @@
 # rayforce-q
 
-Q IPC wire-format client for [RayforceDB](https://github.com/RayforceDB) —
-a small, **language-neutral C core**
+Q IPC wire-format client for [RayforceDB](https://github.com/RayforceDB) — a small, **language-neutral C core and compiled binary**
 
-The core operates **purely** on rayforce `ray_t` objects and the public
-`<rayforce.h>` API.
+The core operates **purely** on rayforce `ray_t` objects and the public `<rayforce.h>` API
 
-## API
+# Embedded binary
+
+`make rayforce` builds a `rayforce` binary with **both** the Q client and the Q server compiled in.
+
+### Client
+
+The client is exposed as `.q.*` rayfall env functions, so any script or REPL session can query a Q server:
+
+```clojure
+(set h (.q.connect "localhost" 5000 "" "" 0))    ;; host port [user password [timeout_ms]]
+(.q.send h "([] a:1 2 3; b:`x`y`z)")             ;; -> a rayforce table
+(.q.close h)
+```
+
+### Server
+
+The server is exposed via the `-q PORT` flag — it shares the REPL's event loop, so the REPL stays interactive while it serves Q clients:
+
+```sh
+./rayforce -q 25565        # serve Rayfall over the Q wire on port 25565
+```
+
+# API
+
+See **[INTEGRATING.md](./docs/INTEGRATING.md)** for more details.
+
+
+### Client
 
 ```c
 #include "q.h"
@@ -26,30 +51,21 @@ int    q_exchange(int fd, const uint8_t *req, int64_t req_len, uint8_t **resp,
 ray_t *q_decode(uint8_t *resp, int64_t resp_len, int compressed, char *err, size_t n);
 ```
 
-The connection handle is the raw socket fd, so the client is thread-safe and
-unbounded (no shared connection table). `q_send` returns a freshly-owned
-`ray_t`, which may itself be a `RAY_ERROR` carrying a Q server-side error; a
-`NULL` return signals a transport/serialization failure with a short reason in
-`err`.
+The connection handle is the raw socket fd, so the client is thread-safe and unbounded (no shared connection table). `q_send` returns a freshly-owned
+`ray_t`, which may itself be a `RAY_ERROR` carrying a Q server-side error. A `NULL` return signals a transport/serialization failure with a short reason in `err`.
 
-## Usage
 
-`rayforce-q` is not a standalone library — bindings compile `q.c`/`q.h` **into**
-their native extension, alongside the rayforce core (which supplies
-`<rayforce.h>` and `table/sym.h`). See **[INTEGRATING.md](./docs/INTEGRATING.md)**
-for more details.
+### Server
 
-## Embedded binary
+To *be* a Q server (the mirror of the client), bindings additionally compile [`q_server.c`](./q_server.c) / [`q_server.h`](./q_server.h) and call:
 
-`make rayforce` builds a `rayforce` binary with the Q client compiled in and
-exposed as `.q.*` rayfall env functions, so any script or REPL session can query
-a Q server:
+```c
+#include "q_server.h"
 
-```clojure
-(set h (.q.connect "localhost" 5000 "" "" 0))   ;; host port [user password [timeout_ms]]
-(.q.send h "([] a:1 2 3; b:`x`y`z)")             ;; -> a rayforce table
-(.q.close h)
+/* Register a non-blocking Q listener on an existing rayforce poll; the server
+ * runs on the same event loop as the REPL/IPC (no thread). Returns a poll
+ * selector id (>= 0), or -1. */
+int64_t q_serve(ray_poll_t *poll, int port);
 ```
 
-It clones the rayforce core, drops `q.c`/`q.h`/`embed/q_env.c` into its build,
-and registers the functions at startup ([`embed/q_env.c`](./embed/q_env.c)).
+A connected Q client (real Q `hopen`, or `q_connect`) sends a char-vector. The server evaluates it as **Rayfall** against the embedded runtime and returns the result Q-encoded.

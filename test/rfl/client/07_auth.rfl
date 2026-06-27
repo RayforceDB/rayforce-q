@@ -2,14 +2,14 @@
 ;; quser/qpass are the valid credentials it injects.
 
 ;; valid credentials -> a usable connection
-(set h (qconnect qhost qauthport quser qpass))
+(set h (.q.connect qhost qauthport quser qpass))
 (>= h 0) -- true
-(qsend h "6*7") -- 42
-(qclose h)
+(.q.send h "6*7") -- 42
+(.q.close h)
 
 ;; wrong password -> the server rejects the login (closes the socket mid
 ;; handshake, so the capability read fails)
-(qconnect qhost qauthport quser "wrongpass") !- auth
+(.q.connect qhost qauthport quser "wrongpass") !- auth
 
 ;; no credentials at all against an auth server -> rejected
-(qconnect qhost qauthport) !- auth
+(.q.connect qhost qauthport) !- auth

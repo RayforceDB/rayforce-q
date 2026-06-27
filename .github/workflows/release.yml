@@ -46,7 +46,6 @@ jobs:
             --notes-file RELEASE_NOTES.md \
             "rayforce-q-linux-x86_64"
 
-      # Same releases bot the Python lib uses. Skipped if the secret is unset.
       - name: Announce on Zulip
         env:
           ZULIP_BOT_TOKEN: ${{ secrets.ZULIP_RELEASES_BOT_TOKEN }}

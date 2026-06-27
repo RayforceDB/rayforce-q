@@ -50,6 +50,13 @@ int    q_close(int fd);
 ray_t *q_send(int fd, ray_t *msg, char *err, size_t n);   /* convenience: encode+exchange+decode */
 ```
 
+If you also compiled `q_server.c`, `q_server.h` adds the one server entry point.
+Call it with the runtime's poll to start a listener on that event loop.
+
+```c
+int64_t q_serve(ray_poll_t *poll, int port);              /* be a Q server */
+```
+
 Your glue does two jobs:
 
 1. **Convert** your binding's native values to/from `ray_t` (host/port/creds in;
@@ -111,9 +118,3 @@ pull_q:
 	fi
 	cp tmp/rayforce-q/q.* <your-native-src-dir>/   # picked up by your build
 ```
-
-### Reference: rayfall builtins
-
-The [`test/`](./test) directory shows a second, non-Python glue:
-`test/q_builtins.c` binds the three calls as rayfall language builtins. It is a
-compact template for a glue layer that isn't CPython.

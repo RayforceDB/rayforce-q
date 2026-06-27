@@ -1,0 +1,21 @@
+;; Null + empty-collection decode. q copies Q payloads verbatim and
+;; re-tags them; rayforce's null sentinels (INT64_MIN, NaN, ...) match Q's,
+;; so typed nulls should round-trip to rayforce nulls.
+
+(set h (.q.connect qhost qport))
+
+;; typed null atoms
+(nil? (.q.send h "0N"))  -- true
+(nil? (.q.send h "0Nh")) -- true
+(nil? (.q.send h "0Ni")) -- true
+(nil? (.q.send h "0n"))  -- true
+
+;; empty typed vectors
+(count (.q.send h "`long$()"))  -- 0
+(count (.q.send h "`float$()")) -- 0
+(count (.q.send h "0#`sym"))    -- 0
+
+;; a null inside a vector survives
+(nil? (at (.q.send h "1 0N 3") 1)) -- true
+
+(.q.close h)

@@ -14,39 +14,13 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y build-essential clang rsync unzip
+        run: sudo apt-get update && sudo apt-get install -y build-essential clang rsync
 
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
 
-      #   Q_URL        URL to a zip/tarball containing the linux-64 q binary
-      #   Q_LICENSE_B64  base64-encoded kc.lic
-      - name: Provision Q
-        env:
-          Q_URL: ${{ secrets.Q_URL }}
-          Q_LICENSE_B64: ${{ secrets.Q_LICENSE_B64 }}
-        run: |
-          if [ -n "$Q_URL" ] && [ -n "$Q_LICENSE_B64" ]; then
-            mkdir -p "$HOME/q"
-            curl -fsSL "$Q_URL" -o /tmp/q.archive
-            case "$Q_URL" in
-              *.zip) unzip -q -o /tmp/q.archive -d "$HOME/q" ;;
-              *)     tar -xf /tmp/q.archive -C "$HOME/q" ;;
-            esac
-            printf '%s' "$Q_LICENSE_B64" | base64 -d > "$HOME/q/kc.lic"
-            QBIN="$(find "$HOME/q" -type f -name q -perm -u+x | head -1)"
-            chmod +x "$QBIN" || true
-            {
-              echo "QHOME=$HOME/q"
-              echo "QLIC=$HOME/q"
-              echo "Q_BINARY=$QBIN"
-            } >> "$GITHUB_ENV"
-            echo "Provisioned q at $QBIN"
-          else
-            echo "::notice::No q secrets (Q_URL / Q_LICENSE_B64) set — building only; q-backed tests will skip."
-          fi
-
+      # No q binary in CI. `make test` runs the server self-round-trip leg and skips the real-q interop
       - name: Build and run tests
         env:
           RAYFORCE_GITHUB: ${{ secrets.RAYFORCE_GITHUB || 'https://github.com/RayforceDB/rayforce.git' }}

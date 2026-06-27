@@ -1,0 +1,28 @@
+;; Atom decode coverage: each q expression returns a scalar that q must
+;; decode into the matching rayforce atom. Compared by formatted value.
+
+(set h (.q.connect qhost qport))
+
+;; integers: long / int / short
+(.q.send h "42")  -- 42
+(.q.send h "42i") -- 42
+(.q.send h "42h") -- 42
+
+;; floats: float / real
+(.q.send h "3.25")  -- 3.25
+(.q.send h "3.25e") -- 3.25
+
+;; booleans
+(.q.send h "1b") -- true
+(.q.send h "0b") -- false
+
+;; byte
+(.q.send h "0x2a") -- 0x2a
+
+;; char atom (q "z" is a single char)
+(.q.send h "\"z\"") -- "z"
+
+;; symbol atom
+(.q.send h "`abc") -- 'abc
+
+(.q.close h)

@@ -21,21 +21,44 @@
  * IN THE SOFTWARE.
  */
 
-/*
- * q_test.c — rayfall test runner for the Q client.
- *
- * Embeds the rayforce engine, registers the q builtins (see q_builtins.c),
- * and runs one or more `.rfl` test files. The assertion DSL mirrors the
- * rayforce core's own .rfl harness.
- */
-
 #include <rayforce.h>
+
+#include "core/poll.h"    /* ray_poll_create / run / destroy        */
+#include "core/runtime.h" /* ray_runtime_set_poll                   */
+#include "q_server.h"     /* q_serve                                */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-void q_register_builtins(void);
+/* Registers `.q.connect` / `.q.send` / `.q.close` */
+void q_env_register(void);
+
+/* --serve PORT: build a runtime + poll, start the Q server, run the loop. */
+static int run_server(int port) {
+  ray_runtime_t *rt = ray_runtime_create(0, NULL);
+  if (rt == NULL) {
+    fprintf(stderr, "driver: failed to create rayforce runtime\n");
+    return 1;
+  }
+  ray_poll_t *poll = ray_poll_create();
+  if (poll == NULL) {
+    fprintf(stderr, "driver: failed to create poll\n");
+    ray_runtime_destroy(rt);
+    return 1;
+  }
+  ray_runtime_set_poll(poll);
+  if (q_serve(poll, port) < 0) {
+    fprintf(stderr, "driver: cannot listen on port %d\n", port);
+    ray_poll_destroy(poll);
+    ray_runtime_destroy(rt);
+    return 1;
+  }
+  ray_poll_run(poll);
+  ray_poll_destroy(poll);
+  ray_runtime_destroy(rt);
+  return 0;
+}
 
 static int fmt_eq(ray_t *a, ray_t *b) {
   if (a == NULL && b == NULL)
@@ -253,6 +276,10 @@ static void inject_server(const char *host, const char *port,
 }
 
 int main(int argc, char **argv) {
+  /* Server role: `driver --serve PORT`. */
+  if (argc >= 3 && strcmp(argv[1], "--serve") == 0)
+    return run_server(atoi(argv[2]));
+
   const char *host = "127.0.0.1";
   const char *port = "0", *authport = "0";
   const char *user = "", *pass = "";
@@ -290,7 +317,7 @@ int main(int argc, char **argv) {
   for (int i = first; i < argc; i++) {
     /* Fresh runtime per file: isolates handles and `set` bindings. */
     ray_runtime_t *rt = ray_runtime_create(0, NULL);
-    q_register_builtins();
+    q_env_register();
     inject_server(host, port, authport, user, pass);
     failures += run_rfl_file(argv[i]);
     ray_runtime_destroy(rt);

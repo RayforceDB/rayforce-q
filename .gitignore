@@ -3,6 +3,6 @@
 *.a
 *.dylib
 test/tmp/
-test/q_test
+test/driver
 /rayforce
 CLAUDE.md

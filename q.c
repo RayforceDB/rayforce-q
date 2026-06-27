@@ -409,6 +409,16 @@ static int64_t q_size_obj(ray_t *obj) {
   if (t == RAY_NULL)
     return 1 + 1 + 4;
 
+  if (t == RAY_STR) {
+    int64_t size = 1 + 1 + 4; /* list type + attrs + count */
+    for (int64_t i = 0; i < obj->len; i++) {
+      size_t slen = 0;
+      ray_str_vec_get(obj, i, &slen);
+      size += 1 + 1 + 4 + (int64_t)slen; /* KC vec header + chars */
+    }
+    return size;
+  }
+
   int esz = (int)ray_scalar_elem_size(t);
   if (esz == 0)
     return 0;
@@ -455,7 +465,9 @@ static int64_t q_ser_obj(uint8_t *buf, ray_t *obj) {
       memcpy(buf, &obj->f64, 8);
       return buf + 8 - start;
     case RAY_GUID:
-      memcpy(buf, ray_data(obj), 16);
+      /* GUID *vectors* store contiguous elements at ray_data and go through the
+       * generic vector path below. */
+      memcpy(buf, (const char *)obj->obj + sizeof(ray_t), 16);
       return buf + 16 - start;
     case RAY_SYM: {
       ray_t *s = ray_sym_str(obj->i64);
@@ -569,6 +581,27 @@ static int64_t q_ser_obj(uint8_t *buf, ray_t *obj) {
     *buf++ = 0;
     memset(buf, 0, 4);
     return buf + 4 - start;
+  }
+
+  if (t == RAY_STR) {
+    start[0] = 0;
+    *buf++ = 0; /* attrs */
+    uint32_t len32 = (uint32_t)obj->len;
+    memcpy(buf, &len32, 4);
+    buf += 4;
+    for (int64_t i = 0; i < obj->len; i++) {
+      size_t slen = 0;
+      const char *s = ray_str_vec_get(obj, i, &slen);
+      *buf++ = (uint8_t)Q_KC; /* each element is a char vector */
+      *buf++ = 0;             /* attrs */
+      uint32_t l = (uint32_t)slen;
+      memcpy(buf, &l, 4);
+      buf += 4;
+      if (slen)
+        memcpy(buf, s, slen);
+      buf += (int64_t)slen;
+    }
+    return buf - start;
   }
 
   int esz = (int)ray_scalar_elem_size(t);

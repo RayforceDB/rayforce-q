@@ -1,0 +1,17 @@
+;; Temporal decode coverage (date / time / timestamp). q copies the raw
+;; Q payload and re-tags it; these assertions confirm the epoch and width
+;; line up with rayforce's own temporal types.
+
+(set h (.q.connect qhost qport))
+
+;; date atom + vector
+(.q.send h "2025.01.01")            -- 2025.01.01
+(.q.send h "2025.01.01 2025.01.02") -- [2025.01.01 2025.01.02]
+
+;; time atom
+(.q.send h "12:34:56.000") -- 12:34:56.000
+
+;; timestamp atom
+(.q.send h "2025.01.01D12:00:00.000000000") -- 2025.01.01D12:00:00.000000000
+
+(.q.close h)

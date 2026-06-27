@@ -1,0 +1,52 @@
+;; Server type matrix: our client (.q.send) -> our server (driver --serve).
+;; Each payload is Rayfall the server evaluates; the LHS round-trips through the
+;; Q wire (server q_encode -> client q_decode), the RHS is the same value built
+;; locally — so a pass proves the wire preserves that type's value + format.
+(set h (.q.connect qhost qport))
+
+;; booleans
+(.q.send h "true") -- true
+(.q.send h "[true false true]") -- [true false true]
+
+;; integers of each width (atoms + vectors)
+(.q.send h "42h") -- 42h
+(.q.send h "42i") -- 42i
+(.q.send h "42") -- 42
+(.q.send h "0x07") -- 0x07
+(.q.send h "[1h 2h 3h]") -- [1h 2h 3h]
+(.q.send h "[10i 20i]") -- [10i 20i]
+
+;; floats
+(.q.send h "3.14") -- 3.14
+(.q.send h "[1.0 2.5 3.0]") -- [1.0 2.5 3.0]
+
+;; symbols
+(.q.send h "'abc") -- 'abc
+(.q.send h "['a 'b 'c]") -- ['a 'b 'c]
+
+;; chars / strings (single char -> -KC atom; multi-char -> KC vector)
+(.q.send h "\"x\"") -- "x"
+(.q.send h "\"hello\"") -- "hello"
+(.q.send h "[\"a\" \"bb\" \"ccc\"]") -- ["a" "bb" "ccc"]
+
+;; temporal atoms
+(.q.send h "2024.01.15") -- 2024.01.15
+(.q.send h "09:30:00.000") -- 09:30:00.000
+(.q.send h "2024.01.15D09:30:00.000000000") -- 2024.01.15D09:30:00.000000000
+
+;; guid (atom exercises the child-block encode path; vector the contiguous one)
+(.q.send h "(as 'guid \"d49f18a4-1969-49e8-9b8a-6bb9a4832eea\")") -- (as 'guid "d49f18a4-1969-49e8-9b8a-6bb9a4832eea")
+(.q.send h "(as 'GUID (list \"d49f18a4-1969-49e8-9b8a-6bb9a4832eea\"))") -- (as 'GUID (list "d49f18a4-1969-49e8-9b8a-6bb9a4832eea"))
+
+;; table (sym-vec names + list of column vectors, on the wire as XT)
+(.q.send h "(table [a b] (list [1 2 3] ['x 'y 'z]))") -- (table [a b] (list [1 2 3] ['x 'y 'z]))
+
+;; typed nulls (i64 / i32 / f64 / symbol). Note: rayforce dicts have no wire
+;; encode path (q.c only decodes q dicts), so dict-result payloads are not
+;; round-tripped here.
+(.q.send h "0Nl") -- 0Nl
+(.q.send h "0Ni") -- 0Ni
+(.q.send h "0Nf") -- 0Nf
+(.q.send h "0Ns") -- 0Ns
+
+(.q.close h)

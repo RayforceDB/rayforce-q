@@ -1,22 +1,22 @@
 ;; Connection lifecycle and basic round-trips against a live q server.
 ;; qhost / qport are injected by the test driver (--host/--port).
 
-(set h (qconnect qhost qport))
+(set h (.q.connect qhost qport))
 
 ;; A handle is a non-negative integer (the socket fd).
 (>= h 0) -- true
 
 ;; Basic synchronous query evaluation.
-(qsend h "1+2") -- 3
-(qsend h "first 1 2 3") -- 1
-(qsend h "count til 10") -- 10
+(.q.send h "1+2") -- 3
+(.q.send h "first 1 2 3") -- 1
+(.q.send h "count til 10") -- 10
 
-(qclose h)
+(.q.close h)
 
 ;; Sending on a closed handle is a transport error.
-(set h2 (qconnect qhost qport))
-(qclose h2)
-(qsend h2 "1+1") !- handle
+(set h2 (.q.connect qhost qport))
+(.q.close h2)
+(.q.send h2 "1+1") !- handle
 
 ;; Connecting to a closed port fails at the socket level.
-(qconnect qhost 1) !- connect
+(.q.connect qhost 1) !- connect

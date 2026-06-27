@@ -1,0 +1,26 @@
+;; Round-trips against the native rayforce-q SERVER (q_server.c, run via
+;; `driver --serve`). Unlike rfl/client/*.rfl (which drive a real q server with
+;; q-language strings), the payloads here are Rayfall — the server evaluates
+;; them with ray_eval_str. qhost / qport are injected by the driver.
+
+(set h (.q.connect qhost qport))
+
+;; A handle is a non-negative integer (the socket fd).
+(>= h 0) -- true
+
+;; Scalar arithmetic — i64 atom round-trip.
+(.q.send h "(+ 1 2)") -- 3
+(.q.send h "(* 6 7)") -- 42
+
+;; Vector results — i64 vector round-trip.
+(.q.send h "(til 5)") -- [0 1 2 3 4]
+(.q.send h "(+ 10 (til 3))") -- [10 11 12]
+
+;; String columns serialize as a q list of char-vectors (q has no string
+;; vector type). Our client decodes that back to a list of strings.
+(.q.send h "(as 'STR [\"a\" \"bb\" \"ccc\"])") -- (list "a" "bb" "ccc")
+
+;; A server-side evaluation error comes back as a Q error frame.
+(.q.send h "(+ 1 2") !- parse
+
+(.q.close h)

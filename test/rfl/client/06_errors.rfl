@@ -5,18 +5,18 @@
 ;; is short (longer Q error text is truncated in the formatted display),
 ;; so these assertions use short error tokens.
 
-(set h (qconnect qhost qport))
+(set h (.q.connect qhost qport))
 
 ;; explicit q signal: 'myerr  -> error text "myerr"
-(qsend h "'myerr") !- myerr
+(.q.send h "'myerr") !- myerr
 
 ;; type error from a bad operation
-(qsend h "`a+1") !- type
+(.q.send h "`a+1") !- type
 
 ;; undefined variable -> q signals the name
-(qsend h "xyzzy") !- xyzzy
+(.q.send h "xyzzy") !- xyzzy
 
 ;; the connection stays usable after a server error
-(qsend h "2+2") -- 4
+(.q.send h "2+2") -- 4
 
-(qclose h)
+(.q.close h)
