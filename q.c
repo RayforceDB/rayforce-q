@@ -983,13 +983,21 @@ static int q_decompress(const uint8_t *src, int64_t src_len, uint8_t **out_buf,
         return -1;
       }
       int64_t r = buffer[src[d++]];
-      result[s++] = result[r++];
-      result[s++] = result[r++];
       if (d >= src_len) {
         free(result);
         return -1;
       }
       n = src[d++];
+      /* A back-reference expands to 2 literal + n copied bytes at result[s].
+       * A malformed or hostile frame can declare a tiny out_size yet expand
+       * past it, so reject that here instead of writing past the allocation.
+       * (r < s <= out_size, so the source reads below stay in bounds.) */
+      if (s + 2 + n > out_size) {
+        free(result);
+        return -1;
+      }
+      result[s++] = result[r++];
+      result[s++] = result[r++];
       for (int64_t m = 0; m < n; m++)
         result[s + m] = result[r + m];
     } else {
