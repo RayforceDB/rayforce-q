@@ -122,7 +122,7 @@ T["table";       ([] a:1 2 3; b:`x`y`z)~h"(table [a b] (list [1 2 3] ['x 'y 'z])
 T["null i64";    0N~h"0Nl"]
 T["null i32";    0Ni~h"0Ni"]
 T["null f64";    0n~h"0Nf"]
-T["null sym";    (`)~h"0Ns"]
+T["null sym";    (`)~h"(as 'sym \"\")"]
 / server-side parse error comes back as a Q error frame
 T["parse err";   @[h;"(+ 1 2";{x like "*parse*"}]]
 hclose h

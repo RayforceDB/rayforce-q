@@ -43,10 +43,11 @@
 
 ;; typed nulls (i64 / i32 / f64 / symbol). Note: rayforce dicts have no wire
 ;; encode path (q.c only decodes q dicts), so dict-result payloads are not
-;; round-tripped here.
+;; round-tripped here. Rayfall has no `0Ns` literal (it parses as a name), so
+;; the null symbol is written as the empty symbol `(as 'sym "")`.
 (.q.send h "0Nl") -- 0Nl
 (.q.send h "0Ni") -- 0Ni
 (.q.send h "0Nf") -- 0Nf
-(.q.send h "0Ns") -- 0Ns
+(.q.send h "(as 'sym \"\")") -- (as 'sym "")
 
 (.q.close h)
