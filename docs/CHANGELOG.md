@@ -2,6 +2,13 @@
 
 All notable changes to `rayforce-q` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/), and the project adheres to [Semantic Versioning](https://semver.org/). Bindings pin a tag, so each release is a stable point they can build against.
 
+## [2.0.1]
+
+### Fixed
+
+- **Datetime (`KZ`) decode**: a q datetime — an IEEE-754 double of fractional days since 2000-01-01 — was copied raw into a `RAY_TIMESTAMP` (i64 nanoseconds), reinterpreting the double's bit pattern instead of converting the value. Timestamps came back silently wrong by ~121 years (e.g. `2026.07.10T09:30:00.000` decoded to `2147.11.17D00:15:16.509272747`), and because the result carried the correct type code, consumers could not detect the corruption. Both the vector and the atom (previously unhandled — it errored with `unsupported wire type`) now convert days → nanoseconds, with the q null (`0n`) mapping to the null timestamp.
+
+
 ## [2.0.0]
 
 ### Added
