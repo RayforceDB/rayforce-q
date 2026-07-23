@@ -32,6 +32,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <netdb.h>
 #include <poll.h>
 #include <stdint.h>
@@ -694,6 +695,13 @@ static ray_t *q_des_vec_i(uint8_t **buf, int64_t *len, int8_t ray_type,
   return vec;
 }
 
+
+static inline int64_t q_kz_days_to_nanos(double days) {
+  if (isnan(days))
+    return NULL_I64;
+  return (int64_t)llround(days * 86400000.0) * 1000000LL;
+}
+
 static ray_t *q_des_obj(uint8_t **buf, int64_t *len) {
   if (*len < 1)
     return ray_error("q: buffer underflow (type)", NULL);
@@ -724,6 +732,14 @@ static ray_t *q_des_obj(uint8_t **buf, int64_t *len) {
   case -Q_KU:
   case -Q_KV:
     return q_des_atom_i(buf, len, RAY_TIME, 4);
+  case -Q_KZ: {
+    Q_NEED(8);
+    double d;
+    memcpy(&d, *buf, 8);
+    *buf += 8;
+    *len -= 8;
+    return ray_timestamp(q_kz_days_to_nanos(d));
+  }
   case -Q_KE: {
     Q_NEED(4);
     float f;
@@ -787,8 +803,32 @@ static ray_t *q_des_obj(uint8_t **buf, int64_t *len) {
   case Q_KU:
   case Q_KV:
     return q_des_vec_i(buf, len, RAY_TIME, 4);
-  case Q_KZ:
-    return q_des_vec_i(buf, len, RAY_TIMESTAMP, 8);
+  case Q_KZ: {
+    int32_t n;
+    if (q_read_vec_header(buf, len, &n) < 0)
+      return ray_error("q: buffer underflow", NULL);
+    if (n < 0)
+      return ray_error("q: negative datetime-vec length", NULL);
+    int64_t bytes = (int64_t)n * 8;
+    if (*len < bytes)
+      return ray_error("q: buffer underflow (datetime-vec)", NULL);
+    ray_t *vec = ray_vec_new(RAY_TIMESTAMP, n);
+    if (vec == NULL || RAY_IS_ERR(vec)) {
+      if (vec)
+        ray_release(vec);
+      return ray_error("q: vector alloc failed", NULL);
+    }
+    int64_t *out = (int64_t *)ray_data(vec);
+    for (int32_t i = 0; i < n; i++) {
+      double d;
+      memcpy(&d, *buf + i * 8, 8);
+      out[i] = q_kz_days_to_nanos(d);
+    }
+    vec->len = n;
+    *buf += bytes;
+    *len -= bytes;
+    return vec;
+  }
   case Q_KE: {
     /* Real (4-byte float) vector — convert to F64 vec for v2. */
     int32_t n;
