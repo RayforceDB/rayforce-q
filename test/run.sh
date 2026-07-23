@@ -58,6 +58,22 @@ find_q() {
   [[ -n "$QBIN" && -x "$QBIN" ]] || QBIN=""
 }
 
+q_home_for() {
+  local qbin="$1" qdir parent
+  if command -v python3 >/dev/null 2>&1; then
+    qbin="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$qbin")"
+  fi
+  qdir="$(cd "$(dirname "$qbin")" && pwd)"
+  parent="$(cd "$qdir/.." && pwd)"
+  if [[ -f "$qdir/q.k" ]]; then
+    printf '%s\n' "$qdir"
+  elif [[ -f "$parent/q.k" ]]; then
+    printf '%s\n' "$parent"
+  else
+    printf '%s\n' "$parent"
+  fi
+}
+
 PIDS=()
 FDS=()
 WORK="$(mktemp -d)"
@@ -76,6 +92,28 @@ PIDS+=("$!")
 wait_for_port "$HOST" "$SERVERPORT" || { echo "driver --serve did not come up on $HOST:$SERVERPORT" >&2; exit 1; }
 echo "server up on $HOST:$SERVERPORT; running server round-trip tests..."
 "$DRIVER" --host "$HOST" --port "$SERVERPORT" "$RFL_DIR"/server/*.rfl
+
+echo "checking malformed Q frame handling..."
+python3 - "$HOST" "$SERVERPORT" <<'PY'
+import socket
+import struct
+import sys
+
+host, port = sys.argv[1], int(sys.argv[2])
+with socket.create_connection((host, port), 1.0) as s:
+    s.sendall(bytes([3, 0]))
+    if s.recv(1) != bytes([3]):
+        raise SystemExit("bad Q handshake response")
+    s.sendall(struct.pack("<BBBBI", 1, 1, 1, 0, 9) + b"x")
+    resp = s.recv(64)
+
+if len(resp) < 9:
+    raise SystemExit("malformed-frame test: server closed without Q error")
+if resp[:4] != bytes([1, 2, 0, 0]):
+    raise SystemExit(f"malformed-frame test: unexpected header {resp.hex()}")
+if resp[8] != 0x80:
+    raise SystemExit(f"malformed-frame test: expected Q error, got {resp.hex()}")
+PY
 
 # ---- Leg 2: real-q interop against Rayforce server
 find_q
@@ -131,14 +169,14 @@ if[count bad; -2 "real-q interop FAILED: ",", " sv bad; exit 1]
 -1 "real-q interop ok (",(string count names)," assertions)"
 exit 0
 QEOF
-  RFPORT="$SERVERPORT" QHOME="$(dirname "$(dirname "$QBIN")")" "$QBIN" "$QSCRIPT" -q < /dev/null
+  RFPORT="$SERVERPORT" QHOME="${QHOME:-$(q_home_for "$QBIN")}" "$QBIN" "$QSCRIPT" -q < /dev/null
 else
   echo "SKIP: no q binary found (set Q_BINARY) — skipping real-q interop + client tests"
   exit 0
 fi
 
 # ---- Leg 3: client tests against real Q server
-export QHOME="${QHOME:-$(dirname "$(dirname "$QBIN")")}"
+export QHOME="${QHOME:-$(q_home_for "$QBIN")}"
 export QLIC="${QLIC:-$QHOME}"
 PORT="${PORT:-$(free_port)}"
 AUTHPORT="${AUTHPORT:-$(free_port)}"
