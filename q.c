@@ -100,6 +100,7 @@ static inline size_t ray_scalar_elem_size(int8_t type) {
 #define Q_ERR (-128)
 
 #define Q_MSG_SYNC 1
+#define Q_MAX_BODY ((int64_t)256 << 20)
 
 typedef struct {
   uint8_t endianness;
@@ -989,10 +990,9 @@ static int q_decompress(const uint8_t *src, int64_t src_len, uint8_t **out_buf,
       }
       n = src[d++];
       /* A back-reference expands to 2 literal + n copied bytes at result[s].
-       * A malformed or hostile frame can declare a tiny out_size yet expand
-       * past it, so reject that here instead of writing past the allocation.
-       * (r < s <= out_size, so the source reads below stay in bounds.) */
-      if (s + 2 + n > out_size) {
+       * Reject frames that point before a complete prior byte-pair exists or
+       * that would expand past the declared uncompressed size. */
+      if (r + 1 >= s || s + 2 + n > out_size) {
         free(result);
         return -1;
       }
@@ -1144,8 +1144,10 @@ int q_exchange(int fd, const uint8_t *req, int64_t req_len, uint8_t **resp,
     return -1;
   }
   int64_t body_len = (int64_t)header.size - (int64_t)sizeof header;
-  if (body_len <= 0) {
-    q_set_err(err, errlen, "q: empty response body");
+  if (body_len <= 0 || body_len > Q_MAX_BODY) {
+    q_set_err(err, errlen,
+              body_len <= 0 ? "q: empty response body"
+                            : "q: response body too large");
     return -1;
   }
   uint8_t *body = (uint8_t *)malloc((size_t)body_len);
