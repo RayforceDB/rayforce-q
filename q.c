@@ -696,7 +696,6 @@ static ray_t *q_des_vec_i(uint8_t **buf, int64_t *len, int8_t ray_type,
   return vec;
 }
 
-
 static inline int64_t q_kz_days_to_nanos(double days) {
   if (isnan(days))
     return NULL_I64;
@@ -980,6 +979,8 @@ static ray_t *q_des_obj(uint8_t **buf, int64_t *len) {
       i++;
     if (i == *len)
       return ray_error("q: malformed error frame", NULL);
+    *buf += i + 1;
+    *len -= i + 1;
     /* Put the q error text in both the code (short, shown by ray_fmt) and the
      * message (full), so bindings reading the message field get the whole
      * string even though the displayed code is length-capped. */
@@ -1067,6 +1068,9 @@ static int q_decompress(const uint8_t *src, int64_t src_len, uint8_t **out_buf,
 /* Public API */
 int q_connect(const char *host, int port, const char *user,
               const char *password, int timeout_ms) {
+  if (host == NULL || host[0] == '\0' || port < 1 || port > 65535)
+    return Q_ERR_SOCKET;
+
   int timed_out = 0;
   int fd = q_open_socket(host, port, timeout_ms, &timed_out);
   if (fd < 0)
@@ -1228,6 +1232,11 @@ ray_t *q_decode(uint8_t *resp, int64_t resp_len, int compressed, char *err,
     free(decompressed);
   if (result == NULL)
     q_set_err(err, errlen, "q: deserialization returned null");
+  else if (remaining != 0) {
+    ray_release(result);
+    q_set_err(err, errlen, "q: trailing bytes after object");
+    return NULL;
+  }
   return result;
 }
 

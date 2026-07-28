@@ -31,8 +31,21 @@
 #include "lang/env.h"  /* ray_env_bind, ray_env_bind_flat        */
 #include "lang/eval.h" /* ray_fn_*, RAY_FN_NONE                  */
 
-#include <stdlib.h> /* atoi  */
+#include <errno.h>
+#include <stdlib.h>
 #include <string.h>
+
+static int q_parse_port(const char *s, int *out) {
+  if (s == NULL || *s == '\0')
+    return 0;
+  errno = 0;
+  char *end = NULL;
+  long v = strtol(s, &end, 10);
+  if (errno != 0 || end == s || *end != '\0' || v < 1 || v > 65535)
+    return 0;
+  *out = (int)v;
+  return 1;
+}
 
 static int64_t q_atom_i64(ray_t *a, int *ok) {
   *ok = 1;
@@ -81,6 +94,8 @@ static ray_t *qb_connect(ray_t **args, int64_t n) {
   int64_t port = q_atom_i64(args[1], &ok);
   if (!ok)
     return ray_error("type", ".q.connect: port must be an integer");
+  if (port < 1 || port > 65535)
+    return ray_error("range", ".q.connect: port must be in 1..65535");
 
   char host[256];
   size_t hn = ray_str_len(args[0]);
@@ -172,8 +187,14 @@ void q_env_register(void) {
 int64_t q_serve_from_args(ray_poll_t *poll, int argc, char **argv) {
   for (int i = 1; i < argc; i++) {
     if ((strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--q-serve") == 0) &&
-        i + 1 < argc)
-      return q_serve(poll, atoi(argv[++i]));
+        i + 1 < argc) {
+      int port = 0;
+      if (!q_parse_port(argv[++i], &port)) {
+        fprintf(stderr, "q: invalid port %s (expected 1..65535)\n", argv[i]);
+        return -1;
+      }
+      return q_serve(poll, port);
+    }
   }
   return -1;
 }

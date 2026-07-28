@@ -25,6 +25,7 @@
 
 #include "core/poll.h"    /* ray_poll_create / run / destroy        */
 #include "core/runtime.h" /* ray_runtime_set_poll                   */
+#include "q.h"            /* q_decode / q_connect                   */
 #include "q_server.h"     /* q_serve                                */
 
 #include <stdio.h>
@@ -275,7 +276,68 @@ static void inject_server(const char *host, const char *port,
   eval_setup("(set qpass \"%s\")", pass);
 }
 
+static void release_any(ray_t *r) {
+  if (r == NULL)
+    return;
+  if (RAY_IS_ERR(r))
+    ray_error_free(r);
+  else
+    ray_release(r);
+}
+
+static int run_codec_selftest(void) {
+  int failures = 0;
+  ray_runtime_t *rt = ray_runtime_create(0, NULL);
+  if (rt == NULL) {
+    fprintf(stderr, "codec selftest: failed to create rayforce runtime\n");
+    return 1;
+  }
+
+  char err[128] = {0};
+  uint8_t int_with_tail[] = {250, 42, 0, 0, 0, 0xff};
+  ray_t *r = q_decode(int_with_tail, (int64_t)sizeof int_with_tail, 0, err,
+                      sizeof err);
+  if (r != NULL || strstr(err, "trailing bytes") == NULL) {
+    fprintf(stderr, "codec selftest: trailing body bytes were not rejected\n");
+    failures++;
+  }
+  release_any(r);
+
+  err[0] = '\0';
+  uint8_t qerr[] = {128, 'b', 'a', 'd', 0};
+  r = q_decode(qerr, (int64_t)sizeof qerr, 0, err, sizeof err);
+  if (r == NULL || !RAY_IS_ERR(r)) {
+    fprintf(stderr, "codec selftest: Q error frame did not decode as error\n");
+    failures++;
+  }
+  release_any(r);
+
+  if (q_connect("127.0.0.1", 70000, "", "", 1) != Q_ERR_SOCKET) {
+    fprintf(stderr, "codec selftest: client accepted out-of-range port\n");
+    failures++;
+  }
+
+  ray_poll_t *poll = ray_poll_create();
+  if (poll == NULL) {
+    fprintf(stderr, "codec selftest: failed to create poll\n");
+    failures++;
+  } else {
+    if (q_serve(poll, -1) >= 0 || q_serve(poll, 70000) >= 0) {
+      fprintf(stderr, "codec selftest: server accepted out-of-range port\n");
+      failures++;
+    }
+    ray_poll_destroy(poll);
+  }
+
+  ray_runtime_destroy(rt);
+  printf("codec selftest: %s\n", failures ? "FAIL" : "ok");
+  return failures ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
+  if (argc >= 2 && strcmp(argv[1], "--codec-selftest") == 0)
+    return run_codec_selftest();
+
   /* Server role: `driver --serve PORT`. */
   if (argc >= 3 && strcmp(argv[1], "--serve") == 0)
     return run_server(atoi(argv[2]));
