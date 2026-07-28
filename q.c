@@ -101,6 +101,7 @@ static inline size_t ray_scalar_elem_size(int8_t type) {
 #define Q_ERR (-128)
 
 #define Q_MSG_SYNC 1
+#define Q_MSG_RESPONSE 2
 #define Q_MAX_BODY ((int64_t)256 << 20)
 
 typedef struct {
@@ -1185,6 +1186,10 @@ int q_exchange(int fd, const uint8_t *req, int64_t req_len, uint8_t **resp,
   }
   if (header.endianness != Q_LITTLE_ENDIAN) {
     q_set_err(err, errlen, "q: big-endian peer not supported");
+    return -1;
+  }
+  if (header.msgtype != Q_MSG_RESPONSE) {
+    q_set_err(err, errlen, "q: expected response message type");
     return -1;
   }
   int64_t body_len = (int64_t)header.size - (int64_t)sizeof header;

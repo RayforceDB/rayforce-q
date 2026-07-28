@@ -25,15 +25,26 @@
 
 #include "core/poll.h"    /* ray_poll_create / run / destroy        */
 #include "core/runtime.h" /* ray_runtime_set_poll                   */
-#include "q.h"            /* q_decode / q_connect                   */
+#include "q.h"            /* q_decode / q_connect / q_exchange      */
 #include "q_server.h"     /* q_serve                                */
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 /* Registers `.q.connect` / `.q.send` / `.q.close` */
 void q_env_register(void);
+
+typedef struct {
+  uint8_t endianness;
+  uint8_t msgtype;
+  uint8_t compressed;
+  uint8_t reserved;
+  uint32_t size;
+} test_q_header_t;
 
 /* --serve PORT: build a runtime + poll, start the Q server, run the loop. */
 static int run_server(int port) {
@@ -334,9 +345,54 @@ static int run_codec_selftest(void) {
   return failures ? 1 : 0;
 }
 
+static int run_exchange_selftest(void) {
+  int sv[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
+    perror("exchange selftest: socketpair");
+    return 1;
+  }
+
+  test_q_header_t h = {
+      .endianness = 1,
+      .msgtype = 1,
+      .compressed = 0,
+      .reserved = 0,
+      .size = (uint32_t)(sizeof(test_q_header_t) + 1),
+  };
+  uint8_t body = 101; /* identity */
+  int failures = 0;
+  if (send(sv[1], &h, sizeof h, 0) != (ssize_t)sizeof h ||
+      send(sv[1], &body, sizeof body, 0) != (ssize_t)sizeof body) {
+    perror("exchange selftest: send");
+    failures++;
+  }
+
+  uint8_t req = 0;
+  uint8_t *resp = NULL;
+  int64_t resp_len = 0;
+  int compressed = 0;
+  char err[128] = {0};
+  int rc = q_exchange(sv[0], &req, 1, &resp, &resp_len, &compressed, err,
+                      sizeof err);
+  if (rc == 0 || strstr(err, "response message type") == NULL) {
+    fprintf(stderr,
+            "exchange selftest: non-response frame was not rejected: %s\n",
+            err);
+    failures++;
+  }
+  free(resp);
+  close(sv[0]);
+  close(sv[1]);
+  printf("exchange selftest: %s\n", failures ? "FAIL" : "ok");
+  return failures ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
   if (argc >= 2 && strcmp(argv[1], "--codec-selftest") == 0)
     return run_codec_selftest();
+
+  if (argc >= 2 && strcmp(argv[1], "--exchange-selftest") == 0)
+    return run_exchange_selftest();
 
   /* Server role: `driver --serve PORT`. */
   if (argc >= 3 && strcmp(argv[1], "--serve") == 0)
