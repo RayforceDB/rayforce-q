@@ -207,12 +207,16 @@ static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
    * buffer is free to reuse the moment it returns. */
   q_header_t hdr = cd->hdr;
   int64_t id = sel->id;
-  ray_t *req = q_decode(sel->rx.buf->data, body, hdr.compressed, NULL, 0);
+  char err[128] = {0};
+  ray_t *req =
+      q_decode(sel->rx.buf->data, body, hdr.compressed, err, sizeof err);
 
   sel->rx.read_fn = q_read_header;
   ray_poll_rx_request(poll, sel, (int64_t)sizeof(q_header_t));
 
-  ray_t *result = eval_request(req);
+  ray_t *result = req ? eval_request(req)
+                      : ray_error("q server: malformed request", "%s",
+                                  err[0] ? err : "q server: decode failed");
   if (req)
     ray_release(req);
 
