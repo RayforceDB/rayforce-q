@@ -242,6 +242,10 @@ static void q_on_close(ray_poll_t *poll, ray_selector_t *sel) {
 int64_t q_serve(ray_poll_t *poll, int port) {
   if (poll == NULL)
     return -1;
+  if (port < 1 || port > 65535) {
+    fprintf(stderr, "q: invalid port %d (expected 1..65535)\n", port);
+    return -1;
+  }
   ray_sock_t fd = ray_sock_listen((uint16_t)port);
   if (fd == RAY_INVALID_SOCK) {
     fprintf(stderr, "q: cannot listen on port %d (in use?)\n", port);
