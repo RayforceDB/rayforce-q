@@ -18,4 +18,16 @@
 ;; a null inside a vector survives
 (nil? (at (.q.send h "1 0N 3") 1)) -- true
 
+;; decoded vectors must carry the HAS_NULLS gate: aggregates skip nulls
+;; instead of folding the sentinel payload in as data.
+(avg (.q.send h "1 2 0N"))       -- 1.5
+(min (.q.send h "5 0N 7"))       -- 5
+(max (.q.send h "0N 2 9"))       -- 9
+(sum (.q.send h "1 2 0N"))       -- 3
+(avg (.q.send h "1.0 2.0 0n"))   -- 1.5
+(avg (.q.send h "`real$1 2 0n")) -- 1.5
+(min (.q.send h "2025.01.01T12:00:00.000 0Nz")) -- 2025.01.01D12:00:00.000000000
+(min (.q.send h "`date$(2025.01.03;0Nd;2025.01.02)")) -- 2025.01.02
+(sum (.q.send h "09:00:00.100 0Nt")) -- 09:00:00.100
+
 (.q.close h)

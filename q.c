@@ -306,6 +306,33 @@ static int64_t q_size_obj(ray_t *obj);
 static int64_t q_ser_obj(uint8_t *buf, ray_t *obj);
 static ray_t *q_des_obj(uint8_t **buf, int64_t *len);
 
+/* Resolve element i of a SYM vector to its string atom.  Splayed/mmap SYM
+ * vectors carry narrow storage widths (attrs low bits, RAY_SYM_W8..W64)
+ * and ids that are positions in the vector's own resolution domain (the
+ * table's symfile), not runtime intern ids — reading them as int64_t
+ * runtime ids walks off the payload and resolves garbage.  The runtime
+ * W64 case degenerates to the old ray_sym_str behavior.  The returned
+ * atom is BORROWED from the domain: do not release. */
+static ray_t *q_sym_vec_str(ray_t *obj, int64_t i) {
+  const void *p = ray_data(obj);
+  int64_t id;
+  switch (obj->attrs & 0x03) { /* storage width bits: RAY_SYM_W8..W64 */
+  case RAY_SYM_W8:
+    id = ((const uint8_t *)p)[i];
+    break;
+  case RAY_SYM_W16:
+    id = ((const uint16_t *)p)[i];
+    break;
+  case RAY_SYM_W32:
+    id = ((const uint32_t *)p)[i];
+    break;
+  default:
+    id = ((const int64_t *)p)[i];
+    break;
+  }
+  return ray_sym_domain_str(ray_sym_vec_domain(obj), id);
+}
+
 /* Build a v2 table from RAY_SYM-vec of names and RAY_LIST of vectors. */
 static ray_t *q_make_table(ray_t *keys, ray_t *vals) {
   if (keys == NULL || vals == NULL || keys->type != RAY_SYM ||
@@ -377,12 +404,9 @@ static int64_t q_size_obj(ray_t *obj) {
   }
   if (t == RAY_SYM) {
     int64_t size = 1 + 1 + 4;
-    int64_t *ids = (int64_t *)ray_data(obj);
     for (int64_t i = 0; i < obj->len; i++) {
-      ray_t *s = ray_sym_str(ids[i]);
+      ray_t *s = q_sym_vec_str(obj, i); /* borrowed */
       size += s ? (int64_t)ray_str_len(s) + 1 : 1;
-      if (s)
-        ray_release(s);
     }
     return size;
   }
@@ -520,14 +544,11 @@ static int64_t q_ser_obj(uint8_t *buf, ray_t *obj) {
     uint32_t len32 = (uint32_t)obj->len;
     memcpy(buf, &len32, 4);
     buf += 4;
-    int64_t *ids = (int64_t *)ray_data(obj);
     for (int64_t i = 0; i < obj->len; i++) {
-      ray_t *s = ray_sym_str(ids[i]);
+      ray_t *s = q_sym_vec_str(obj, i); /* borrowed */
       size_t n = s ? ray_str_len(s) : 0;
-      if (s) {
+      if (s)
         memcpy(buf, ray_str_ptr(s), n);
-        ray_release(s);
-      }
       buf[n] = 0;
       buf += n + 1;
     }
@@ -672,6 +693,74 @@ static int q_read_vec_header(uint8_t **buf, int64_t *len, int32_t *out_n) {
   return 0;
 }
 
+/* Q null sentinels are byte-identical to rayforce's (NaN, INT_MIN family,
+ * 16 zero bytes for GUID), so decoded payloads already carry correct null
+ * values — but null-aware consumers (aggregation kernels, ray_vec_is_null)
+ * are gated on the vec-level RAY_ATTR_HAS_NULLS flag, which a raw payload
+ * copy never sets.  Scan for the type's sentinel and flip the gate via one
+ * idempotent set_null on the first hit (it rewrites the same sentinel). */
+static void q_flag_nulls(ray_t *vec) {
+  if (vec == NULL || RAY_IS_ERR(vec))
+    return;
+  const void *p = ray_data(vec);
+  int64_t null_at = -1;
+  switch (vec->type) {
+  case RAY_I16: {
+    const int16_t *v = (const int16_t *)p;
+    for (int64_t i = 0; i < vec->len; i++)
+      if (v[i] == NULL_I16) {
+        null_at = i;
+        break;
+      }
+    break;
+  }
+  case RAY_I32:
+  case RAY_DATE:
+  case RAY_TIME: {
+    const int32_t *v = (const int32_t *)p;
+    for (int64_t i = 0; i < vec->len; i++)
+      if (v[i] == NULL_I32) {
+        null_at = i;
+        break;
+      }
+    break;
+  }
+  case RAY_I64:
+  case RAY_TIMESTAMP: {
+    const int64_t *v = (const int64_t *)p;
+    for (int64_t i = 0; i < vec->len; i++)
+      if (v[i] == NULL_I64) {
+        null_at = i;
+        break;
+      }
+    break;
+  }
+  case RAY_F64: {
+    const double *v = (const double *)p;
+    for (int64_t i = 0; i < vec->len; i++)
+      if (isnan(v[i])) {
+        null_at = i;
+        break;
+      }
+    break;
+  }
+  case RAY_GUID: {
+    static const uint8_t zero[16] = {0};
+    const uint8_t *v = (const uint8_t *)p;
+    for (int64_t i = 0; i < vec->len; i++)
+      if (memcmp(v + i * 16, zero, 16) == 0) {
+        null_at = i;
+        break;
+      }
+    break;
+  }
+  default: /* BOOL/U8/SYM/STR: non-nullable in rayforce */
+    return;
+  }
+  if (null_at >= 0)
+    ray_vec_set_null(vec, null_at, true);
+}
+
 static ray_t *q_des_vec_i(uint8_t **buf, int64_t *len, int8_t ray_type,
                           int width) {
   int32_t n;
@@ -693,6 +782,7 @@ static ray_t *q_des_vec_i(uint8_t **buf, int64_t *len, int8_t ray_type,
   vec->len = n;
   *buf += bytes;
   *len -= bytes;
+  q_flag_nulls(vec);
   return vec;
 }
 
@@ -827,6 +917,7 @@ static ray_t *q_des_obj(uint8_t **buf, int64_t *len) {
     vec->len = n;
     *buf += bytes;
     *len -= bytes;
+    q_flag_nulls(vec);
     return vec;
   }
   case Q_KE: {
@@ -854,6 +945,7 @@ static ray_t *q_des_obj(uint8_t **buf, int64_t *len) {
     vec->len = n;
     *buf += bytes;
     *len -= bytes;
+    q_flag_nulls(vec);
     return vec;
   }
   case Q_KF:
