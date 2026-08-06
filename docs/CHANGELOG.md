@@ -2,6 +2,14 @@
 
 All notable changes to `rayforce-q` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/), and the project adheres to [Semantic Versioning](https://semver.org/). Bindings pin a tag, so each release is a stable point they can build against.
 
+## [2.0.2]
+
+### Fixed
+
+- **Null gate on decode**: rayforce aggregation kernels consult null sentinels only when a vector carries the `RAY_ATTR_HAS_NULLS` gate, which a raw payload copy never sets. Decoded vectors with q nulls (`0N`, `0n`, null temporals, `0Ng`) produced wrong aggregates — `avg` folded `INT64_MIN` in as data, `min` returned the sentinel itself — while the payload bytes were correct. The decoder now scans each sentinel-supporting vector (fixed-width, datetime, and real paths) and flips the gate via one idempotent `ray_vec_set_null` on the first hit.
+- **SYM vector encode ignored the resolution domain**: splayed/mmap SYM columns store ids as positions in the table's symfile domain, but the encoder resolved them against the runtime intern table — a served splayed table returned empty or wrong symbols. Ids now resolve through `ray_sym_vec_domain` / `ray_sym_domain_str`; the runtime-domain case is unchanged.
+- **SYM vector encode assumed 8-byte ids**: narrow storage widths (`RAY_SYM_W8/W16/W32`, the attrs low bits) were read as `int64_t`, walking off the payload — encoding a narrow SYM vector (any splayed column with a small dictionary) crashed the server. Element reads are now width-aware.
+
 ## [2.0.1]
 
 ### Fixed
