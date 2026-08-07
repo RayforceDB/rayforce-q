@@ -88,6 +88,9 @@ trap cleanup EXIT
 echo "running codec selftest..."
 "$DRIVER" --codec-selftest
 
+echo "running exchange selftest..."
+"$DRIVER" --exchange-selftest
+
 # ---- Leg 1: Rayforce server
 SERVERPORT="${SERVERPORT:-$(free_port)}"
 "$DRIVER" --serve "$SERVERPORT" &
