@@ -82,6 +82,15 @@ typedef struct {
   ray_t *sync_resp;
 } q_conn_t;
 
+static void q_release_any(ray_t *obj) {
+  if (obj == NULL)
+    return;
+  if (RAY_IS_ERR(obj))
+    ray_error_free(obj);
+  else
+    ray_release(obj);
+}
+
 /* A list argument carries data, not variable references — mark it so a symbol
  * inside it stays a literal instead of resolving against the environment.
  * Mirrors mark_ipc_literal_fallbacks in core/ipc.c. */
@@ -142,7 +151,7 @@ static void q_send_result(ray_sock_t fd, ray_t *result) {
   if (q_encode(result, &buf, &len, err, sizeof err) < 0) {
     ray_t *e = ray_error(err[0] ? err : "q server: encode failed", NULL);
     int rc = q_encode(e, &buf, &len, err, sizeof err);
-    ray_release(e);
+    q_release_any(e);
     if (rc < 0)
       return;
   }
@@ -271,7 +280,7 @@ static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
       cd->sync_ready = 1;
     } else {
       fprintf(stderr, "q: unsolicited response frame dropped\n");
-      ray_release(req);
+      q_release_any(req);
     }
     return NULL;
   }
@@ -280,7 +289,7 @@ static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
                       : ray_error("q server: malformed request", "%s",
                                   err[0] ? err : "q server: decode failed");
   if (req)
-    ray_release(req);
+    q_release_any(req);
 
   if (hdr.msgtype !=
       Q_MSG_ASYNC) { /* sync expects a response, async does not */
@@ -293,7 +302,7 @@ static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
     fprintf(stderr, "q: async message raised an error\n");
   }
   if (result)
-    ray_release(result);
+    q_release_any(result);
   return NULL;
 }
 
@@ -304,7 +313,7 @@ static void q_on_close(ray_poll_t *poll, ray_selector_t *sel) {
     /* A RESPONSE deposited for a sync wait that never consumed it (peer died
      * mid-round-trip) would otherwise leak. */
     if (cd->sync_resp)
-      ray_release(cd->sync_resp);
+      q_release_any(cd->sync_resp);
     free(cd);
     sel->data = NULL;
   }

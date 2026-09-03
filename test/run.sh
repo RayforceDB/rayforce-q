@@ -88,6 +88,9 @@ trap cleanup EXIT
 echo "running codec selftest..."
 "$DRIVER" --codec-selftest
 
+echo "running exchange selftest..."
+"$DRIVER" --exchange-selftest
+
 # ---- Leg 1: Rayforce server
 SERVERPORT="${SERVERPORT:-$(free_port)}"
 "$DRIVER" --serve "$SERVERPORT" &
@@ -159,6 +162,8 @@ T["guid atom";   ("G"$"d49f18a4-1969-49e8-9b8a-6bb9a4832eea")~h"(as 'guid \"d49f
 T["guid vec";    (enlist "G"$"d49f18a4-1969-49e8-9b8a-6bb9a4832eea")~h"(as 'GUID (list \"d49f18a4-1969-49e8-9b8a-6bb9a4832eea\"))"]
 / table
 T["table";       ([] a:1 2 3; b:`x`y`z)~h"(table [a b] (list [1 2 3] ['x 'y 'z]))"]
+/ dict
+T["dict";        (`a`b!1 2)~h"(dict ['a 'b] [1 2])"]
 / typed nulls
 T["null i64";    0N~h"0Nl"]
 T["null i32";    0Ni~h"0Ni"]

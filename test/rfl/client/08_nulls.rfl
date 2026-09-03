@@ -9,6 +9,7 @@
 (nil? (.q.send h "0Nh")) -- true
 (nil? (.q.send h "0Ni")) -- true
 (nil? (.q.send h "0n"))  -- true
+(nil? (.q.send h "::"))  -- true
 
 ;; empty typed vectors
 (count (.q.send h "`long$()"))  -- 0
