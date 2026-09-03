@@ -199,15 +199,15 @@ static void q_bind(const char *name, ray_t *fn) {
 void q_env_register(void) {
   ray_t *f;
 
-  f = ray_fn_vary(".q.connect", RAY_FN_NONE, qb_connect);
+  f = ray_fn_vary(".q.connect", RAY_FN_RESTRICTED, qb_connect);
   q_bind(".q.connect", f);
   ray_release(f);
 
-  f = ray_fn_binary(".q.send", RAY_FN_NONE, qb_send);
+  f = ray_fn_binary(".q.send", RAY_FN_RESTRICTED, qb_send);
   q_bind(".q.send", f);
   ray_release(f);
 
-  f = ray_fn_unary(".q.close", RAY_FN_NONE, qb_close);
+  f = ray_fn_unary(".q.close", RAY_FN_RESTRICTED, qb_close);
   q_bind(".q.close", f);
   ray_release(f);
 }
