@@ -821,10 +821,99 @@ static ray_t *q_des_vec_i(uint8_t **buf, int64_t *len, int8_t ray_type,
   return vec;
 }
 
+/* q temporal payloads that are NOT byte-compatible with a rayforce type and
+ * need a unit conversion instead of a raw copy + re-tag:
+ *
+ *   KZ datetime  double days since 2000.01.01  -> TIMESTAMP (i64 ns)
+ *   KU minute    i32 minutes since midnight    -> TIME (i32 ms)
+ *   KV second    i32 seconds since midnight    -> TIME (i32 ms)
+ *   KM month     i32 months since 2000.01      -> DATE (i32 days, 1st of month)
+ *
+ * A value the target cannot represent (q infinities 0W/-0W, a datetime past
+ * the i64 nanosecond range, a minute/second count that overflows i32 ms)
+ * decodes to the typed null rather than wrapping into a plausible-looking
+ * wrong value; the null sentinel itself (0Nz/0Nu/0Nv/0Nm) maps to the null. */
+
+/* |ms| must stay below INT64_MAX / 1e6 for the ns product to fit. */
+#define Q_KZ_MAX_MS 9223372036854.0
+
 static inline int64_t q_kz_days_to_nanos(double days) {
   if (isnan(days))
     return NULL_I64;
-  return (int64_t)llround(days * 86400000.0) * 1000000LL;
+  double ms = days * 86400000.0;
+  if (!(ms > -Q_KZ_MAX_MS && ms < Q_KZ_MAX_MS))
+    return NULL_I64; /* +-0Wz, or out of TIMESTAMP range */
+  return (int64_t)llround(ms) * 1000000LL;
+}
+
+/* minute/second -> ms.  `scale` is 60000 (KU) or 1000 (KV). */
+static int32_t q_i32_scaled_to_ms(int32_t v, int32_t scale) {
+  if (v == NULL_I32)
+    return NULL_I32;
+  if (v > INT32_MAX / scale || v < -(INT32_MAX / scale))
+    return NULL_I32; /* +-0Wu/0Wv, or past the i32 ms range */
+  return v * scale;
+}
+
+/* Days since 1970-01-01 for the first day of (y, m), m in 1..12.
+ * Howard Hinnant's days_from_civil, integral in the proleptic Gregorian
+ * calendar for any year. */
+static inline int64_t q_days_from_civil(int64_t y, int m) {
+  y -= m <= 2;
+  int64_t era = (y >= 0 ? y : y - 399) / 400;
+  int64_t yoe = y - era * 400;                          /* [0, 399] */
+  int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5; /* day 1 of month */
+  int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;  /* [0, 146096] */
+  return era * 146097 + doe - 719468;
+}
+
+/* months since 2000.01 -> days since 2000.01.01 of that month's first day,
+ * i.e. what q's `date$ does with a month (2024.02m -> 2024.02.01).  The
+ * second argument only exists to share q_des_vec_i32_conv's callback shape. */
+static int32_t q_km_months_to_days(int32_t months, int32_t unused) {
+  (void)unused;
+  if (months == NULL_I32)
+    return NULL_I32;
+  if (months == INT32_MAX || months == -INT32_MAX)
+    return NULL_I32; /* +-0Wm */
+  int64_t m0 = months;
+  int64_t y = 2000 + (m0 >= 0 ? m0 / 12 : -((-m0 + 11) / 12));
+  int mon = (int)(m0 - (y - 2000) * 12) + 1; /* 1..12 */
+  int64_t days = q_days_from_civil(y, mon) - q_days_from_civil(2000, 1);
+  if (days < INT32_MIN + 1 || days > INT32_MAX)
+    return NULL_I32;
+  return (int32_t)days;
+}
+
+/* Decode an i32 vector through a per-element conversion (KU/KV/KM). */
+static ray_t *q_des_vec_i32_conv(uint8_t **buf, int64_t *len, int8_t ray_type,
+                                 int32_t (*conv)(int32_t, int32_t),
+                                 int32_t arg) {
+  int32_t n;
+  if (q_read_vec_header(buf, len, &n) < 0)
+    return ray_error("q: buffer underflow", NULL);
+  if (n < 0)
+    return ray_error("q: negative vector length", NULL);
+  int64_t bytes = (int64_t)n * 4;
+  if (*len < bytes)
+    return ray_error("q: buffer underflow (vec body)", NULL);
+  ray_t *vec = ray_vec_new(ray_type, n);
+  if (vec == NULL || RAY_IS_ERR(vec)) {
+    if (vec)
+      ray_release(vec);
+    return ray_error("q: vector alloc failed", NULL);
+  }
+  int32_t *out = (int32_t *)ray_data(vec);
+  for (int32_t i = 0; i < n; i++) {
+    int32_t v;
+    memcpy(&v, *buf + (int64_t)i * 4, 4);
+    out[i] = conv(v, arg);
+  }
+  vec->len = n;
+  *buf += bytes;
+  *len -= bytes;
+  q_flag_nulls(vec);
+  return vec;
 }
 
 static ray_t *q_des_obj(uint8_t **buf, int64_t *len) {
@@ -851,12 +940,22 @@ static ray_t *q_des_obj(uint8_t **buf, int64_t *len) {
   case -Q_KN:
     return q_des_atom_i(buf, len, RAY_TIMESTAMP, 8);
   case -Q_KD:
-  case -Q_KM:
     return q_des_atom_i(buf, len, RAY_DATE, 4);
   case -Q_KT:
+    return q_des_atom_i(buf, len, RAY_TIME, 4);
   case -Q_KU:
   case -Q_KV:
-    return q_des_atom_i(buf, len, RAY_TIME, 4);
+  case -Q_KM: {
+    /* Same width as the target, different unit — convert, don't re-tag. */
+    Q_NEED(4);
+    int32_t v;
+    memcpy(&v, *buf, 4);
+    *buf += 4;
+    *len -= 4;
+    if (type == -Q_KM)
+      return ray_date(q_km_months_to_days(v, 0));
+    return ray_time(q_i32_scaled_to_ms(v, type == -Q_KU ? 60000 : 1000));
+  }
   case -Q_KZ: {
     Q_NEED(8);
     double d;
@@ -922,12 +1021,15 @@ static ray_t *q_des_obj(uint8_t **buf, int64_t *len) {
   case Q_KN:
     return q_des_vec_i(buf, len, RAY_TIMESTAMP, 8);
   case Q_KD:
-  case Q_KM:
     return q_des_vec_i(buf, len, RAY_DATE, 4);
   case Q_KT:
-  case Q_KU:
-  case Q_KV:
     return q_des_vec_i(buf, len, RAY_TIME, 4);
+  case Q_KU:
+    return q_des_vec_i32_conv(buf, len, RAY_TIME, q_i32_scaled_to_ms, 60000);
+  case Q_KV:
+    return q_des_vec_i32_conv(buf, len, RAY_TIME, q_i32_scaled_to_ms, 1000);
+  case Q_KM:
+    return q_des_vec_i32_conv(buf, len, RAY_DATE, q_km_months_to_days, 0);
   case Q_KZ: {
     int32_t n;
     if (q_read_vec_header(buf, len, &n) < 0)

@@ -18,4 +18,43 @@
 (.q.send h "2025.01.01T12:00:00.000")                         -- 2025.01.01D12:00:00.000000000
 (.q.send h "2026.07.10T09:30:00.000 2025.01.01T00:00:00.000") -- [2026.07.10D09:30:00.000000000 2025.01.01D00:00:00.000000000]
 
+;; A datetime the i64-nanosecond TIMESTAMP cannot hold (here ~2737 years
+;; out) and the q infinities decode to the null timestamp, not to an
+;; overflowed but plausible-looking value.
+(nil? (.q.send h "\"z\"$1e6"))   -- true
+(nil? (.q.send h "0Wz"))         -- true
+(nil? (.q.send h "-0Wz"))        -- true
+(.q.send h "(2025.01.01T12:00:00.000;0Wz)") -- [2025.01.01D12:00:00.000000000 0Np]
+
+;; minute (KU) and second (KV) share TIME's i32 width but count minutes /
+;; seconds since midnight, not milliseconds — they must be scaled, not
+;; re-tagged (09:30 used to come back as 00:00:00.570).
+(.q.send h "09:30")              -- 09:30:00.000
+(.q.send h "09:30 10:45")        -- [09:30:00.000 10:45:00.000]
+(.q.send h "09:30:15")           -- 09:30:15.000
+(.q.send h "09:30:15 23:59:59")  -- [09:30:15.000 23:59:59.000]
+(.q.send h "-09:30")             -- -09:30:00.000
+(nil? (.q.send h "0Nu"))         -- true
+(nil? (.q.send h "0Nv"))         -- true
+(nil? (at (.q.send h "`minute$570 0N 645") 1)) -- true
+;; the infinities have no i32-ms representation -> null
+(nil? (.q.send h "0Wu"))         -- true
+(nil? (.q.send h "-0Wv"))        -- true
+(nil? (at (.q.send h "09:30:15 0Wv") 1)) -- true
+;; decoded vectors carry the null gate, so aggregates skip the nulls
+(min (.q.send h "`minute$645 0N 570")) -- 09:30:00.000
+(max (.q.send h "`second$34215 0W 34216")) -- 09:30:16.000
+
+;; month (KM) counts months since 2000.01; it decodes to the DATE of the
+;; month's first day, as q's `date$ does (2024.02m used to be 2000.10.16).
+(.q.send h "2024.02m")                       -- 2024.02.01
+(.q.send h "2024.02 2024.03m")               -- [2024.02.01 2024.03.01]
+(.q.send h "2000.01m")                       -- 2000.01.01
+(.q.send h "1999.12m")                       -- 1999.12.01
+(.q.send h "1999.01 1998.12 2100.02m")       -- [1999.01.01 1998.12.01 2100.02.01]
+(.q.send h "`date$2024.02m")                 -- 2024.02.01
+(nil? (.q.send h "0Nm"))                     -- true
+(nil? (.q.send h "0Wm"))                     -- true
+(nil? (at (.q.send h "`month$289 0N 290") 1)) -- true
+
 (.q.close h)
