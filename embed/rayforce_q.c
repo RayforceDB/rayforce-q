@@ -164,8 +164,11 @@ static ray_t *qb_send(ray_t *handle, ray_t *msg) {
   char err[128] = {0};
   ray_t *res = q_send((int)fd, msg, err, sizeof err);
   if (res == NULL) {
-    /* Distinguish a closed/invalid fd from a transport failure. */
-    const char *code = strstr(err, "handle") ? "handle" : "send";
+    /* Distinguish a closed/invalid fd and an expired .q.connect timeout
+     * from a transport failure. */
+    const char *code = strstr(err, "handle")      ? "handle"
+                       : strstr(err, "timed out") ? "timeout"
+                                                  : "send";
     return ray_error(code, "%s", err[0] ? err : ".q.send: send failed");
   }
   return res;
