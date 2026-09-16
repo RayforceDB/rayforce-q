@@ -1058,6 +1058,8 @@ static ray_t *q_des_obj(uint8_t **buf, int64_t *len) {
 
   case Q_XT: { /* table = attrs(0) + dict_marker(99) + keys + values */
     Q_NEED(2);
+    if ((*buf)[0] != 0 || (*buf)[1] != Q_XD)
+      return ray_error("q: malformed table marker", NULL);
     (*buf) += 2;
     *len -= 2;
     ray_t *keys = q_des_obj(buf, len);
@@ -1373,7 +1375,9 @@ ray_t *q_decode(uint8_t *resp, int64_t resp_len, int compressed, char *err,
     free(decompressed);
   if (result == NULL)
     q_set_err(err, errlen, "q: deserialization returned null");
-  else if (remaining != 0) {
+  else if (RAY_IS_ERR(result)) {
+    return result;
+  } else if (remaining != 0) {
     q_release_any(result);
     q_set_err(err, errlen, "q: trailing bytes after object");
     return NULL;

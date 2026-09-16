@@ -333,6 +333,21 @@ static int run_codec_selftest(void) {
   }
   release_any(r);
 
+  err[0] = '\0';
+  uint8_t bad_table_marker[] = {98, 0, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0,
+                                0,  0, 0, 0,  0, 0, 0, 0};
+  r = q_decode(bad_table_marker, (int64_t)sizeof bad_table_marker, 0, err,
+               sizeof err);
+  ray_t *rs = r ? ray_fmt(r, 0) : NULL;
+  const char *rp = rs ? ray_str_ptr(rs) : err;
+  if (r == NULL || !RAY_IS_ERR(r) || strstr(rp, "q: malf") == NULL) {
+    fprintf(stderr, "codec selftest: malformed table marker was accepted\n");
+    failures++;
+  }
+  if (rs)
+    ray_release(rs);
+  release_any(r);
+
   if (q_connect("127.0.0.1", 70000, "", "", 1) != Q_ERR_SOCKET) {
     fprintf(stderr, "codec selftest: client accepted out-of-range port\n");
     failures++;
