@@ -121,6 +121,23 @@ if resp[8] != 0x80:
     raise SystemExit(f"malformed-frame test: expected Q error, got {resp.hex()}")
 PY
 
+echo "checking unknown Q message type handling..."
+python3 - "$HOST" "$SERVERPORT" <<'PY'
+import socket
+import struct
+import sys
+
+host, port = sys.argv[1], int(sys.argv[2])
+with socket.create_connection((host, port), 1.0) as s:
+    s.sendall(bytes([3, 0]))
+    if s.recv(1) != bytes([3]):
+        raise SystemExit("bad Q handshake response")
+    # Q identity is a valid body; only the message type is invalid.
+    s.sendall(struct.pack("<BBBBI", 1, 9, 0, 0, 10) + bytes([101, 0]))
+    if s.recv(1) != b'':
+        raise SystemExit("unknown message type was executed or answered")
+PY
+
 # ---- Leg 2: real-q interop against Rayforce server
 find_q
 if [[ -n "$QBIN" ]]; then

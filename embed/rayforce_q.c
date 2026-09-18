@@ -67,21 +67,26 @@ static int64_t q_atom_i64(ray_t *a, int *ok) {
   }
   switch (a->type) {
   case -RAY_I64:
-  case -RAY_TIMESTAMP:
     return a->i64;
   case -RAY_I32:
-  case -RAY_DATE:
-  case -RAY_TIME:
     return a->i32;
   case -RAY_I16:
     return a->i16;
   case -RAY_U8:
-  case -RAY_BOOL:
     return a->u8;
   default:
     *ok = 0;
     return 0;
   }
+}
+
+static int64_t q_handle_i64(ray_t *a, int *ok) {
+  if (a != NULL && a->type == -RAY_I64 && a->i64 >= 0) {
+    *ok = 1;
+    return a->i64;
+  }
+  *ok = 0;
+  return 0;
 }
 
 static void q_str_arg(ray_t *a, char *buf, size_t cap) {
@@ -163,9 +168,9 @@ static ray_t *qb_connect(ray_t **args, int64_t n) {
 /* (.q.send handle msg) -> decoded response (may itself be a Q server error). */
 static ray_t *qb_send(ray_t *handle, ray_t *msg) {
   int ok;
-  int64_t fd = q_atom_i64(handle, &ok);
+  int64_t fd = q_handle_i64(handle, &ok);
   if (!ok)
-    return ray_error("type", ".q.send: handle must be an integer");
+    return ray_error("type", ".q.send: handle must be a non-negative i64");
 
   ray_poll_t *poll = q_poll();
   if (poll != NULL)
@@ -184,15 +189,18 @@ static ray_t *qb_send(ray_t *handle, ray_t *msg) {
 /* (.q.close handle) -> null. */
 static ray_t *qb_close(ray_t *handle) {
   int ok;
-  int64_t fd = q_atom_i64(handle, &ok);
+  int64_t fd = q_handle_i64(handle, &ok);
   if (!ok)
-    return ray_error("type", ".q.close: handle must be an integer");
+    return ray_error("type", ".q.close: handle must be a non-negative i64");
 
   ray_poll_t *poll = q_poll();
-  if (poll != NULL)
+  if (poll != NULL) {
+    if (ray_poll_get(poll, fd) == NULL)
+      return ray_error("handle", ".q.close: not an open connection");
     q_conn_close(poll, fd);
-  else
-    q_close((int)fd);
+  } else if (q_close((int)fd) < 0) {
+    return ray_error("handle", ".q.close: not an open connection");
+  }
   return RAY_NULL_OBJ;
 }
 
