@@ -13,3 +13,12 @@
 
 ;; no credentials at all against an auth server -> rejected
 (.q.connect qhost qauthport) !- auth
+
+;; credentials must be strings; invalid values must fail before any socket I/O.
+(.q.connect qhost qauthport 123 quser) !- type
+(.q.connect qhost qauthport quser 456) !- type
+
+;; timeout is a non-negative C int number of milliseconds.
+(.q.connect qhost qport "" "" -1) !- range
+(.q.connect qhost qport "" "" 2147483648) !- range
+(.q.connect qhost qport "" "" "1000") !- type
