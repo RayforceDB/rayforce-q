@@ -37,6 +37,7 @@
 
 /* Registers `.q.connect` / `.q.send` / `.q.close` */
 void q_env_register(void);
+int64_t q_serve_from_args(ray_poll_t *poll, int argc, char **argv);
 
 typedef struct {
   uint8_t endianness;
@@ -70,6 +71,42 @@ static int run_server(int port) {
   ray_poll_destroy(poll);
   ray_runtime_destroy(rt);
   return 0;
+}
+
+static int run_q_cli_selftest(void) {
+  ray_runtime_t *rt = ray_runtime_create(0, NULL);
+  if (rt == NULL) {
+    fprintf(stderr, "q CLI selftest: failed to create runtime\n");
+    return 1;
+  }
+  ray_poll_t *poll = ray_poll_create();
+  if (poll == NULL) {
+    fprintf(stderr, "q CLI selftest: failed to create poll\n");
+    ray_runtime_destroy(rt);
+    return 1;
+  }
+
+  char *no_flag[] = {"rayforce", "--file", "app.rfl"};
+  char *bad_port[] = {"rayforce", "-q", "70000"};
+  char *junk_port[] = {"rayforce", "--q-serve", "1abc"};
+  char *missing_port[] = {"rayforce", "-q"};
+  char *app_args[] = {"rayforce", "--", "-q", "70000"};
+  int failures = 0;
+  if (q_serve_from_args(poll, 3, no_flag) != 0)
+    failures++;
+  if (q_serve_from_args(poll, 3, bad_port) >= 0)
+    failures++;
+  if (q_serve_from_args(poll, 3, junk_port) >= 0)
+    failures++;
+  if (q_serve_from_args(poll, 2, missing_port) >= 0)
+    failures++;
+  if (q_serve_from_args(poll, 4, app_args) != 0)
+    failures++;
+
+  ray_poll_destroy(poll);
+  ray_runtime_destroy(rt);
+  printf("q CLI selftest: %s\n", failures ? "FAIL" : "ok");
+  return failures ? 1 : 0;
 }
 
 static int fmt_eq(ray_t *a, ray_t *b) {
@@ -425,6 +462,9 @@ int main(int argc, char **argv) {
 
   if (argc >= 2 && strcmp(argv[1], "--exchange-selftest") == 0)
     return run_exchange_selftest();
+
+  if (argc >= 2 && strcmp(argv[1], "--q-cli-selftest") == 0)
+    return run_q_cli_selftest();
 
   /* Server role: `driver --serve PORT`. */
   if (argc >= 3 && strcmp(argv[1], "--serve") == 0)

@@ -91,6 +91,9 @@ echo "running codec selftest..."
 echo "running exchange selftest..."
 "$DRIVER" --exchange-selftest
 
+echo "running Q CLI argument selftest..."
+"$DRIVER" --q-cli-selftest
+
 # ---- Leg 1: Rayforce server
 SERVERPORT="${SERVERPORT:-$(free_port)}"
 "$DRIVER" --serve "$SERVERPORT" &
