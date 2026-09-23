@@ -42,6 +42,7 @@
 #include "q.h" /* pulls in <rayforce.h>: ray_eval_str, q_encode/q_decode */
 
 #include "core/sock.h" /* ray_sock_listen/accept/recv/send/close               */
+#include "core/qlog.h" /* ray_qlog_begin/end: the .sys.querylog ring         */
 #include "lang/eval.h" /* ray_eval, RAY_EVAL_LITERAL_FALLBACK                  */
 #include "ops/ops.h" /* ray_is_lazy, ray_lazy_materialize                    */
 
@@ -160,6 +161,42 @@ static void q_send_result(ray_sock_t fd, ray_t *result) {
   free(buf);
 }
 
+/* The query text a log row carries. A string request is the text itself.
+ * Anything else is summarised, not formatted: a push is a list whose head
+ * names the handler and whose payload can be a hundred megabytes of table,
+ * and formatting that back to source would cost more than evaluating it.
+ * The head and the frame's size say what it was. Returns the length written
+ * into `out`, at most `cap`. */
+static size_t q_log_source(ray_t *req, int64_t body, char *out, size_t cap) {
+  int n;
+  if (req == NULL || RAY_IS_ERR(req)) {
+    n = snprintf(out, cap, "malformed request, %lld B", (long long)body);
+  } else if (req->type == -RAY_STR) {
+    size_t len = ray_str_len(req);
+    if (len > cap)
+      len = cap;
+    memcpy(out, ray_str_ptr(req), len);
+    return len;
+  } else {
+    ray_t *name = NULL;
+    if (req->type == RAY_LIST && ray_len(req) > 0) {
+      ray_t *head = ((ray_t **)ray_data(req))[0];
+      if (head && head->type == -RAY_SYM)
+        name = ray_sym_str(head->i64);
+    }
+    if (name && !RAY_IS_ERR(name))
+      n = snprintf(out, cap, "(%.*s ...) %lld B", (int)ray_str_len(name),
+                   ray_str_ptr(name), (long long)body);
+    else
+      n = snprintf(out, cap, "(...) %lld B", (long long)body);
+    if (name)
+      q_release_any(name);
+  }
+  if (n < 0)
+    return 0;
+  return (size_t)n < cap ? (size_t)n : cap;
+}
+
 static int64_t q_recv_fn(int64_t fd, uint8_t *buf, int64_t len) {
   return ray_sock_recv((ray_sock_t)fd, buf, (size_t)len);
 }
@@ -263,6 +300,15 @@ static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
   q_header_t hdr = cd->hdr;
   int64_t id = sel->id;
   char err[128] = {0};
+
+  /* The core's query log (`.sys.querylog`): one row per request this server
+   * evaluates, decode included, so what the q wire costs the poll thread is
+   * readable beside the native IPC's rows. A RESPONSE is data for a parked
+   * q_conn_send, not a query, and stays out. A no-op while the log is off. */
+  ray_qlog_ctx_t qc = {0};
+  if (hdr.msgtype != Q_MSG_RESPONSE)
+    ray_qlog_begin(&qc);
+
   ray_t *req =
       q_decode(sel->rx.buf->data, body, hdr.compressed, err, sizeof err);
 
@@ -285,11 +331,17 @@ static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
     return NULL;
   }
 
+  char qsrc[RAY_QLOG_QUERY_MAX];
+  size_t qsrc_len = 0;
+  if (qc.measure.active)
+    qsrc_len = q_log_source(req, body, qsrc, sizeof qsrc);
+
   ray_t *result = req ? eval_request(req)
                       : ray_error("q server: malformed request", "%s",
                                   err[0] ? err : "q server: decode failed");
   if (req)
     q_release_any(req);
+  ray_qlog_end(&qc, qsrc, qsrc_len, result);
 
   if (hdr.msgtype !=
       Q_MSG_ASYNC) { /* sync expects a response, async does not */
