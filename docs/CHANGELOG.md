@@ -2,19 +2,6 @@
 
 All notable changes to `rayforce-q` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/), and the project adheres to [Semantic Versioning](https://semver.org/). Bindings pin a tag, so each release is a stable point they can build against.
 
-## [Unreleased]
-
-### Added
-
-- **Requests land in the core's query log.** With `.sys.querylog.enable` on, every request
-  the server evaluates is one row of `.sys.querylog`, the ring the native IPC server already
-  feeds: finish time, duration with decode included, status and the source. A string request
-  is logged verbatim; a list request, the shape a q publisher pushes, is logged as its head
-  and the frame's size (`(upd ...) 132 B`), because formatting a pushed table back to source
-  would cost more than the push. A RESPONSE frame is data for a parked `q_conn_send` and is
-  not logged. An operator can now read what each push costs the poll thread, which is what a
-  query queued behind it waits for.
-
 ## [2.1.1]
 
 ### Fixed

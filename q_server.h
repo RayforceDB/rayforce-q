@@ -39,9 +39,7 @@
  * The listener is non-blocking and runs entirely on the rayforce poll you
  * hand it — the same event loop the REPL and native IPC use — so it never
  * spawns a thread. Every request is evaluated on the poll thread, serialized
- * with the rest of the runtime. With the core's query log on
- * (`.sys.querylog.enable`), every request evaluated here lands in it beside
- * the native IPC's rows, decode included, with its duration and status.
+ * with the rest of the runtime.
  */
 
 #include <rayforce.h>
