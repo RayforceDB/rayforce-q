@@ -17,6 +17,7 @@
 (set h2 (.q.connect qhost qport))
 (.q.close h2)
 (.q.send h2 "1+1") !- handle
+(.q.connect qhost qport "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx") !- length
 
 ;; Connecting to a closed port fails at the socket level.
 (.q.connect qhost 1) !- connect
