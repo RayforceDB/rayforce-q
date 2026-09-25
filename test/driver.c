@@ -35,6 +35,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <sys/wait.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 /* Registers `.q.connect` / `.q.send` / `.q.close` */
@@ -542,6 +543,53 @@ static int run_exchange_selftest(void) {
     }
     free(resp);
     close(sv[0]);
+  }
+
+  /* Poll-attached round-trip against a peer that never answers: the recv
+   * timeout on the socket (what q_connect's timeout_ms sets) must bound
+   * q_conn_send and close the handle, instead of parking the event loop
+   * indefinitely. */
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
+    perror("exchange selftest: socketpair silent-peer");
+    failures++;
+  } else {
+    ray_runtime_t *rt = ray_runtime_create(0, NULL);
+    ray_poll_t *poll = rt ? ray_poll_create() : NULL;
+    if (poll == NULL) {
+      fprintf(stderr, "exchange selftest: failed to create runtime/poll\n");
+      failures++;
+    } else {
+      struct timeval tv = {.tv_sec = 0, .tv_usec = 200 * 1000};
+      setsockopt(sv[0], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+      int64_t id = q_conn_attach(poll, sv[0]);
+      if (id < 0)
+        close(sv[0]);
+      ray_t *msg = ray_str("1+1", 3);
+      /* A regression here is an unbounded wait: let SIGALRM fail the run
+       * instead of hanging it. */
+      alarm(10);
+      ray_t *r = id >= 0 ? q_conn_send(poll, id, msg) : NULL;
+      alarm(0);
+      ray_t *es = (r && RAY_IS_ERR(r)) ? ray_fmt(r, 0) : NULL;
+      const char *ep = es ? ray_str_ptr(es) : "";
+      if (r == NULL || !RAY_IS_ERR(r) || strstr(ep, "timeout") == NULL) {
+        fprintf(stderr, "exchange selftest: silent peer did not time out: %s\n",
+                ep);
+        failures++;
+      }
+      if (ray_poll_get(poll, id) != NULL) {
+        fprintf(stderr, "exchange selftest: timed-out handle was left open\n");
+        failures++;
+      }
+      if (es)
+        ray_release(es);
+      release_any(r);
+      ray_release(msg);
+      ray_poll_destroy(poll);
+    }
+    if (rt)
+      ray_runtime_destroy(rt);
+    close(sv[1]);
   }
 
   printf("exchange selftest: %s\n", failures ? "FAIL" : "ok");

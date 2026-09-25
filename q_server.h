@@ -66,6 +66,8 @@ int64_t q_serve(ray_poll_t *poll, int port);
 /* Put an already-connected, already-handshaken q_connect fd under `poll`'s
  * rx machine. Returns a poll selector id (>= 0) — the handle for the calls
  * below — or -1. The fd is owned by the poll from here on; do not q_close it.
+ * The socket's recv timeout (what q_connect's timeout_ms set) is read here
+ * and becomes q_conn_send's round-trip budget; none = wait indefinitely.
  */
 int64_t q_conn_attach(ray_poll_t *poll, int fd);
 
@@ -73,7 +75,10 @@ int64_t q_conn_attach(ray_poll_t *poll, int fd);
  * this connection until its RESPONSE arrives — dispatching, not swallowing,
  * any frame that arrives in between (a pushed async runs its handler, an
  * inbound sync request is answered). Returns a freshly-owned object, which
- * may be a RAY_ERROR from the peer or a local io/handle error. */
+ * may be a RAY_ERROR from the peer or a local io/handle error. When the
+ * budget inherited at attach time runs out first, the connection is closed
+ * (a late RESPONSE must not be taken for the next request's reply) and a
+ * `timeout` error is returned; the handle is then no longer open. */
 ray_t *q_conn_send(ray_poll_t *poll, int64_t id, ray_t *msg);
 
 /* Close an attached connection and release its state. */

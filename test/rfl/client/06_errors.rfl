@@ -25,3 +25,16 @@
 (.q.send h "2+2") -- 4
 
 (.q.close h)
+
+;; The .q.connect timeout bounds every sync round-trip, not just the
+;; connect: a peer that takes longer than the budget to answer surfaces
+;; as a `timeout` error instead of a wait with no upper bound (the
+;; event-loop path used to block forever). q itself is the slow peer here.
+(set slow (.q.connect qhost qport "" "" 300))
+(.q.send slow "system \"sleep 2\"") !- timeout
+(.q.close slow)
+
+;; a fresh connection with a budget the peer meets works as before
+(set fast (.q.connect qhost qport "" "" 5000))
+(.q.send fast "3+4") -- 7
+(.q.close fast)

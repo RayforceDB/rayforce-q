@@ -42,6 +42,7 @@
 #include "q.h" /* pulls in <rayforce.h>: ray_eval_str, q_encode/q_decode */
 
 #include "core/sock.h" /* ray_sock_listen/accept/recv/send/close               */
+#include "core/timer.h" /* ray_time_now_ms                                     */
 #include "lang/eval.h" /* ray_eval, RAY_EVAL_LITERAL_FALLBACK                  */
 #include "ops/ops.h" /* ray_is_lazy, ray_lazy_materialize                    */
 
@@ -50,6 +51,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 
 /* Wire header — must match q.c byte-for-byte */
 typedef struct {
@@ -81,6 +84,7 @@ typedef struct {
   uint8_t sync_waiting; /* a q_conn_send is parked on this connection */
   uint8_t sync_ready;   /* its RESPONSE has been deposited below      */
   ray_t *sync_resp;
+  int sync_timeout_ms; /* q_conn_send round-trip budget; <= 0 blocks  */
 } q_conn_t;
 
 static void q_release_any(ray_t *obj) {
@@ -398,14 +402,28 @@ static int q_conn_pump(ray_poll_t *poll, int64_t id) {
   }
 }
 
+/* The per-operation timeout q_connect applied to the socket (SO_RCVTIMEO).
+ * Once the fd is non-blocking under a poll, the kernel no longer enforces
+ * it, so q_conn_send has to — read it here before the switch. 0 = none. */
+static int q_sock_recv_timeout_ms(int fd) {
+  struct timeval tv = {0, 0};
+  socklen_t n = sizeof tv;
+  if (getsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, &n) < 0)
+    return 0;
+  int64_t ms = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+  return ms > INT32_MAX ? INT32_MAX : (int)ms;
+}
+
 int64_t q_conn_attach(ray_poll_t *poll, int fd) {
   if (poll == NULL || fd < 0)
     return -1;
+  int timeout_ms = q_sock_recv_timeout_ms(fd);
   ray_sock_set_nonblocking((ray_sock_t)fd);
 
   q_conn_t *cd = (q_conn_t *)calloc(1, sizeof *cd);
   if (cd == NULL)
     return -1;
+  cd->sync_timeout_ms = timeout_ms;
 
   ray_poll_reg_t reg = {0};
   reg.fd = (int64_t)fd;
@@ -450,6 +468,11 @@ ray_t *q_conn_send(ray_poll_t *poll, int64_t id, ray_t *msg) {
   cd->sync_ready = 0;
   cd->sync_resp = NULL;
 
+  /* The socket's recv timeout is the whole round-trip's budget, as it is on
+   * the blocking path where the kernel enforces it per recv. */
+  int bounded = cd->sync_timeout_ms > 0;
+  int64_t deadline_ms = bounded ? ray_time_now_ms() + cd->sync_timeout_ms : 0;
+
   for (;;) {
     /* Process what is already readable, then block for more. The pump can
      * deregister the selector (peer died), which frees cd — so re-resolve and
@@ -469,9 +492,22 @@ ray_t *q_conn_send(ray_poll_t *poll, int64_t id, ray_t *msg) {
     }
     if (rc < 0)
       return ray_error("io", "q: connection closed");
-    int w = ray_sock_wait_readable_intr((ray_sock_t)sel->fd, -1);
-    if (w == -2)
-      continue; /* interrupted by a signal — keep waiting */
+    int wait_ms = -1;
+    if (bounded) {
+      int64_t left = deadline_ms - ray_time_now_ms();
+      if (left <= 0) {
+        /* The request is in flight and its RESPONSE may still land; left
+         * open, the next sync send on this handle would claim it as its
+         * own reply. Tear the connection down and let the caller
+         * reconnect. q_on_close frees cd. */
+        ray_poll_deregister(poll, id);
+        return ray_error("timeout", "q: response timed out");
+      }
+      wait_ms = left > INT32_MAX ? INT32_MAX : (int)left;
+    }
+    int w = ray_sock_wait_readable_intr((ray_sock_t)sel->fd, wait_ms);
+    if (w == -2 || w == 0)
+      continue; /* signal, or the slice elapsed — the deadline check decides */
     if (w < 0) {
       cd->sync_waiting = 0;
       return ray_error("io", "q: recv failed");
