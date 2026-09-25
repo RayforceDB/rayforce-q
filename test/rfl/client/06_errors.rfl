@@ -7,6 +7,11 @@
 
 (set h (.q.connect qhost qport))
 
+;; Handles are the exact non-negative i64 values returned by .q.connect.
+(.q.send true "1+1") !- type
+(.q.close true) !- type
+(.q.close 999999) !- handle
+
 ;; explicit q signal: 'myerr  -> error text "myerr"
 (.q.send h "'myerr") !- myerr
 

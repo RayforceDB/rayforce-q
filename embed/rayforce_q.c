@@ -33,6 +33,7 @@
 #include "lang/eval.h"    /* ray_fn_*, RAY_FN_NONE               */
 
 #include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -66,21 +67,26 @@ static int64_t q_atom_i64(ray_t *a, int *ok) {
   }
   switch (a->type) {
   case -RAY_I64:
-  case -RAY_TIMESTAMP:
     return a->i64;
   case -RAY_I32:
-  case -RAY_DATE:
-  case -RAY_TIME:
     return a->i32;
   case -RAY_I16:
     return a->i16;
   case -RAY_U8:
-  case -RAY_BOOL:
     return a->u8;
   default:
     *ok = 0;
     return 0;
   }
+}
+
+static int64_t q_handle_i64(ray_t *a, int *ok) {
+  if (a != NULL && a->type == -RAY_I64 && a->i64 >= 0) {
+    *ok = 1;
+    return a->i64;
+  }
+  *ok = 0;
+  return 0;
 }
 
 static void q_str_arg(ray_t *a, char *buf, size_t cap) {
@@ -115,15 +121,24 @@ static ray_t *qb_connect(ray_t **args, int64_t n) {
   memcpy(host, ray_str_ptr(args[0]), hn);
   host[hn] = '\0';
 
+  if (n >= 3 && (args[2] == NULL || args[2]->type != -RAY_STR))
+    return ray_error("type", ".q.connect: user must be a string");
+  if (n >= 4 && (args[3] == NULL || args[3]->type != -RAY_STR))
+    return ray_error("type", ".q.connect: password must be a string");
+
   char user[128], password[128];
   q_str_arg(n >= 3 ? args[2] : NULL, user, sizeof user);
   q_str_arg(n >= 4 ? args[3] : NULL, password, sizeof password);
   int timeout_ms = 0;
   if (n >= 5) {
     int tok;
-    timeout_ms = (int)q_atom_i64(args[4], &tok);
+    int64_t timeout_value = q_atom_i64(args[4], &tok);
     if (!tok)
-      timeout_ms = 0;
+      return ray_error("type", ".q.connect: timeout must be an integer");
+    if (timeout_value < 0 || timeout_value > INT_MAX)
+      return ray_error("range",
+                       ".q.connect: timeout must be in 0..INT_MAX ms");
+    timeout_ms = (int)timeout_value;
   }
 
   int fd = q_connect(host, (int)port, user, password, timeout_ms);
@@ -153,9 +168,9 @@ static ray_t *qb_connect(ray_t **args, int64_t n) {
 /* (.q.send handle msg) -> decoded response (may itself be a Q server error). */
 static ray_t *qb_send(ray_t *handle, ray_t *msg) {
   int ok;
-  int64_t fd = q_atom_i64(handle, &ok);
+  int64_t fd = q_handle_i64(handle, &ok);
   if (!ok)
-    return ray_error("type", ".q.send: handle must be an integer");
+    return ray_error("type", ".q.send: handle must be a non-negative i64");
 
   ray_poll_t *poll = q_poll();
   if (poll != NULL)
@@ -174,15 +189,18 @@ static ray_t *qb_send(ray_t *handle, ray_t *msg) {
 /* (.q.close handle) -> null. */
 static ray_t *qb_close(ray_t *handle) {
   int ok;
-  int64_t fd = q_atom_i64(handle, &ok);
+  int64_t fd = q_handle_i64(handle, &ok);
   if (!ok)
-    return ray_error("type", ".q.close: handle must be an integer");
+    return ray_error("type", ".q.close: handle must be a non-negative i64");
 
   ray_poll_t *poll = q_poll();
-  if (poll != NULL)
+  if (poll != NULL) {
+    if (ray_poll_get(poll, fd) == NULL)
+      return ray_error("handle", ".q.close: not an open connection");
     q_conn_close(poll, fd);
-  else
-    q_close((int)fd);
+  } else if (q_close((int)fd) < 0) {
+    return ray_error("handle", ".q.close: not an open connection");
+  }
   return RAY_NULL_OBJ;
 }
 

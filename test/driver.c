@@ -33,6 +33,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 /* Registers `.q.connect` / `.q.send` / `.q.close` */
@@ -333,6 +335,34 @@ static int run_codec_selftest(void) {
   }
   release_any(r);
 
+  err[0] = '\0';
+  uint8_t bad_table_marker[] = {98, 0, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0,
+                                0,  0, 0, 0,  0, 0, 0, 0};
+  r = q_decode(bad_table_marker, (int64_t)sizeof bad_table_marker, 0, err,
+               sizeof err);
+  ray_t *rs = r ? ray_fmt(r, 0) : NULL;
+  const char *rp = rs ? ray_str_ptr(rs) : err;
+  if (r == NULL || !RAY_IS_ERR(r) || strstr(rp, "q: malf") == NULL) {
+    fprintf(stderr, "codec selftest: malformed table marker was accepted\n");
+    failures++;
+  }
+  if (rs)
+    ray_release(rs);
+  release_any(r);
+
+  uint8_t oversized_compressed[4];
+  uint32_t oversized_size =
+      (uint32_t)((256u << 20) + sizeof(test_q_header_t) + 1u);
+  memcpy(oversized_compressed, &oversized_size, sizeof oversized_size);
+  err[0] = '\0';
+  r = q_decode(oversized_compressed, (int64_t)sizeof oversized_compressed, 1,
+               err, sizeof err);
+  if (r != NULL || strstr(err, "decompression failed") == NULL) {
+    fprintf(stderr, "codec selftest: oversized compressed body was accepted\n");
+    failures++;
+  }
+  release_any(r);
+
   if (q_connect("127.0.0.1", 70000, "", "", 1) != Q_ERR_SOCKET) {
     fprintf(stderr, "codec selftest: client accepted out-of-range port\n");
     failures++;
@@ -381,6 +411,61 @@ static int run_codec_selftest(void) {
     }
     release_any(r);
   }
+
+  int listener = socket(AF_INET, SOCK_STREAM, 0);
+  if (listener < 0) {
+    perror("codec selftest: handshake socket");
+    failures++;
+  } else {
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (bind(listener, (struct sockaddr *)&addr, sizeof addr) < 0 ||
+        listen(listener, 1) < 0) {
+      perror("codec selftest: handshake listener");
+      failures++;
+      close(listener);
+    } else {
+      socklen_t addr_len = sizeof addr;
+      if (getsockname(listener, (struct sockaddr *)&addr, &addr_len) < 0) {
+        perror("codec selftest: handshake address");
+        close(listener);
+        failures++;
+        goto handshake_done;
+      }
+      pid_t child = fork();
+      if (child < 0) {
+        perror("codec selftest: handshake fork");
+        close(listener);
+        failures++;
+        goto handshake_done;
+      } else if (child == 0) {
+        int peer = accept(listener, NULL, NULL);
+        if (peer >= 0) {
+          uint8_t b;
+          while (recv(peer, &b, 1, 0) == 1 && b != 0)
+            ;
+          b = 0xff;
+          send(peer, &b, 1, 0);
+          close(peer);
+        }
+        close(listener);
+        _exit(0);
+      }
+      close(listener);
+      int bad_cap =
+          q_connect("127.0.0.1", ntohs(addr.sin_port), "", "", 1000);
+      if (bad_cap != Q_ERR_HANDSHAKE) {
+        fprintf(stderr, "codec selftest: invalid handshake capability accepted\n");
+        if (bad_cap >= 0)
+          q_close(bad_cap);
+        failures++;
+      }
+      waitpid(child, NULL, 0);
+    }
+  }
+handshake_done:
 
   ray_poll_t *poll = ray_poll_create();
   if (poll == NULL) {

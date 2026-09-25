@@ -103,6 +103,7 @@ static inline size_t ray_scalar_elem_size(int8_t type) {
 
 #define Q_MSG_SYNC 1
 #define Q_MSG_RESPONSE 2
+#define Q_CAP_MAX 3
 #define Q_MAX_BODY ((int64_t)256 << 20)
 
 typedef struct {
@@ -1160,6 +1161,8 @@ static ray_t *q_des_obj(uint8_t **buf, int64_t *len) {
 
   case Q_XT: { /* table = attrs(0) + dict_marker(99) + keys + values */
     Q_NEED(2);
+    if ((*buf)[0] != 0 || (*buf)[1] != Q_XD)
+      return ray_error("q: malformed table marker", NULL);
     (*buf) += 2;
     *len -= 2;
     ray_t *keys = q_des_obj(buf, len);
@@ -1240,7 +1243,7 @@ static int q_decompress(const uint8_t *src, int64_t src_len, uint8_t **out_buf,
   uint32_t header_size;
   memcpy(&header_size, src, 4);
   int64_t out_size = (int64_t)header_size - (int64_t)sizeof(q_header_t);
-  if (out_size <= 0)
+  if (out_size <= 0 || out_size > Q_MAX_BODY)
     return -1;
 
   uint32_t buffer[256] = {0};
@@ -1352,6 +1355,10 @@ int q_connect(const char *host, int port, const char *user,
 
   uint8_t cap;
   if (!sent_ok || q_recv_all(fd, &cap, 1) < 0) {
+    close(fd);
+    return Q_ERR_HANDSHAKE;
+  }
+  if (cap > Q_CAP_MAX) {
     close(fd);
     return Q_ERR_HANDSHAKE;
   }
@@ -1475,7 +1482,9 @@ ray_t *q_decode(uint8_t *resp, int64_t resp_len, int compressed, char *err,
     free(decompressed);
   if (result == NULL)
     q_set_err(err, errlen, "q: deserialization returned null");
-  else if (remaining != 0) {
+  else if (RAY_IS_ERR(result)) {
+    return result;
+  } else if (remaining != 0) {
     q_release_any(result);
     q_set_err(err, errlen, "q: trailing bytes after object");
     return NULL;

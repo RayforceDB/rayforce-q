@@ -62,6 +62,7 @@ typedef struct {
 
 #define Q_LITTLE_ENDIAN 1
 #define Q_MSG_ASYNC 0
+#define Q_MSG_SYNC 1
 #define Q_MSG_RESPONSE 2
 #define Q_CAP_MAX 3                     /* matches q.c client capability  */
 #define Q_MAX_BODY ((int64_t)256 << 20) /* reject absurd frames (256 MiB) */
@@ -268,6 +269,13 @@ static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
 
   sel->rx.read_fn = q_read_header;
   ray_poll_rx_request(poll, sel, (int64_t)sizeof(q_header_t));
+
+  if (hdr.msgtype != Q_MSG_ASYNC && hdr.msgtype != Q_MSG_SYNC &&
+      hdr.msgtype != Q_MSG_RESPONSE) {
+    q_release_any(req);
+    ray_poll_deregister(poll, id);
+    return NULL;
+  }
 
   /* A RESPONSE belongs to the q_conn_send parked on this connection — it is
    * data, not something to evaluate. */
