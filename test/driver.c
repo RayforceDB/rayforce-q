@@ -503,7 +503,7 @@ static int run_codec_selftest(void) {
       waitpid(child, NULL, 0);
     }
   }
-handshake_done:
+handshake_done:;
 
   ray_poll_t *poll = ray_poll_create();
   if (poll == NULL) {

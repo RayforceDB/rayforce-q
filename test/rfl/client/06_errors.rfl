@@ -32,7 +32,10 @@
 ;; event-loop path used to block forever). q itself is the slow peer here.
 (set slow (.q.connect qhost qport "" "" 300))
 (.q.send slow "system \"sleep 2\"") !- timeout
-(.q.close slow)
+;; on the event-loop path the timeout already closed the handle (a late
+;; RESPONSE must not be taken for the next reply); on the blocking path the
+;; fd is still open, so close it if it is.
+(try (.q.close slow) null)
 
 ;; a fresh connection with a budget the peer meets works as before
 (set fast (.q.connect qhost qport "" "" 5000))
