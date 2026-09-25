@@ -233,12 +233,18 @@ void q_env_register(void) {
   ray_release(f);
 }
 
-/* Folded entry point, called from the rayforce binary's main()
- * Starts the Q server when `-q PORT` / `--q-serve PORT` is present */
+/* Folded entry point, called from the rayforce binary's main().
+ * Returns the listener id on success, 0 when no Q-server flag is present,
+ * or -1 when a Q-server flag is malformed or cannot be started. */
 int64_t q_serve_from_args(ray_poll_t *poll, int argc, char **argv) {
   for (int i = 1; i < argc; i++) {
-    if ((strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--q-serve") == 0) &&
-        i + 1 < argc) {
+    if (strcmp(argv[i], "--") == 0)
+      break;
+    if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--q-serve") == 0) {
+      if (i + 1 >= argc) {
+        fprintf(stderr, "q: missing port after %s (expected 1..65535)\n", argv[i]);
+        return -1;
+      }
       int port = 0;
       if (!q_parse_port(argv[++i], &port)) {
         fprintf(stderr, "q: invalid port %s (expected 1..65535)\n", argv[i]);
@@ -247,5 +253,5 @@ int64_t q_serve_from_args(ray_poll_t *poll, int argc, char **argv) {
       return q_serve(poll, port);
     }
   }
-  return -1;
+  return 0;
 }

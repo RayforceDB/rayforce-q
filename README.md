@@ -36,6 +36,12 @@ The server is exposed via the `-q PORT` flag — it shares the REPL's event loop
 ./rayforce -q 25565        # serve Rayfall over the Q wire on port 25565
 ```
 
+Both `-q` and `--q-serve` require a decimal TCP port in `1..65535`. A
+missing or invalid port prints a diagnostic and exits with status `2`, so a
+service supervisor does not mistake a failed Q listener for a healthy
+process. Arguments after `--` are passed to the Rayfall application and are
+not interpreted as Q-server options.
+
 # API
 
 See **[INTEGRATING.md](./docs/INTEGRATING.md)** for more details.

@@ -70,8 +70,8 @@ rayforce: pull_core
 	@mkdir -p $(CORE)/src/q
 	@cp q.c q.h q_server.c q_server.h embed/rayforce_q.c $(CORE)/src/q/
 	@sed -e 's@ray_runtime_t\* rt = ray_runtime_create(argc, argv);@& extern void q_env_register(void); if (rt) q_env_register();@' \
-	     -e 's@        else if (strcmp(argv\[i\], "--") == 0)@        else if ((strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--q-serve") == 0) \&\& i + 1 < argc) { i++; } &@' \
-	     -e 's@if (poll) ray_runtime_set_poll(poll);@if (poll) { ray_runtime_set_poll(poll); extern int64_t q_serve_from_args(ray_poll_t*, int, char**); q_serve_from_args(poll, argc, argv); }@' \
+	     -e 's@        else if (strcmp(argv\[i\], "--") == 0)@        else if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--q-serve") == 0) { if (i + 1 < argc) i++; } &@' \
+	     -e 's@if (poll) ray_runtime_set_poll(poll);@if (poll) { ray_runtime_set_poll(poll); extern int64_t q_serve_from_args(ray_poll_t*, int, char**); if (q_serve_from_args(poll, argc, argv) < 0) { rc = 2; goto done; } }@' \
 		$(CORE)/src/app/main.c > $(CORE)/src/app/main.c.q && \
 		mv $(CORE)/src/app/main.c.q $(CORE)/src/app/main.c
 	@$(MAKE) -C $(CORE) release
