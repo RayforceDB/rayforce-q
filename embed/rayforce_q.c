@@ -89,15 +89,19 @@ static int64_t q_handle_i64(ray_t *a, int *ok) {
   return 0;
 }
 
-static void q_str_arg(ray_t *a, char *buf, size_t cap) {
+static ray_t *q_copy_str_arg(ray_t *a, const char *name, char *buf,
+                             size_t cap) {
   buf[0] = '\0';
-  if (a == NULL || a->type != -RAY_STR)
-    return;
+  if (a == NULL)
+    return NULL;
+  if (a->type != -RAY_STR)
+    return ray_error("type", ".q.connect: %s must be a string", name);
   size_t n = ray_str_len(a);
   if (n >= cap)
-    n = cap - 1;
+    return ray_error("length", ".q.connect: %s too long", name);
   memcpy(buf, ray_str_ptr(a), n);
   buf[n] = '\0';
+  return NULL;
 }
 
 /* (.q.connect host port [user password [timeout_ms]]) -> fd */
@@ -127,8 +131,14 @@ static ray_t *qb_connect(ray_t **args, int64_t n) {
     return ray_error("type", ".q.connect: password must be a string");
 
   char user[128], password[128];
-  q_str_arg(n >= 3 ? args[2] : NULL, user, sizeof user);
-  q_str_arg(n >= 4 ? args[3] : NULL, password, sizeof password);
+  ray_t *arg_err = q_copy_str_arg(n >= 3 ? args[2] : NULL, "user", user,
+                                  sizeof user);
+  if (arg_err)
+    return arg_err;
+  arg_err = q_copy_str_arg(n >= 4 ? args[3] : NULL, "password", password,
+                           sizeof password);
+  if (arg_err)
+    return arg_err;
   int timeout_ms = 0;
   if (n >= 5) {
     int tok;
