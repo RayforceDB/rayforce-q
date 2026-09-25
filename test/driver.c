@@ -338,6 +338,50 @@ static int run_codec_selftest(void) {
     failures++;
   }
 
+  /* Unit-converted temporals, raw wire bytes so no q is needed: the q
+   * type byte, then the little-endian payload. */
+  struct {
+    const char *name;
+    uint8_t body[16];
+    int64_t body_len;
+    int8_t want_type;
+    int64_t want_val; /* i32 sentinel-compared through the atom union */
+  } temporal[] = {
+      /* -17 minute 570 -> 09:30 = 34200000 ms */
+      {"minute atom", {0xEF, 0x3A, 0x02, 0x00, 0x00}, 5, -RAY_TIME, 34200000},
+      /* -18 second 34215 -> 09:30:15 = 34215000 ms */
+      {"second atom", {0xEE, 0xA7, 0x85, 0x00, 0x00}, 5, -RAY_TIME, 34215000},
+      /* -17 minute 0Wu (INT32_MAX) has no i32-ms form -> null time */
+      {"minute inf", {0xEF, 0xFF, 0xFF, 0xFF, 0x7F}, 5, -RAY_TIME, NULL_I32},
+      /* -13 month 289 (2024.02m) -> 2024.02.01 = 8797 days since 2000 */
+      {"month atom", {0xF3, 0x21, 0x01, 0x00, 0x00}, 5, -RAY_DATE, 8797},
+      /* -13 month -1 (1999.12m) -> 1999.12.01 = -31 days */
+      {"month neg", {0xF3, 0xFF, 0xFF, 0xFF, 0xFF}, 5, -RAY_DATE, -31},
+      /* -15 datetime 1e6 days (~2737 years): past the ns range -> null */
+      {"datetime range",
+       {0xF1, 0x00, 0x00, 0x00, 0x00, 0x80, 0x84, 0x2E, 0x41},
+       9,
+       -RAY_TIMESTAMP,
+       NULL_I64},
+  };
+  for (size_t i = 0; i < sizeof temporal / sizeof temporal[0]; i++) {
+    err[0] = '\0';
+    r = q_decode(temporal[i].body, temporal[i].body_len, 0, err, sizeof err);
+    int64_t got = 0;
+    if (r != NULL && !RAY_IS_ERR(r))
+      got = (r->type == -RAY_TIMESTAMP) ? r->i64 : (int64_t)r->i32;
+    if (r == NULL || RAY_IS_ERR(r) || r->type != temporal[i].want_type ||
+        got != temporal[i].want_val) {
+      fprintf(stderr,
+              "codec selftest: %s decoded wrong (type %d val %lld, want "
+              "type %d val %lld) %s\n",
+              temporal[i].name, r ? (int)r->type : 0, (long long)got,
+              (int)temporal[i].want_type, (long long)temporal[i].want_val, err);
+      failures++;
+    }
+    release_any(r);
+  }
+
   ray_poll_t *poll = ray_poll_create();
   if (poll == NULL) {
     fprintf(stderr, "codec selftest: failed to create poll\n");
