@@ -2,6 +2,34 @@
 
 All notable changes to `rayforce-q` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/), and the project adheres to [Semantic Versioning](https://semver.org/). Bindings pin a tag, so each release is a stable point they can build against.
 
+## [2.2.0]
+
+Built and tested (`make test` with a real q, `make rayforce`) against rayforce
+core `dev` at `12502a6e`, which carries the fix for joins that leaked memory
+per call once the right table passed 65 536 rows with the thread pool on
+(core #621, issue #619). Nothing in this repository needed to change for that
+core; the release records the pairing and ships the fixes below.
+
+### Fixed
+
+- **Poll-attached sync sends ignored the `.q.connect` timeout.** On the event
+  loop `q_conn_send` waited for the RESPONSE without a deadline, so a peer that
+  accepted a request and never answered parked the loop for good. The fd's
+  receive timeout is now the round-trip budget; on expiry the handle is
+  deregistered and `.q.send` fails with `timeout` (on both paths).
+- **q minute, second and month decoded unscaled.** `09:30` came back as
+  `00:00:00.570` and `2024.02m` as `2000.10.16`. They are now scaled to the
+  rayforce TIME and DATE they mean; values those types cannot hold, and
+  datetimes past the TIMESTAMP range, decode to the typed null.
+- **`.q.connect` / `.q.send` / `.q.close` were callable by restricted (`-U`)
+  IPC clients**, which let such a client make the server open outbound q
+  connections. They are now registered as restricted builtins.
+- **Wire and argument validation**: non-response frames are rejected where a
+  response is expected, table wire markers and connect arguments are checked,
+  oversized credential strings are refused, closed peers and identity replies
+  are handled, native dict results encode, and the server CLI validates its
+  port arguments. `.q.close` on a handle that is not open is an error.
+
 ## [2.1.1]
 
 ### Fixed
