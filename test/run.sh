@@ -141,6 +141,79 @@ with socket.create_connection((host, port), 1.0) as s:
         raise SystemExit("unknown message type was executed or answered")
 PY
 
+echo "checking multi-chunk Q frame decoding..."
+python3 - "$HOST" "$SERVERPORT" <<'PY'
+import socket
+import struct
+import sys
+
+host, port = sys.argv[1], int(sys.argv[2])
+count = 40_000
+values = list(range(count))
+request = bytes([6, 0]) + struct.pack("<I", count) + struct.pack(
+    f"<{count}i", *values
+)
+
+def recv_exact(sock, size):
+    chunks = bytearray()
+    while len(chunks) < size:
+        part = sock.recv(size - len(chunks))
+        if not part:
+            raise SystemExit("multi-chunk test: server closed early")
+        chunks.extend(part)
+    return bytes(chunks)
+
+with socket.create_connection((host, port), 1.0) as s:
+    s.sendall(bytes([3, 0]))
+    if recv_exact(s, 1) != bytes([3]):
+        raise SystemExit("bad Q handshake response")
+    s.sendall(struct.pack("<BBBBI", 1, 1, 0, 0, len(request) + 8))
+    s.sendall(request)
+    header = recv_exact(s, 8)
+    if header[:4] != bytes([1, 2, 0, 0]):
+        raise SystemExit(f"multi-chunk test: unexpected response header {header.hex()}")
+    body = recv_exact(s, struct.unpack_from("<I", header, 4)[0] - 8)
+    if body != request:
+        raise SystemExit("multi-chunk test: vector changed during round-trip")
+PY
+
+if [[ -r "/proc/${PIDS[0]}/status" ]]; then
+  echo "checking partial large-frame memory use..."
+  python3 - "$HOST" "$SERVERPORT" "${PIDS[0]}" <<'PY'
+import socket
+import struct
+import sys
+import time
+
+host, port, pid = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+status_path = f"/proc/{pid}/status"
+
+def vm_size_kib():
+    with open(status_path, encoding="ascii") as f:
+        for line in f:
+            if line.startswith("VmSize:"):
+                return int(line.split()[1])
+    raise RuntimeError("VmSize missing from server status")
+
+before = vm_size_kib()
+with socket.create_connection((host, port), 1.0) as s:
+    s.sendall(bytes([3, 0]))
+    if s.recv(1) != bytes([3]):
+        raise SystemExit("bad Q handshake response")
+    # Advertise a 128 MiB body, then hold the connection without sending it.
+    total_size = 128 * 1024 * 1024
+    s.sendall(struct.pack("<BBBBI", 1, 1, 0, 0, total_size))
+    time.sleep(0.25)
+    delta_kib = vm_size_kib() - before
+    if delta_kib > 32 * 1024:
+        raise SystemExit(
+            f"partial-frame test: server reserved {delta_kib} KiB before body arrived"
+        )
+
+print(f"partial-frame memory check ok ({delta_kib} KiB growth)")
+PY
+fi
+
 # ---- Leg 2: real-q interop against Rayforce server
 find_q
 if [[ -n "$QBIN" ]]; then
