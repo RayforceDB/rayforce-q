@@ -938,7 +938,6 @@ static ray_t *q_des_obj(uint8_t **buf, int64_t *len) {
   case -Q_KJ:
     return q_des_atom_i(buf, len, RAY_I64, 8);
   case -Q_KP:
-  case -Q_KN:
     return q_des_atom_i(buf, len, RAY_TIMESTAMP, 8);
   case -Q_KD:
     return q_des_atom_i(buf, len, RAY_DATE, 4);
@@ -1019,7 +1018,6 @@ static ray_t *q_des_obj(uint8_t **buf, int64_t *len) {
   case Q_KJ:
     return q_des_vec_i(buf, len, RAY_I64, 8);
   case Q_KP:
-  case Q_KN:
     return q_des_vec_i(buf, len, RAY_TIMESTAMP, 8);
   case Q_KD:
     return q_des_vec_i(buf, len, RAY_DATE, 4);

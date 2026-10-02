@@ -451,6 +451,32 @@ static int run_codec_selftest(void) {
     release_any(r);
   }
 
+  /* Q timespans (KN) are durations, not timestamps. Rayforce has no
+   * duration type, so reject them rather than silently changing meaning. */
+  const struct {
+    const char *name;
+    uint8_t body[6];
+    int64_t body_len;
+  } unsupported_temporals[] = {
+      {"timespan atom", {0xF0, 0, 0, 0, 0, 0}, 1},
+      {"timespan vector", {0x10, 0, 0, 0, 0, 0}, 6},
+  };
+  for (size_t i = 0;
+       i < sizeof unsupported_temporals / sizeof unsupported_temporals[0];
+       i++) {
+    err[0] = '\0';
+    r = q_decode((uint8_t *)unsupported_temporals[i].body,
+                 unsupported_temporals[i].body_len, 0, err, sizeof err);
+    if (r == NULL || !RAY_IS_ERR(r) ||
+        strcmp(ray_err_code(r), "q: unsu") != 0) {
+      fprintf(stderr, "codec selftest: %s was not rejected: %s\n",
+              unsupported_temporals[i].name,
+              r && RAY_IS_ERR(r) ? ray_err_code(r) : err);
+      failures++;
+    }
+    release_any(r);
+  }
+
   int listener = socket(AF_INET, SOCK_STREAM, 0);
   if (listener < 0) {
     perror("codec selftest: handshake socket");
