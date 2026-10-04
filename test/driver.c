@@ -367,6 +367,28 @@ static int run_codec_selftest(void) {
   release_any(r);
 
   err[0] = '\0';
+  uint8_t unsupported_type[] = {127};
+  r = q_decode(unsupported_type, (int64_t)sizeof unsupported_type, 0, err,
+               sizeof err);
+  if (r != NULL || strstr(err, "deserialization failed") == NULL) {
+    fprintf(stderr, "codec selftest: unsupported wire type was not reported as "
+                    "decode failure\n");
+    failures++;
+  }
+  release_any(r);
+
+  err[0] = '\0';
+  uint8_t malformed_qerr[] = {128, 'b', 'a', 'd'};
+  r = q_decode(malformed_qerr, (int64_t)sizeof malformed_qerr, 0, err,
+               sizeof err);
+  if (r != NULL || err[0] == '\0') {
+    fprintf(stderr,
+            "codec selftest: malformed Q error frame was not rejected\n");
+    failures++;
+  }
+  release_any(r);
+
+  err[0] = '\0';
   uint8_t qidentity[] = {101, 0};
   r = q_decode(qidentity, (int64_t)sizeof qidentity, 0, err, sizeof err);
   if (r != RAY_NULL_OBJ) {
@@ -399,13 +421,14 @@ static int run_codec_selftest(void) {
     fprintf(stderr, "codec selftest: cannot allocate deep frame\n");
     failures++;
   } else {
+    err[0] = '\0';
     for (int i = 0; i < deep_levels; i++) {
       deep[(size_t)i * 6] = 0;     /* general list */
       deep[(size_t)i * 6 + 2] = 1; /* one element */
     }
     deep[deep_len - 2] = 101; /* identity */
     r = q_decode(deep, (int64_t)deep_len, 0, err, sizeof err);
-    if (!RAY_IS_ERR(r)) {
+    if (r != NULL || err[0] == '\0') {
       fprintf(stderr, "codec selftest: excessive nesting was not rejected\n");
       failures++;
     }
@@ -438,14 +461,10 @@ static int run_codec_selftest(void) {
                                 0,  0, 0, 0,  0, 0, 0, 0, 0, 0};
   r = q_decode(bad_table_marker, (int64_t)sizeof bad_table_marker, 0, err,
                sizeof err);
-  ray_t *rs = r ? ray_fmt(r, 0) : NULL;
-  const char *rp = rs ? ray_str_ptr(rs) : err;
-  if (r == NULL || !RAY_IS_ERR(r) || strstr(rp, "q: malf") == NULL) {
+  if (r != NULL || err[0] == '\0') {
     fprintf(stderr, "codec selftest: malformed table marker was accepted\n");
     failures++;
   }
-  if (rs)
-    ray_release(rs);
   release_any(r);
 
   uint8_t oversized_compressed[4];

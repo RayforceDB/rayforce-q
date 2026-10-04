@@ -1580,16 +1580,26 @@ ray_t *q_decode(uint8_t *resp, int64_t resp_len, int compressed, char *err,
   uint8_t *cursor = decoded;
   int64_t remaining = decoded_len;
   ray_t *result = q_des_obj(&cursor, &remaining, 0);
+  int is_q_error_frame =
+      decoded_len >= 2 && decoded[0] == (uint8_t)Q_ERR &&
+      memchr(decoded + 1, '\0', (size_t)(decoded_len - 1)) != NULL;
   if (decompressed)
     free(decompressed);
   if (result == NULL)
     q_set_err(err, errlen, "q: deserialization returned null");
-  else if (RAY_IS_ERR(result)) {
-    return result;
-  } else if (remaining != 0) {
+  else if (remaining != 0) {
     q_release_any(result);
     q_set_err(err, errlen, "q: trailing bytes after object");
     return NULL;
+  } else if (RAY_IS_ERR(result)) {
+    /* A Q error frame is a valid decoded server response. Other errors
+     * produced by q_des_obj represent malformed or unsupported wire data and
+     * must use the documented decode-failure channel instead. */
+    if (!is_q_error_frame) {
+      q_release_any(result);
+      q_set_err(err, errlen, "q: deserialization failed");
+      return NULL;
+    }
   }
   return result;
 }
