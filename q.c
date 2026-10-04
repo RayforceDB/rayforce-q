@@ -1584,9 +1584,7 @@ ray_t *q_decode(uint8_t *resp, int64_t resp_len, int compressed, char *err,
     free(decompressed);
   if (result == NULL)
     q_set_err(err, errlen, "q: deserialization returned null");
-  else if (RAY_IS_ERR(result)) {
-    return result;
-  } else if (remaining != 0) {
+  else if (remaining != 0) {
     q_release_any(result);
     q_set_err(err, errlen, "q: trailing bytes after object");
     return NULL;

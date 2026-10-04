@@ -367,6 +367,17 @@ static int run_codec_selftest(void) {
   release_any(r);
 
   err[0] = '\0';
+  uint8_t qerr_with_tail[] = {128, 'b', 'a', 'd', 0, 0xff};
+  r = q_decode(qerr_with_tail, (int64_t)sizeof qerr_with_tail, 0, err,
+               sizeof err);
+  if (r != NULL || strstr(err, "trailing bytes") == NULL) {
+    fprintf(stderr,
+            "codec selftest: trailing bytes after Q error were not rejected\n");
+    failures++;
+  }
+  release_any(r);
+
+  err[0] = '\0';
   uint8_t qidentity[] = {101, 0};
   r = q_decode(qidentity, (int64_t)sizeof qidentity, 0, err, sizeof err);
   if (r != RAY_NULL_OBJ) {
