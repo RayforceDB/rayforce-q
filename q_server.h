@@ -81,6 +81,9 @@ int64_t q_conn_attach(ray_poll_t *poll, int fd);
  * `timeout` error is returned; the handle is then no longer open. */
 ray_t *q_conn_send(ray_poll_t *poll, int64_t id, ray_t *msg);
 
+/* Check whether `id` identifies an open Q connection owned by this module. */
+int q_conn_is_handle(ray_poll_t *poll, int64_t id);
+
 /* Close an attached connection and release its state. */
 void q_conn_close(ray_poll_t *poll, int64_t id);
 

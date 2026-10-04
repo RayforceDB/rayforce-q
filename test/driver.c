@@ -28,14 +28,17 @@
 #include "q.h"            /* q_decode / q_connect / q_exchange      */
 #include "q_server.h"     /* q_serve                                */
 
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <netinet/in.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
-#include <sys/wait.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 /* Registers `.q.connect` / `.q.send` / `.q.close` */
@@ -373,9 +376,66 @@ static int run_codec_selftest(void) {
   }
   release_any(r);
 
+  /* An unsupported nested value must fail size calculation before the
+   * serializer writes a partial type byte past the allocated buffer. */
+  r = ray_eval_str("(list (fn [x] x))");
+  uint8_t *encoded = NULL;
+  int64_t encoded_len = 0;
   err[0] = '\0';
-  uint8_t bad_table_marker[] = {98, 0, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0,
-                                0,  0, 0, 0,  0, 0, 0, 0};
+  if (RAY_IS_ERR(r) ||
+      q_encode(r, &encoded, &encoded_len, err, sizeof err) == 0) {
+    fprintf(stderr, "codec selftest: nested function was serialized\n");
+    failures++;
+  }
+  free(encoded);
+  release_any(r);
+
+  /* A small body with excessive nesting is rejected without exhausting the
+   * C stack. Every six bytes is a one-item Q general list. */
+  const int deep_levels = 5000;
+  const size_t deep_len = (size_t)deep_levels * 6 + 2;
+  uint8_t *deep = (uint8_t *)calloc(deep_len, 1);
+  if (deep == NULL) {
+    fprintf(stderr, "codec selftest: cannot allocate deep frame\n");
+    failures++;
+  } else {
+    for (int i = 0; i < deep_levels; i++) {
+      deep[(size_t)i * 6] = 0;     /* general list */
+      deep[(size_t)i * 6 + 2] = 1; /* one element */
+    }
+    deep[deep_len - 2] = 101; /* identity */
+    r = q_decode(deep, (int64_t)deep_len, 0, err, sizeof err);
+    if (!RAY_IS_ERR(r)) {
+      fprintf(stderr, "codec selftest: excessive nesting was not rejected\n");
+      failures++;
+    }
+    release_any(r);
+    free(deep);
+  }
+
+  /* Keyed-table dictionaries keep their Q dictionary marker on re-encode. */
+  const uint8_t keyed_table[] = {
+      0x63, 0x62, 0x00, 0x63, 0x0b, 0x00, 0x01, 0x00, 0x00, 0x00, 0x6b,
+      0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x01, 0x00,
+      0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x62, 0x00, 0x63, 0x0b, 0x00,
+      0x01, 0x00, 0x00, 0x00, 0x76, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+      0x00, 0x06, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00};
+  r = q_decode((uint8_t *)keyed_table, sizeof keyed_table, 0, err, sizeof err);
+  encoded = NULL;
+  encoded_len = 0;
+  if (RAY_IS_ERR(r) ||
+      q_encode(r, &encoded, &encoded_len, err, sizeof err) < 0 ||
+      encoded_len < (int64_t)sizeof(test_q_header_t) + 3 ||
+      encoded[sizeof(test_q_header_t)] != 99) {
+    fprintf(stderr, "codec selftest: keyed-table marker was not preserved\n");
+    failures++;
+  }
+  free(encoded);
+  release_any(r);
+
+  err[0] = '\0';
+  uint8_t bad_table_marker[] = {98, 0, 0, 11, 0, 0, 0, 0, 0, 0,
+                                0,  0, 0, 0,  0, 0, 0, 0, 0, 0};
   r = q_decode(bad_table_marker, (int64_t)sizeof bad_table_marker, 0, err,
                sizeof err);
   ray_t *rs = r ? ray_fmt(r, 0) : NULL;
@@ -404,6 +464,25 @@ static int run_codec_selftest(void) {
   if (q_connect("127.0.0.1", 70000, "", "", 1) != Q_ERR_SOCKET) {
     fprintf(stderr, "codec selftest: client accepted out-of-range port\n");
     failures++;
+  }
+
+  /* A large i64 handle must not truncate to and close an unrelated fd. */
+  q_env_register();
+  int unrelated_fd = open("/dev/null", O_RDONLY);
+  if (unrelated_fd < 0) {
+    perror("codec selftest: open handle sentinel");
+    failures++;
+  } else {
+    char close_expr[96];
+    snprintf(close_expr, sizeof close_expr, "(.q.close %lld)",
+             (long long)unrelated_fd + (1LL << 32));
+    r = ray_eval_str(close_expr);
+    if (!RAY_IS_ERR(r) || fcntl(unrelated_fd, F_GETFD) < 0) {
+      fprintf(stderr, "codec selftest: oversized handle closed a valid fd\n");
+      failures++;
+    }
+    release_any(r);
+    close(unrelated_fd);
   }
 
   /* Unit-converted temporals, raw wire bytes so no q is needed: the q
@@ -492,10 +571,10 @@ static int run_codec_selftest(void) {
         _exit(0);
       }
       close(listener);
-      int bad_cap =
-          q_connect("127.0.0.1", ntohs(addr.sin_port), "", "", 1000);
+      int bad_cap = q_connect("127.0.0.1", ntohs(addr.sin_port), "", "", 1000);
       if (bad_cap != Q_ERR_HANDSHAKE) {
-        fprintf(stderr, "codec selftest: invalid handshake capability accepted\n");
+        fprintf(stderr,
+                "codec selftest: invalid handshake capability accepted\n");
         if (bad_cap >= 0)
           q_close(bad_cap);
         failures++;
@@ -514,7 +593,36 @@ handshake_done:;
       fprintf(stderr, "codec selftest: server accepted out-of-range port\n");
       failures++;
     }
+    struct sockaddr_in probe_addr = {0};
+    int probe_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int port = 0;
+    if (probe_fd >= 0) {
+      probe_addr.sin_family = AF_INET;
+      probe_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+      if (bind(probe_fd, (struct sockaddr *)&probe_addr, sizeof probe_addr) ==
+          0) {
+        socklen_t probe_len = sizeof probe_addr;
+        if (getsockname(probe_fd, (struct sockaddr *)&probe_addr, &probe_len) ==
+            0)
+          port = ntohs(probe_addr.sin_port);
+      }
+      close(probe_fd);
+    }
+    int64_t listener_id = port ? q_serve(poll, port) : -1;
+    ray_selector_t *listener_sel =
+        listener_id >= 0 ? ray_poll_get(poll, listener_id) : NULL;
+    int listener_fd = listener_sel ? (int)listener_sel->fd : -1;
+    if (listener_id < 0 || listener_fd < 0) {
+      fprintf(stderr, "codec selftest: cannot create close-test listener\n");
+      failures++;
+    }
     ray_poll_destroy(poll);
+    if (listener_fd >= 0 &&
+        (fcntl(listener_fd, F_GETFD) >= 0 || errno != EBADF)) {
+      fprintf(stderr, "codec selftest: poll destroy left listener open\n");
+      failures++;
+      close(listener_fd);
+    }
   }
 
   ray_runtime_destroy(rt);
@@ -574,12 +682,44 @@ static int run_exchange_selftest(void) {
                     sizeof err);
     if (rc == 0 || strstr(err, "send") == NULL) {
       fprintf(stderr,
-              "exchange selftest: closed peer did not fail cleanly: %s\n",
-              err);
+              "exchange selftest: closed peer did not fail cleanly: %s\n", err);
       failures++;
     }
     free(resp);
     close(sv[0]);
+  }
+
+  /* A timeout poisons the blocking stream: a late reply to request A must
+   * never be accepted as the response to request B. */
+  ray_t *r = NULL;
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
+    perror("exchange selftest: socketpair late-response");
+    failures++;
+  } else {
+    struct timeval tv = {.tv_sec = 0, .tv_usec = 50 * 1000};
+    setsockopt(sv[0], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    ray_t *msg = ray_i64(1);
+    err[0] = '\0';
+    r = q_send(sv[0], msg, err, sizeof err);
+    if (r != NULL || strstr(err, "timed out") == NULL) {
+      fprintf(stderr, "exchange selftest: silent request did not time out\n");
+      failures++;
+    }
+    release_any(r);
+    const uint8_t late_response[] = {1, 2,   0,   0, 13, 0, 0,
+                                     0, 250, 111, 0, 0,  0};
+    (void)send(sv[1], late_response, sizeof late_response, MSG_NOSIGNAL);
+    err[0] = '\0';
+    r = q_send(sv[0], msg, err, sizeof err);
+    if (r != NULL) {
+      fprintf(stderr,
+              "exchange selftest: late response was reused by next request\n");
+      failures++;
+    }
+    release_any(r);
+    ray_release(msg);
+    close(sv[0]);
+    close(sv[1]);
   }
 
   /* Poll-attached round-trip against a peer that never answers: the recv
@@ -605,7 +745,7 @@ static int run_exchange_selftest(void) {
       /* A regression here is an unbounded wait: let SIGALRM fail the run
        * instead of hanging it. */
       alarm(10);
-      ray_t *r = id >= 0 ? q_conn_send(poll, id, msg) : NULL;
+      r = id >= 0 ? q_conn_send(poll, id, msg) : NULL;
       alarm(0);
       ray_t *es = (r && RAY_IS_ERR(r)) ? ray_fmt(r, 0) : NULL;
       const char *ep = es ? ray_str_ptr(es) : "";
@@ -627,6 +767,89 @@ static int run_exchange_selftest(void) {
     if (rt)
       ray_runtime_destroy(rt);
     close(sv[1]);
+  }
+
+  /* Backpressure during a large write is covered by the same round-trip
+   * deadline as waiting for the response. */
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
+    perror("exchange selftest: socketpair send-timeout");
+    failures++;
+  } else {
+    ray_runtime_t *rt = ray_runtime_create(0, NULL);
+    ray_poll_t *poll = rt ? ray_poll_create() : NULL;
+    if (poll == NULL) {
+      fprintf(stderr, "exchange selftest: send-timeout runtime/poll failed\n");
+      failures++;
+      close(sv[0]);
+    } else {
+      int small_sndbuf = 4096;
+      struct timeval tv = {.tv_sec = 0, .tv_usec = 100 * 1000};
+      setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &small_sndbuf,
+                 sizeof small_sndbuf);
+      setsockopt(sv[0], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+      int64_t id = q_conn_attach(poll, sv[0]);
+      ray_t *msg = ray_vec_new(RAY_I32, 1000000);
+      alarm(5);
+      ray_t *r = id >= 0 ? q_conn_send(poll, id, msg) : NULL;
+      alarm(0);
+      ray_t *es = (r && RAY_IS_ERR(r)) ? ray_fmt(r, 0) : NULL;
+      const char *ep = es ? ray_str_ptr(es) : "";
+      if (id < 0 || r == NULL || !RAY_IS_ERR(r) ||
+          strstr(ep, "timeout") == NULL || ray_poll_get(poll, id) != NULL) {
+        fprintf(stderr,
+                "exchange selftest: blocked send did not time out: %s\n", ep);
+        failures++;
+      }
+      if (es)
+        ray_release(es);
+      release_any(r);
+      ray_release(msg);
+      ray_poll_destroy(poll);
+      ray_runtime_destroy(rt);
+      close(sv[1]);
+    }
+  }
+
+  /* A complete queued response remains available if the peer then sends FIN. */
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
+    perror("exchange selftest: socketpair response-fin");
+    failures++;
+  } else {
+    ray_runtime_t *rt = ray_runtime_create(0, NULL);
+    ray_poll_t *poll = rt ? ray_poll_create() : NULL;
+    if (poll == NULL) {
+      fprintf(stderr, "exchange selftest: response-fin runtime/poll failed\n");
+      failures++;
+      close(sv[0]);
+    } else {
+      test_q_header_t h = {.endianness = 1,
+                           .msgtype = 2,
+                           .compressed = 0,
+                           .reserved = 0,
+                           .size = 13};
+      uint8_t response[sizeof h + 5];
+      int32_t value = 42;
+      memcpy(response, &h, sizeof h);
+      response[sizeof h] = 250; /* Q int atom */
+      memcpy(response + sizeof h + 1, &value, sizeof value);
+      int64_t id = q_conn_attach(poll, sv[0]);
+      if (send(sv[1], response, sizeof response, MSG_NOSIGNAL) !=
+          (ssize_t)sizeof response)
+        failures++;
+      shutdown(sv[1], SHUT_WR);
+      ray_t *msg = ray_i64(1);
+      ray_t *r = id >= 0 ? q_conn_send(poll, id, msg) : NULL;
+      if (r == NULL || RAY_IS_ERR(r) || r->type != -RAY_I32 || r->i32 != 42) {
+        fprintf(stderr, "exchange selftest: response before FIN was lost\n");
+        failures++;
+      }
+      release_any(r);
+      release_any(q_conn_send(poll, id, msg)); /* detects and closes the FIN */
+      ray_release(msg);
+      ray_poll_destroy(poll);
+      ray_runtime_destroy(rt);
+      close(sv[1]);
+    }
   }
 
   printf("exchange selftest: %s\n", failures ? "FAIL" : "ok");

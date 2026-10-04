@@ -131,8 +131,8 @@ static ray_t *qb_connect(ray_t **args, int64_t n) {
     return ray_error("type", ".q.connect: password must be a string");
 
   char user[128], password[128];
-  ray_t *arg_err = q_copy_str_arg(n >= 3 ? args[2] : NULL, "user", user,
-                                  sizeof user);
+  ray_t *arg_err =
+      q_copy_str_arg(n >= 3 ? args[2] : NULL, "user", user, sizeof user);
   if (arg_err)
     return arg_err;
   arg_err = q_copy_str_arg(n >= 4 ? args[3] : NULL, "password", password,
@@ -146,8 +146,7 @@ static ray_t *qb_connect(ray_t **args, int64_t n) {
     if (!tok)
       return ray_error("type", ".q.connect: timeout must be an integer");
     if (timeout_value < 0 || timeout_value > INT_MAX)
-      return ray_error("range",
-                       ".q.connect: timeout must be in 0..INT_MAX ms");
+      return ray_error("range", ".q.connect: timeout must be in 0..INT_MAX ms");
     timeout_ms = (int)timeout_value;
   }
 
@@ -185,6 +184,8 @@ static ray_t *qb_send(ray_t *handle, ray_t *msg) {
   ray_poll_t *poll = q_poll();
   if (poll != NULL)
     return q_conn_send(poll, fd, msg);
+  if (fd > INT_MAX)
+    return ray_error("range", ".q.send: handle exceeds the socket range");
 
   char err[128] = {0};
   ray_t *res = q_send((int)fd, msg, err, sizeof err);
@@ -208,9 +209,11 @@ static ray_t *qb_close(ray_t *handle) {
 
   ray_poll_t *poll = q_poll();
   if (poll != NULL) {
-    if (ray_poll_get(poll, fd) == NULL)
-      return ray_error("handle", ".q.close: not an open connection");
+    if (!q_conn_is_handle(poll, fd))
+      return ray_error("handle", ".q.close: not an open Q connection");
     q_conn_close(poll, fd);
+  } else if (fd > INT_MAX) {
+    return ray_error("range", ".q.close: handle exceeds the socket range");
   } else if (q_close((int)fd) < 0) {
     return ray_error("handle", ".q.close: not an open connection");
   }
@@ -252,7 +255,8 @@ int64_t q_serve_from_args(ray_poll_t *poll, int argc, char **argv) {
       break;
     if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--q-serve") == 0) {
       if (i + 1 >= argc) {
-        fprintf(stderr, "q: missing port after %s (expected 1..65535)\n", argv[i]);
+        fprintf(stderr, "q: missing port after %s (expected 1..65535)\n",
+                argv[i]);
         return -1;
       }
       int port = 0;
