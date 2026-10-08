@@ -863,6 +863,49 @@ static int run_exchange_selftest(void) {
     }
   }
 
+  /* A header-only RESPONSE is malformed, but it still belongs to the parked
+   * sync waiter; it must not be treated as an inbound identity request and
+   * misreported as a timeout. */
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
+    perror("exchange selftest: socketpair empty-response");
+    failures++;
+  } else {
+    ray_runtime_t *rt = ray_runtime_create(0, NULL);
+    ray_poll_t *poll = rt ? ray_poll_create() : NULL;
+    if (poll == NULL) {
+      fprintf(stderr, "exchange selftest: empty-response runtime/poll failed\n");
+      failures++;
+      close(sv[0]);
+    } else {
+      struct timeval tv = {.tv_sec = 0, .tv_usec = 200 * 1000};
+      setsockopt(sv[0], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+      test_q_header_t h = {.endianness = 1,
+                           .msgtype = 2,
+                           .compressed = 0,
+                           .reserved = 0,
+                           .size = (uint32_t)sizeof(test_q_header_t)};
+      int64_t id = q_conn_attach(poll, sv[0]);
+      if (send(sv[1], &h, sizeof h, MSG_NOSIGNAL) != (ssize_t)sizeof h)
+        failures++;
+      ray_t *msg = ray_i64(1);
+      ray_t *r = id >= 0 ? q_conn_send(poll, id, msg) : NULL;
+      const char *ep = (r && RAY_IS_ERR(r)) ? ray_err_code(r) : "";
+      if (r == NULL || !RAY_IS_ERR(r) || strcmp(ep, "empty") != 0 ||
+          ray_poll_get(poll, id) == NULL) {
+        fprintf(stderr,
+                "exchange selftest: empty response was not delivered to the "
+                "sync waiter: %s\n",
+                ep);
+        failures++;
+      }
+      release_any(r);
+      ray_release(msg);
+      ray_poll_destroy(poll);
+      ray_runtime_destroy(rt);
+      close(sv[1]);
+    }
+  }
+
   printf("exchange selftest: %s\n", failures ? "FAIL" : "ok");
   return failures ? 1 : 0;
 }

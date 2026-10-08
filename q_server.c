@@ -87,6 +87,7 @@ typedef struct {
   int hs_len;
   uint8_t sync_waiting; /* a q_conn_send is parked on this connection */
   uint8_t sync_ready;   /* its RESPONSE has been deposited below      */
+  uint8_t outbound;     /* q_conn_attach client side; may receive RESPONSE */
   ray_t *sync_resp;
   int sync_timeout_ms; /* q_conn_send round-trip budget; <= 0 blocks  */
 } q_conn_t;
@@ -308,8 +309,18 @@ static ray_t *q_read_header(ray_poll_t *poll, ray_selector_t *sel) {
     ray_poll_deregister(poll, sel->id);
     return NULL;
   }
+  if (cd->hdr.msgtype == Q_MSG_RESPONSE && !cd->outbound) {
+    ray_poll_deregister(poll, sel->id);
+    return NULL;
+  }
   if (body == 0) {
-    if (cd->hdr.msgtype != Q_MSG_ASYNC && q_send_result(poll, sel, NULL) < 0) {
+    if (cd->hdr.msgtype == Q_MSG_RESPONSE) {
+      if (cd->sync_waiting && !cd->sync_ready) {
+        cd->sync_resp = ray_error("empty", "q: empty response body");
+        cd->sync_ready = 1;
+      }
+    } else if (cd->hdr.msgtype != Q_MSG_ASYNC &&
+               q_send_result(poll, sel, NULL) < 0) {
       ray_poll_deregister(poll, sel->id);
       return NULL;
     }
@@ -539,6 +550,7 @@ int64_t q_conn_attach(ray_poll_t *poll, int fd) {
   if (cd == NULL)
     return -1;
   cd->magic = Q_CONN_MAGIC;
+  cd->outbound = 1;
   cd->sync_timeout_ms = timeout_ms;
 
   ray_poll_reg_t reg = {0};
