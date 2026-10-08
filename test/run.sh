@@ -131,14 +131,31 @@ import struct
 import sys
 
 host, port = sys.argv[1], int(sys.argv[2])
+
+def recv_closed(sock):
+    try:
+        return sock.recv(1) == b''
+    except ConnectionResetError:
+        return True
+
 with socket.create_connection((host, port), 1.0) as s:
     s.sendall(bytes([3, 0]))
     if s.recv(1) != bytes([3]):
         raise SystemExit("bad Q handshake response")
     # Q identity is a valid body; only the message type is invalid.
     s.sendall(struct.pack("<BBBBI", 1, 9, 0, 0, 10) + bytes([101, 0]))
-    if s.recv(1) != b'':
+    if not recv_closed(s):
         raise SystemExit("unknown message type was executed or answered")
+
+with socket.create_connection((host, port), 1.0) as s:
+    s.sendall(bytes([3, 0]))
+    if s.recv(1) != bytes([3]):
+        raise SystemExit("bad Q handshake response")
+    # A header-only frame must reject the unknown message type before treating
+    # the empty body as an identity request.
+    s.sendall(struct.pack("<BBBBI", 1, 9, 0, 0, 8))
+    if not recv_closed(s):
+        raise SystemExit("empty unknown message type was answered")
 PY
 
 # ---- Leg 2: real-q interop against Rayforce server

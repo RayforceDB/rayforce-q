@@ -303,6 +303,11 @@ static ray_t *q_read_header(ray_poll_t *poll, ray_selector_t *sel) {
     ray_poll_deregister(poll, sel->id);
     return NULL;
   }
+  if (cd->hdr.msgtype != Q_MSG_ASYNC && cd->hdr.msgtype != Q_MSG_SYNC &&
+      cd->hdr.msgtype != Q_MSG_RESPONSE) {
+    ray_poll_deregister(poll, sel->id);
+    return NULL;
+  }
   if (body == 0) {
     if (cd->hdr.msgtype != Q_MSG_ASYNC && q_send_result(poll, sel, NULL) < 0) {
       ray_poll_deregister(poll, sel->id);
@@ -332,13 +337,6 @@ static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
 
   sel->rx.read_fn = q_read_header;
   ray_poll_rx_request(poll, sel, (int64_t)sizeof(q_header_t));
-
-  if (hdr.msgtype != Q_MSG_ASYNC && hdr.msgtype != Q_MSG_SYNC &&
-      hdr.msgtype != Q_MSG_RESPONSE) {
-    q_release_any(req);
-    ray_poll_deregister(poll, id);
-    return NULL;
-  }
 
   /* A RESPONSE belongs to the q_conn_send parked on this connection — it is
    * data, not something to evaluate. */
