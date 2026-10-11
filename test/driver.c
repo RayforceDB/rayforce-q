@@ -681,6 +681,38 @@ static int run_exchange_selftest(void) {
   close(sv[1]);
 
   if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
+    perror("exchange selftest: socketpair bad-compressed");
+    failures++;
+  } else {
+    h.msgtype = 2;
+    h.compressed = 2;
+    h.size = (uint32_t)(sizeof(test_q_header_t) + 2);
+    uint8_t identity[] = {101, 0};
+    if (send(sv[1], &h, sizeof h, 0) != (ssize_t)sizeof h ||
+        send(sv[1], identity, sizeof identity, 0) !=
+            (ssize_t)sizeof identity) {
+      perror("exchange selftest: send bad-compressed");
+      failures++;
+    }
+    resp = NULL;
+    resp_len = 0;
+    compressed = 0;
+    err[0] = '\0';
+    rc = q_exchange(sv[0], &req, 1, &resp, &resp_len, &compressed, err,
+                    sizeof err);
+    if (rc == 0 || strstr(err, "compressed flag") == NULL) {
+      fprintf(stderr,
+              "exchange selftest: invalid compressed flag was not rejected: "
+              "%s\n",
+              err);
+      failures++;
+    }
+    free(resp);
+    close(sv[0]);
+    close(sv[1]);
+  }
+
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
     perror("exchange selftest: socketpair closed-peer");
     failures++;
   } else {

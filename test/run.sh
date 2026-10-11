@@ -109,6 +109,13 @@ import struct
 import sys
 
 host, port = sys.argv[1], int(sys.argv[2])
+
+def recv_closed(sock):
+    try:
+        return sock.recv(1) == b''
+    except ConnectionResetError:
+        return True
+
 with socket.create_connection((host, port), 1.0) as s:
     s.sendall(bytes([3, 0]))
     if s.recv(1) != bytes([3]):
@@ -122,6 +129,14 @@ if resp[:4] != bytes([1, 2, 0, 0]):
     raise SystemExit(f"malformed-frame test: unexpected header {resp.hex()}")
 if resp[8] != 0x80:
     raise SystemExit(f"malformed-frame test: expected Q error, got {resp.hex()}")
+
+with socket.create_connection((host, port), 1.0) as s:
+    s.sendall(bytes([3, 0]))
+    if s.recv(1) != bytes([3]):
+        raise SystemExit("bad Q handshake response")
+    s.sendall(struct.pack("<BBBBI", 1, 1, 2, 0, 10) + bytes([101, 0]))
+    if not recv_closed(s):
+        raise SystemExit("invalid compressed flag was answered")
 PY
 
 echo "checking unknown Q message type handling..."

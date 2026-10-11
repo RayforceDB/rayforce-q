@@ -309,6 +309,10 @@ static ray_t *q_read_header(ray_poll_t *poll, ray_selector_t *sel) {
     ray_poll_deregister(poll, sel->id);
     return NULL;
   }
+  if (cd->hdr.compressed > 1) {
+    ray_poll_deregister(poll, sel->id);
+    return NULL;
+  }
   if (cd->hdr.msgtype == Q_MSG_RESPONSE && !cd->outbound) {
     ray_poll_deregister(poll, sel->id);
     return NULL;

@@ -1536,6 +1536,11 @@ int q_exchange(int fd, const uint8_t *req, int64_t req_len, uint8_t **resp,
     shutdown(fd, SHUT_RDWR);
     return -1;
   }
+  if (header.compressed > 1) {
+    q_set_err(err, errlen, "q: invalid compressed flag");
+    shutdown(fd, SHUT_RDWR);
+    return -1;
+  }
   int64_t body_len = (int64_t)header.size - (int64_t)sizeof header;
   if (body_len <= 0 || body_len > Q_MAX_BODY) {
     q_set_err(err, errlen,
