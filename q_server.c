@@ -318,15 +318,13 @@ static ray_t *q_read_header(ray_poll_t *poll, ray_selector_t *sel) {
     return NULL;
   }
   if (body == 0) {
-    if (cd->hdr.msgtype == Q_MSG_RESPONSE) {
-      if (cd->sync_waiting && !cd->sync_ready) {
-        cd->sync_resp = ray_error("empty", "q: empty response body");
-        cd->sync_ready = 1;
-      }
-    } else if (cd->hdr.msgtype != Q_MSG_ASYNC &&
-               q_send_result(poll, sel, NULL) < 0) {
+    if (cd->hdr.msgtype != Q_MSG_RESPONSE) {
       ray_poll_deregister(poll, sel->id);
       return NULL;
+    }
+    if (cd->sync_waiting && !cd->sync_ready) {
+      cd->sync_resp = ray_error("empty", "q: empty response body");
+      cd->sync_ready = 1;
     }
     ray_poll_rx_request(poll, sel, (int64_t)sizeof(q_header_t));
     return NULL;

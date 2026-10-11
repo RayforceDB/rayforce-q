@@ -137,6 +137,14 @@ with socket.create_connection((host, port), 1.0) as s:
     s.sendall(struct.pack("<BBBBI", 1, 1, 2, 0, 10) + bytes([101, 0]))
     if not recv_closed(s):
         raise SystemExit("invalid compressed flag was answered")
+
+with socket.create_connection((host, port), 1.0) as s:
+    s.sendall(bytes([3, 0]))
+    if s.recv(1) != bytes([3]):
+        raise SystemExit("bad Q handshake response")
+    s.sendall(struct.pack("<BBBBI", 1, 1, 0, 0, 8))
+    if not recv_closed(s):
+        raise SystemExit("empty sync frame was answered")
 PY
 
 echo "checking unknown Q message type handling..."
