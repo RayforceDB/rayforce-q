@@ -71,6 +71,7 @@ typedef struct {
 #define Q_MSG_RESPONSE 2
 #define Q_CAP_MAX 3                     /* matches q.c client capability  */
 #define Q_MAX_BODY ((int64_t)256 << 20) /* reject absurd frames (256 MiB) */
+#define Q_RX_CHUNK_SIZE ((int64_t)64 << 10)
 #define Q_MAX_HANDSHAKE 512             /* credential blob upper bound    */
 #define Q_CONN_MAGIC UINT32_C(0x7150434e)
 
@@ -90,6 +91,10 @@ typedef struct {
   uint8_t outbound;     /* q_conn_attach client side; may receive RESPONSE */
   ray_t *sync_resp;
   int sync_timeout_ms; /* q_conn_send round-trip budget; <= 0 blocks  */
+  uint8_t *rx_body;
+  int64_t rx_body_len;
+  int64_t rx_body_cap;
+  int64_t rx_body_total;
 } q_conn_t;
 
 static void q_release_any(ray_t *obj) {
@@ -317,6 +322,11 @@ static ray_t *q_read_header(ray_poll_t *poll, ray_selector_t *sel) {
     ray_poll_deregister(poll, sel->id);
     return NULL;
   }
+  free(cd->rx_body);
+  cd->rx_body = NULL;
+  cd->rx_body_len = 0;
+  cd->rx_body_cap = 0;
+  cd->rx_body_total = body;
   if (body == 0) {
     if (cd->hdr.msgtype != Q_MSG_RESPONSE) {
       ray_poll_deregister(poll, sel->id);
@@ -330,23 +340,66 @@ static ray_t *q_read_header(ray_poll_t *poll, ray_selector_t *sel) {
     return NULL;
   }
   sel->rx.read_fn = q_read_body;
-  ray_poll_rx_request(poll, sel, body);
+  ray_poll_rx_request(poll, sel,
+                      body < Q_RX_CHUNK_SIZE ? body : Q_RX_CHUNK_SIZE);
   return NULL;
 }
 
 static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
   q_conn_t *cd = (q_conn_t *)sel->data;
-  int64_t body = (int64_t)cd->hdr.size - (int64_t)sizeof(q_header_t);
-  if (!sel->rx.buf || sel->rx.buf->offset < body)
+  if (!sel->rx.buf || sel->rx.buf->offset <= 0)
     return NULL;
+
+  int64_t received = sel->rx.buf->offset;
+  int64_t needed = cd->rx_body_len + received;
+  if (needed < cd->rx_body_len || needed > cd->rx_body_total) {
+    ray_poll_deregister(poll, sel->id);
+    return NULL;
+  }
+  if (needed > cd->rx_body_cap) {
+    int64_t cap = cd->rx_body_cap
+                      ? cd->rx_body_cap
+                      : (cd->rx_body_total < Q_RX_CHUNK_SIZE
+                             ? cd->rx_body_total
+                             : Q_RX_CHUNK_SIZE);
+    while (cap < needed) {
+      if (cap > cd->rx_body_total / 2) {
+        cap = cd->rx_body_total;
+        break;
+      }
+      cap *= 2;
+    }
+    uint8_t *body = (uint8_t *)realloc(cd->rx_body, (size_t)cap);
+    if (body == NULL) {
+      ray_poll_deregister(poll, sel->id);
+      return NULL;
+    }
+    cd->rx_body = body;
+    cd->rx_body_cap = cap;
+  }
+  memcpy(cd->rx_body + cd->rx_body_len, sel->rx.buf->data,
+         (size_t)received);
+  cd->rx_body_len = needed;
+
+  if (cd->rx_body_len < cd->rx_body_total) {
+    int64_t left = cd->rx_body_total - cd->rx_body_len;
+    ray_poll_rx_request(poll, sel,
+                        left < Q_RX_CHUNK_SIZE ? left : Q_RX_CHUNK_SIZE);
+    return NULL;
+  }
 
   /* q_decode fully materializes the request into ray_t objects, so the rx
    * buffer is free to reuse the moment it returns. */
   q_header_t hdr = cd->hdr;
   int64_t id = sel->id;
   char err[128] = {0};
-  ray_t *req =
-      q_decode(sel->rx.buf->data, body, hdr.compressed, err, sizeof err);
+  ray_t *req = q_decode(cd->rx_body, cd->rx_body_len, hdr.compressed, err,
+                       sizeof err);
+  free(cd->rx_body);
+  cd->rx_body = NULL;
+  cd->rx_body_len = 0;
+  cd->rx_body_cap = 0;
+  cd->rx_body_total = 0;
 
   sel->rx.read_fn = q_read_header;
   ray_poll_rx_request(poll, sel, (int64_t)sizeof(q_header_t));
@@ -397,6 +450,7 @@ static void q_on_close(ray_poll_t *poll, ray_selector_t *sel) {
     if (cd->sync_resp)
       q_release_any(cd->sync_resp);
     cd->magic = 0;
+    free(cd->rx_body);
     free(cd);
     sel->data = NULL;
   }
