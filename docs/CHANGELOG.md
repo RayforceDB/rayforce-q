@@ -2,6 +2,74 @@
 
 All notable changes to `rayforce-q` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/), and the project adheres to [Semantic Versioning](https://semver.org/). Bindings pin a tag, so each release is a stable point they can build against.
 
+## [2.3.0]
+
+Built and tested (`make test` with a real q) against rayforce core `dev` at
+`43b9941`. The core v2.11.0 (`dc9b12a`) the Rust bindings pin carries every
+poll API this release uses, so nothing in the core needed to change. Eight
+hardening PRs from Evgen Belozerov (#14, #15, #17–#21).
+
+### Added
+
+- **`q_conn_is_handle(poll, id)`** reports whether a selector id names an open
+  Q connection owned by this module. Connection state carries a magic word,
+  and `q_conn_send` / `q_conn_close` / `.q.close` check it, so an id that
+  belongs to some other selector is refused instead of being closed.
+- **Keyed tables keep their Q dictionary wire type.** A keyed table (a
+  2-element `(keys, values)` list of two tables carrying the dict attribute)
+  encodes as a Q dict of two tables and decodes back to the same shape; a dict
+  with a table on only one side is rejected as unsupported.
+
+### Changed
+
+- **Q timespan atoms and vectors are rejected as unsupported**, instead of
+  being decoded as timestamps that showed a duration as a date.
+- **Large frames are received in 64 KiB chunks.** The server no longer
+  reserves a frame's full advertised body before any of it arrives, so a peer
+  that advertises 128 MiB and goes idle costs a few KiB rather than the whole
+  allocation. The 256 MiB frame limit is unchanged.
+- **Server responses are queued through the poll's writable events** instead
+  of being written synchronously, so a slow reader no longer parks the shared
+  event loop. Queued output is bounded by the frame limit; a peer that exceeds
+  it is dropped.
+- **Poll-attached sync sends honour the `.q.connect` timeout on the write side
+  too.** `q_conn_send` waits for writability under the same deadline it waits
+  for the response; a send that times out deregisters the handle with a
+  `timeout` error.
+
+### Fixed
+
+- **Malformed frames could corrupt memory or exhaust the stack.** Both codec
+  walks are bounded at 128 levels of nesting; encoded sizes are
+  overflow-checked and compared against what was actually written; symbol
+  vectors are checked against the remaining frame before allocation;
+  unsupported nested values are refused before serialization.
+- **The blocking client could deliver a stale response to the next request.**
+  A transport or framing failure in `q_exchange` / `q_send` now shuts the
+  socket down, since the request/response boundary may be out of step; the
+  caller still owns and closes the fd. A peer closing mid-read reports
+  `ECONNRESET` instead of a bare failure.
+- **Header-only and malformed frames on the server.** An unknown message type,
+  an invalid compressed flag (anything but 0 or 1, on the blocking client and
+  the listener alike), a RESPONSE from an inbound client, and a SYNC or ASYNC
+  request with no body all close the connection. Before, a header-only request
+  earned an identity reply and an unknown type was caught only after its body
+  had been read. A header-only RESPONSE on an outbound connection wakes the
+  parked `q_conn_send` with an `empty` error instead of a timeout.
+- **Q error frames with trailing bytes are rejected** rather than decoded as a
+  valid error.
+- **Q listeners are closed when their poll is destroyed**; the listening socket
+  used to leak.
+- **`.q.send` and `.q.close` on the blocking path refuse handles above the
+  socket range** rather than truncating them to an `int` and touching an
+  unrelated descriptor.
+- **A peer that went away mid-write no longer raises `SIGPIPE`**: sockets are
+  opened with `SO_NOSIGPIPE` where it exists and sent with `MSG_NOSIGNAL`
+  elsewhere.
+- **`q_conn_pump` re-resolves the selector after every state step** and
+  returns as soon as the parked response is ready, so a handler that closes
+  the connection from inside cannot leave the pump on freed state.
+
 ## [2.2.0]
 
 Built and tested (`make test` with a real q, `make rayforce`) against rayforce
