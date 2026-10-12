@@ -32,8 +32,9 @@
  * converts between the wire and rayforce core `ray_t` objects.
  *
  * A connection handle is the raw socket file descriptor (>= 0). There is no
- * global connection table, so the client is thread-safe and unbounded: each
- * fd is independent and owned by the caller.
+ * global connection table. Independent fds may be used concurrently; calls
+ * sharing one fd must serialize complete request/response exchanges. Each fd
+ * remains owned by the caller.
  */
 
 #include <rayforce.h>
@@ -58,7 +59,10 @@ int q_close(int fd);
 int q_encode(ray_t *msg, uint8_t **req, int64_t *req_len, char *err,
              size_t errlen);
 
-/* Send a pre-encoded request on `fd` and read the raw response body. */
+/* Send a pre-encoded request on `fd` and read the raw response body. A
+ * transport or framing failure shuts down the socket because the request or
+ * response boundary may be out of sync; the caller still owns and must close
+ * the fd. */
 int q_exchange(int fd, const uint8_t *req, int64_t req_len, uint8_t **resp,
                int64_t *resp_len, int *compressed, char *err, size_t errlen);
 

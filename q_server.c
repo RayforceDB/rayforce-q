@@ -47,6 +47,8 @@
 #include "ops/ops.h" /* ray_is_lazy, ray_lazy_materialize                    */
 
 #include <errno.h>
+#include <limits.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -70,6 +72,7 @@ typedef struct {
 #define Q_CAP_MAX 3                     /* matches q.c client capability  */
 #define Q_MAX_BODY ((int64_t)256 << 20) /* reject absurd frames (256 MiB) */
 #define Q_MAX_HANDSHAKE 512             /* credential blob upper bound    */
+#define Q_CONN_MAGIC UINT32_C(0x7150434e)
 
 /* Per-connection rx state. `hdr` carries the current frame's header between
  * the header and body reads; `cap` accumulates the last byte seen during the
@@ -78,11 +81,13 @@ typedef struct {
  * The sync_* triple is the outbound side's round-trip slot: q_conn_send parks
  * on the connection and the rx machine deposits the RESPONSE frame here. */
 typedef struct {
+  uint32_t magic;
   q_header_t hdr;
   uint8_t cap;
   int hs_len;
   uint8_t sync_waiting; /* a q_conn_send is parked on this connection */
   uint8_t sync_ready;   /* its RESPONSE has been deposited below      */
+  uint8_t outbound;     /* q_conn_attach client side; may receive RESPONSE */
   ray_t *sync_resp;
   int sync_timeout_ms; /* q_conn_send round-trip budget; <= 0 blocks  */
 } q_conn_t;
@@ -149,7 +154,15 @@ static ray_t *eval_request(ray_t *req) {
 /* Encode `result` as a Q response and write it. A NULL result encodes as the
  * identity (::). q_encode stamps the header as SYNC, so flip the message-type
  * byte to RESPONSE before sending. */
-static void q_send_result(ray_sock_t fd, ray_t *result) {
+static int64_t q_send_fn(int64_t fd, uint8_t *buf, int64_t len) {
+  int flags = 0;
+#ifdef MSG_NOSIGNAL
+  flags |= MSG_NOSIGNAL;
+#endif
+  return (int64_t)send((int)fd, buf, (size_t)len, flags);
+}
+
+static int q_send_result(ray_poll_t *poll, ray_selector_t *sel, ray_t *result) {
   uint8_t *buf = NULL;
   int64_t len = 0;
   char err[128] = {0};
@@ -158,11 +171,53 @@ static void q_send_result(ray_sock_t fd, ray_t *result) {
     int rc = q_encode(e, &buf, &len, err, sizeof err);
     q_release_any(e);
     if (rc < 0)
-      return;
+      return -1;
   }
   buf[1] = Q_MSG_RESPONSE;
-  ray_sock_send(fd, buf, (size_t)len);
+  int64_t queued = 0;
+  for (ray_poll_buf_t *p = sel->tx.buf; p != NULL; p = p->next) {
+    int64_t pending = p->size - p->offset;
+    if (pending < 0 || queued > Q_MAX_BODY - pending) {
+      free(buf);
+      return -1;
+    }
+    queued += pending;
+  }
+  if (len > Q_MAX_BODY - queued) {
+    free(buf);
+    return -1;
+  }
+  ray_poll_buf_t *out = ray_poll_buf_new(len);
+  if (out == NULL) {
+    free(buf);
+    return -1;
+  }
+  memcpy(out->data, buf, (size_t)len);
   free(buf);
+  if (sel->tx.buf == NULL) {
+    sel->tx.buf = out;
+  } else {
+    ray_poll_buf_t *tail = sel->tx.buf;
+    while (tail->next != NULL)
+      tail = tail->next;
+    tail->next = out;
+  }
+  ray_poll_tx_request(poll, sel);
+  return 0;
+}
+
+static void q_close_listener(ray_poll_t *poll, ray_selector_t *sel) {
+  (void)poll;
+  ray_sock_close((ray_sock_t)sel->fd);
+}
+
+static void q_close_connection_sigpipe(ray_sock_t fd) {
+#ifdef SO_NOSIGPIPE
+  int yes = 1;
+  setsockopt((int)fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof yes);
+#else
+  (void)fd;
+#endif
 }
 
 static int64_t q_recv_fn(int64_t fd, uint8_t *buf, int64_t len) {
@@ -180,17 +235,20 @@ static ray_t *q_accept(ray_poll_t *poll, ray_selector_t *sel) {
   if (nfd == RAY_INVALID_SOCK)
     return NULL;
   ray_sock_set_nonblocking(nfd);
+  q_close_connection_sigpipe(nfd);
 
   q_conn_t *cd = (q_conn_t *)calloc(1, sizeof *cd);
   if (cd == NULL) {
     ray_sock_close(nfd);
     return NULL;
   }
+  cd->magic = Q_CONN_MAGIC;
 
   ray_poll_reg_t reg = {0};
   reg.fd = (int64_t)nfd;
   reg.type = RAY_SEL_SOCKET;
   reg.recv_fn = q_recv_fn;
+  reg.send_fn = q_send_fn;
   reg.read_fn = q_read_handshake;
   reg.close_fn = q_on_close;
   reg.data = cd;
@@ -246,9 +304,28 @@ static ray_t *q_read_header(ray_poll_t *poll, ray_selector_t *sel) {
     ray_poll_deregister(poll, sel->id);
     return NULL;
   }
+  if (cd->hdr.msgtype != Q_MSG_ASYNC && cd->hdr.msgtype != Q_MSG_SYNC &&
+      cd->hdr.msgtype != Q_MSG_RESPONSE) {
+    ray_poll_deregister(poll, sel->id);
+    return NULL;
+  }
+  if (cd->hdr.compressed > 1) {
+    ray_poll_deregister(poll, sel->id);
+    return NULL;
+  }
+  if (cd->hdr.msgtype == Q_MSG_RESPONSE && !cd->outbound) {
+    ray_poll_deregister(poll, sel->id);
+    return NULL;
+  }
   if (body == 0) {
-    if (cd->hdr.msgtype != 0) /* sync -> identity reply */
-      q_send_result((ray_sock_t)sel->fd, NULL);
+    if (cd->hdr.msgtype != Q_MSG_RESPONSE) {
+      ray_poll_deregister(poll, sel->id);
+      return NULL;
+    }
+    if (cd->sync_waiting && !cd->sync_ready) {
+      cd->sync_resp = ray_error("empty", "q: empty response body");
+      cd->sync_ready = 1;
+    }
     ray_poll_rx_request(poll, sel, (int64_t)sizeof(q_header_t));
     return NULL;
   }
@@ -273,13 +350,6 @@ static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
 
   sel->rx.read_fn = q_read_header;
   ray_poll_rx_request(poll, sel, (int64_t)sizeof(q_header_t));
-
-  if (hdr.msgtype != Q_MSG_ASYNC && hdr.msgtype != Q_MSG_SYNC &&
-      hdr.msgtype != Q_MSG_RESPONSE) {
-    q_release_any(req);
-    ray_poll_deregister(poll, id);
-    return NULL;
-  }
 
   /* A RESPONSE belongs to the q_conn_send parked on this connection — it is
    * data, not something to evaluate. */
@@ -306,8 +376,8 @@ static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
   if (hdr.msgtype !=
       Q_MSG_ASYNC) { /* sync expects a response, async does not */
     ray_selector_t *cur = ray_poll_get(poll, id); /* eval may have closed it */
-    if (cur)
-      q_send_result((ray_sock_t)cur->fd, result);
+    if (cur && q_send_result(poll, cur, result) < 0)
+      ray_poll_deregister(poll, id);
   } else if (result != NULL && RAY_IS_ERR(result)) {
     /* Async has no reply channel, so an error here would vanish silently —
      * the one place an operator could learn a push handler is broken. */
@@ -326,6 +396,7 @@ static void q_on_close(ray_poll_t *poll, ray_selector_t *sel) {
      * mid-round-trip) would otherwise leak. */
     if (cd->sync_resp)
       q_release_any(cd->sync_resp);
+    cd->magic = 0;
     free(cd);
     sel->data = NULL;
   }
@@ -351,6 +422,7 @@ int64_t q_serve(ray_poll_t *poll, int port) {
   reg.fd = (int64_t)fd;
   reg.type = RAY_SEL_SOCKET;
   reg.read_fn = q_accept;
+  reg.close_fn = q_close_listener;
 
   int64_t id = ray_poll_register(poll, &reg);
   if (id < 0) {
@@ -398,8 +470,63 @@ static int q_conn_pump(ray_poll_t *poll, int64_t id) {
     }
     /* Phase buffer complete — advance the state machine. read_fn may
      * deregister or re-arm the selector; the loop re-validates either way. */
+    void *data = sel->data;
     sel->rx.read_fn(poll, sel);
+    sel = ray_poll_get(poll, id);
+    if (sel == NULL || sel->data != data)
+      return -1;
+    if (((q_conn_t *)data)->sync_ready)
+      return 0;
   }
+}
+
+/* Send a complete frame without letting a slow peer park the shared event
+ * loop forever. The socket is nonblocking; a configured timeout covers both
+ * readiness waits and short writes. */
+static int q_send_frame_until(int fd, const uint8_t *buf, size_t len,
+                              int bounded, int64_t deadline_ms) {
+  size_t sent = 0;
+  while (sent < len) {
+    int flags = 0;
+#ifdef MSG_NOSIGNAL
+    flags |= MSG_NOSIGNAL;
+#endif
+    ssize_t n = send(fd, buf + sent, len - sent, flags);
+    if (n > 0) {
+      sent += (size_t)n;
+      continue;
+    }
+    if (n == 0) {
+      errno = EPIPE;
+      return -1;
+    }
+    if (errno == EINTR)
+      continue;
+    if (errno != EAGAIN && errno != EWOULDBLOCK)
+      return -1;
+
+    int wait_ms = -1;
+    if (bounded) {
+      int64_t left = deadline_ms - ray_time_now_ms();
+      if (left <= 0) {
+        errno = ETIMEDOUT;
+        return -1;
+      }
+      wait_ms = left > INT_MAX ? INT_MAX : (int)left;
+    }
+    struct pollfd pfd = {.fd = fd, .events = POLLOUT};
+    int ready;
+    do {
+      ready = poll(&pfd, 1, wait_ms);
+    } while (ready < 0 && errno == EINTR);
+    if (ready == 0) {
+      errno = ETIMEDOUT;
+      return -1;
+    }
+    if (ready < 0)
+      return -1;
+  }
+  return 0;
 }
 
 /* The per-operation timeout q_connect applied to the socket (SO_RCVTIMEO).
@@ -419,16 +546,20 @@ int64_t q_conn_attach(ray_poll_t *poll, int fd) {
     return -1;
   int timeout_ms = q_sock_recv_timeout_ms(fd);
   ray_sock_set_nonblocking((ray_sock_t)fd);
+  q_close_connection_sigpipe((ray_sock_t)fd);
 
   q_conn_t *cd = (q_conn_t *)calloc(1, sizeof *cd);
   if (cd == NULL)
     return -1;
+  cd->magic = Q_CONN_MAGIC;
+  cd->outbound = 1;
   cd->sync_timeout_ms = timeout_ms;
 
   ray_poll_reg_t reg = {0};
   reg.fd = (int64_t)fd;
   reg.type = RAY_SEL_SOCKET;
   reg.recv_fn = q_recv_fn;
+  reg.send_fn = q_send_fn;
   reg.read_fn = q_read_header; /* q_connect already did the handshake */
   reg.close_fn = q_on_close;
   reg.data = cd;
@@ -446,7 +577,8 @@ int64_t q_conn_attach(ray_poll_t *poll, int fd) {
 
 ray_t *q_conn_send(ray_poll_t *poll, int64_t id, ray_t *msg) {
   ray_selector_t *sel = poll ? ray_poll_get(poll, id) : NULL;
-  if (sel == NULL || sel->data == NULL)
+  if (sel == NULL || sel->close_fn != q_on_close || sel->data == NULL ||
+      ((q_conn_t *)sel->data)->magic != Q_CONN_MAGIC)
     return ray_error("handle", "q: not an open connection");
   q_conn_t *cd = (q_conn_t *)sel->data;
   if (cd->sync_waiting)
@@ -459,10 +591,16 @@ ray_t *q_conn_send(ray_poll_t *poll, int64_t id, ray_t *msg) {
   char err[128] = {0};
   if (q_encode(msg, &req, &req_len, err, sizeof err) < 0)
     return ray_error("send", "%s", err[0] ? err : "q: encode failed");
-  int64_t sent = ray_sock_send((ray_sock_t)sel->fd, req, (size_t)req_len);
+  int bounded = cd->sync_timeout_ms > 0;
+  int64_t deadline_ms = bounded ? ray_time_now_ms() + cd->sync_timeout_ms : 0;
+  int send_rc = q_send_frame_until((int)sel->fd, req, (size_t)req_len, bounded,
+                                   deadline_ms);
   free(req);
-  if (sent < 0)
-    return ray_error("io", "q: send failed");
+  if (send_rc < 0) {
+    const char *code = errno == ETIMEDOUT ? "timeout" : "io";
+    ray_poll_deregister(poll, id);
+    return ray_error(code, "q: send failed");
+  }
 
   cd->sync_waiting = 1;
   cd->sync_ready = 0;
@@ -470,9 +608,6 @@ ray_t *q_conn_send(ray_poll_t *poll, int64_t id, ray_t *msg) {
 
   /* The socket's recv timeout is the whole round-trip's budget, as it is on
    * the blocking path where the kernel enforces it per recv. */
-  int bounded = cd->sync_timeout_ms > 0;
-  int64_t deadline_ms = bounded ? ray_time_now_ms() + cd->sync_timeout_ms : 0;
-
   for (;;) {
     /* Process what is already readable, then block for more. The pump can
      * deregister the selector (peer died), which frees cd — so re-resolve and
@@ -515,8 +650,16 @@ ray_t *q_conn_send(ray_poll_t *poll, int64_t id, ray_t *msg) {
   }
 }
 
-void q_conn_close(ray_poll_t *poll, int64_t id) {
+int q_conn_is_handle(ray_poll_t *poll, int64_t id) {
   if (poll == NULL)
+    return 0;
+  ray_selector_t *sel = ray_poll_get(poll, id);
+  return sel != NULL && sel->close_fn == q_on_close && sel->data != NULL &&
+         ((q_conn_t *)sel->data)->magic == Q_CONN_MAGIC;
+}
+
+void q_conn_close(ray_poll_t *poll, int64_t id) {
+  if (!q_conn_is_handle(poll, id))
     return;
   ray_poll_deregister(poll, id); /* q_on_close frees the state and the fd */
 }

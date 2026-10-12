@@ -109,6 +109,13 @@ import struct
 import sys
 
 host, port = sys.argv[1], int(sys.argv[2])
+
+def recv_closed(sock):
+    try:
+        return sock.recv(1) == b''
+    except ConnectionResetError:
+        return True
+
 with socket.create_connection((host, port), 1.0) as s:
     s.sendall(bytes([3, 0]))
     if s.recv(1) != bytes([3]):
@@ -122,6 +129,22 @@ if resp[:4] != bytes([1, 2, 0, 0]):
     raise SystemExit(f"malformed-frame test: unexpected header {resp.hex()}")
 if resp[8] != 0x80:
     raise SystemExit(f"malformed-frame test: expected Q error, got {resp.hex()}")
+
+with socket.create_connection((host, port), 1.0) as s:
+    s.sendall(bytes([3, 0]))
+    if s.recv(1) != bytes([3]):
+        raise SystemExit("bad Q handshake response")
+    s.sendall(struct.pack("<BBBBI", 1, 1, 2, 0, 10) + bytes([101, 0]))
+    if not recv_closed(s):
+        raise SystemExit("invalid compressed flag was answered")
+
+with socket.create_connection((host, port), 1.0) as s:
+    s.sendall(bytes([3, 0]))
+    if s.recv(1) != bytes([3]):
+        raise SystemExit("bad Q handshake response")
+    s.sendall(struct.pack("<BBBBI", 1, 1, 0, 0, 8))
+    if not recv_closed(s):
+        raise SystemExit("empty sync frame was answered")
 PY
 
 echo "checking unknown Q message type handling..."
@@ -131,14 +154,42 @@ import struct
 import sys
 
 host, port = sys.argv[1], int(sys.argv[2])
+
+def recv_closed(sock):
+    try:
+        return sock.recv(1) == b''
+    except ConnectionResetError:
+        return True
+
 with socket.create_connection((host, port), 1.0) as s:
     s.sendall(bytes([3, 0]))
     if s.recv(1) != bytes([3]):
         raise SystemExit("bad Q handshake response")
     # Q identity is a valid body; only the message type is invalid.
     s.sendall(struct.pack("<BBBBI", 1, 9, 0, 0, 10) + bytes([101, 0]))
-    if s.recv(1) != b'':
+    if not recv_closed(s):
         raise SystemExit("unknown message type was executed or answered")
+
+with socket.create_connection((host, port), 1.0) as s:
+    s.sendall(bytes([3, 0]))
+    if s.recv(1) != bytes([3]):
+        raise SystemExit("bad Q handshake response")
+    # A header-only frame must reject the unknown message type before treating
+    # the empty body as an identity request.
+    s.sendall(struct.pack("<BBBBI", 1, 9, 0, 0, 8))
+    if not recv_closed(s):
+        raise SystemExit("empty unknown message type was answered")
+
+with socket.create_connection((host, port), 1.0) as s:
+    s.sendall(bytes([3, 0]))
+    if s.recv(1) != bytes([3]):
+        raise SystemExit("bad Q handshake response")
+    # RESPONSE frames belong only on outbound q_conn_attach handles. A client
+    # connected to the server listener must not be allowed to continue after
+    # sending one.
+    s.sendall(struct.pack("<BBBBI", 1, 2, 0, 0, 10) + bytes([101, 0]))
+    if not recv_closed(s):
+        raise SystemExit("inbound response frame was accepted")
 PY
 
 # ---- Leg 2: real-q interop against Rayforce server

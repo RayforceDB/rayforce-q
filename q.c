@@ -171,8 +171,10 @@ static ssize_t q_recv_all(int fd, void *buf, size_t n) {
   uint8_t *p = (uint8_t *)buf;
   while (total < n) {
     ssize_t r = recv(fd, p + total, n - total, 0);
-    if (r == 0)
+    if (r == 0) {
+      errno = ECONNRESET;
       return -1;
+    }
     if (r < 0) {
       if (errno == EINTR)
         continue;
@@ -328,9 +330,14 @@ static int8_t q_type_of(int8_t ray_type) {
   }
 }
 
-static int64_t q_size_obj(ray_t *obj);
+/* Keep all recursive codec walks bounded. A frame-size limit alone does not
+ * prevent a tiny, deeply nested list from exhausting the C stack. */
+#define Q_MAX_NESTING 128
+#define Q_SIZE_OVERFLOW (-1)
+
+static int64_t q_size_obj(ray_t *obj, int depth);
 static int64_t q_ser_obj(uint8_t *buf, ray_t *obj);
-static ray_t *q_des_obj(uint8_t **buf, int64_t *len);
+static ray_t *q_des_obj(uint8_t **buf, int64_t *len, int depth);
 
 /* Resolve element i of a SYM vector to its string atom.  Splayed/mmap SYM
  * vectors carry narrow storage widths (attrs low bits, RAY_SYM_W8..W64)
@@ -376,7 +383,25 @@ static ray_t *q_make_table(ray_t *keys, ray_t *vals) {
   return tbl;
 }
 
-static int64_t q_size_obj(ray_t *obj) {
+static int q_add_size(int64_t *size, int64_t part) {
+  if (part < 0 || *size > INT64_MAX - part)
+    return -1;
+  *size += part;
+  return 0;
+}
+
+static int q_is_keyed_table(ray_t *obj) {
+  if (obj == NULL || obj->type != RAY_LIST || !(obj->attrs & RAY_ATTR_DICT) ||
+      obj->len != 2)
+    return 0;
+  ray_t **items = (ray_t **)ray_data(obj);
+  return items[0] != NULL && items[1] != NULL && items[0]->type == RAY_TABLE &&
+         items[1]->type == RAY_TABLE;
+}
+
+static int64_t q_size_obj(ray_t *obj, int depth) {
+  if (depth > Q_MAX_NESTING)
+    return Q_SIZE_OVERFLOW;
   if (obj == NULL || obj == RAY_NULL_OBJ)
     return 1 + 1; /* identity type + primitive code */
 
@@ -412,27 +437,44 @@ static int64_t q_size_obj(ray_t *obj) {
     case RAY_STR: {
       /* Single char goes as -KC atom; multi-char as KC vector. */
       int64_t n = (int64_t)ray_str_len(obj);
+      if (n > UINT32_MAX)
+        return Q_SIZE_OVERFLOW;
       if (n == 1)
         return 1 + 1;
       return 1 + 1 + 4 + n;
     }
     }
-    return 0;
+    return Q_SIZE_OVERFLOW;
   }
 
   /* Vectors / containers */
   if (t == RAY_LIST) {
+    if (obj->len < 0 || obj->len > UINT32_MAX)
+      return Q_SIZE_OVERFLOW;
+    if (q_is_keyed_table(obj)) {
+      ray_t **items = (ray_t **)ray_data(obj);
+      int64_t keys = q_size_obj(items[0], depth + 1);
+      int64_t vals = q_size_obj(items[1], depth + 1);
+      if (keys < 0 || vals < 0 || keys > INT64_MAX - vals - 1)
+        return Q_SIZE_OVERFLOW;
+      return 1 + keys + vals;
+    }
     int64_t size = 1 + 1 + 4;
     ray_t **elems = (ray_t **)ray_data(obj);
-    for (int64_t i = 0; i < obj->len; i++)
-      size += q_size_obj(elems[i]);
+    for (int64_t i = 0; i < obj->len; i++) {
+      if (q_add_size(&size, q_size_obj(elems[i], depth + 1)) < 0)
+        return Q_SIZE_OVERFLOW;
+    }
     return size;
   }
   if (t == RAY_SYM) {
+    if (obj->len < 0 || obj->len > UINT32_MAX)
+      return Q_SIZE_OVERFLOW;
     int64_t size = 1 + 1 + 4;
     for (int64_t i = 0; i < obj->len; i++) {
       ray_t *s = q_sym_vec_str(obj, i); /* borrowed */
-      size += s ? (int64_t)ray_str_len(s) + 1 : 1;
+      if (q_add_size(&size, s ? (int64_t)ray_str_len(s) + 1 : 1) < 0)
+        return Q_SIZE_OVERFLOW;
     }
     return size;
   }
@@ -441,20 +483,37 @@ static int64_t q_size_obj(ray_t *obj) {
      * list-0 of column vectors. RAY_TABLE is opaque - extract via the
      * public accessors instead of indexing ray_data directly. */
     int64_t ncols = ray_table_ncols(obj);
+    if (ncols < 0 || ncols > UINT32_MAX)
+      return Q_SIZE_OVERFLOW;
     int64_t names = 1 + 1 + 4; /* KS type + attrs + count */
     for (int64_t i = 0; i < ncols; i++) {
       ray_t *s = ray_sym_str(ray_table_col_name(obj, i));
-      names += s ? (int64_t)ray_str_len(s) + 1 : 1;
+      if (q_add_size(&names, s ? (int64_t)ray_str_len(s) + 1 : 1) < 0) {
+        if (s)
+          ray_release(s);
+        return Q_SIZE_OVERFLOW;
+      }
       if (s)
         ray_release(s);
     }
     int64_t cols = 1 + 1 + 4; /* list type + attrs + count */
-    for (int64_t i = 0; i < ncols; i++)
-      cols += q_size_obj(ray_table_get_col_idx(obj, i));
-    return 3 + names + cols; /* XT + attrs + XD */
+    for (int64_t i = 0; i < ncols; i++) {
+      if (q_add_size(&cols,
+                     q_size_obj(ray_table_get_col_idx(obj, i), depth + 1)) < 0)
+        return Q_SIZE_OVERFLOW;
+    }
+    int64_t total = 3;
+    if (q_add_size(&total, names) < 0 || q_add_size(&total, cols) < 0)
+      return Q_SIZE_OVERFLOW;
+    return total; /* XT + attrs + XD */
   }
-  if (t == RAY_DICT)
-    return 1 + q_size_obj(ray_dict_keys(obj)) + q_size_obj(ray_dict_vals(obj));
+  if (t == RAY_DICT) {
+    int64_t keys = q_size_obj(ray_dict_keys(obj), depth + 1);
+    int64_t vals = q_size_obj(ray_dict_vals(obj), depth + 1);
+    if (keys < 0 || vals < 0 || keys > INT64_MAX - vals - 1)
+      return Q_SIZE_OVERFLOW;
+    return 1 + keys + vals;
+  }
   if (t == RAY_ERROR) {
     const char *msg = ray_err_code(obj);
     int64_t n = msg ? (int64_t)strlen(msg) : 0;
@@ -464,18 +523,22 @@ static int64_t q_size_obj(ray_t *obj) {
     return 1 + 1 + 4;
 
   if (t == RAY_STR) {
+    if (obj->len < 0 || obj->len > UINT32_MAX)
+      return Q_SIZE_OVERFLOW;
     int64_t size = 1 + 1 + 4; /* list type + attrs + count */
     for (int64_t i = 0; i < obj->len; i++) {
       size_t slen = 0;
       ray_str_vec_get(obj, i, &slen);
-      size += 1 + 1 + 4 + (int64_t)slen; /* KC vec header + chars */
+      if (q_add_size(&size, 1 + 1 + 4 + (int64_t)slen) < 0)
+        return Q_SIZE_OVERFLOW;
     }
     return size;
   }
 
   int esz = (int)ray_scalar_elem_size(t);
-  if (esz == 0)
-    return 0;
+  if (esz == 0 || obj->len < 0 || obj->len > UINT32_MAX ||
+      obj->len > (INT64_MAX - 6) / esz)
+    return Q_SIZE_OVERFLOW;
   return 1 + 1 + 4 + obj->len * esz;
 }
 
@@ -489,7 +552,22 @@ static int64_t q_ser_obj(uint8_t *buf, ray_t *obj) {
   }
 
   int8_t t = obj->type;
-  *buf++ = (uint8_t)q_type_of(t);
+  if (t == RAY_LIST && q_is_keyed_table(obj)) {
+    ray_t **items = (ray_t **)ray_data(obj);
+    *buf++ = Q_XD;
+    int64_t r = q_ser_obj(buf, items[0]);
+    if (r < 0)
+      return -1;
+    buf += r;
+    r = q_ser_obj(buf, items[1]);
+    if (r < 0)
+      return -1;
+    return buf + r - start;
+  }
+  int8_t wire_type = q_type_of(t);
+  if (wire_type == 0 && t != RAY_LIST)
+    return -1;
+  *buf++ = (uint8_t)wire_type;
 
   if (t < 0) {
     int abs_t = -t;
@@ -917,7 +995,9 @@ static ray_t *q_des_vec_i32_conv(uint8_t **buf, int64_t *len, int8_t ray_type,
   return vec;
 }
 
-static ray_t *q_des_obj(uint8_t **buf, int64_t *len) {
+static ray_t *q_des_obj(uint8_t **buf, int64_t *len, int depth) {
+  if (depth > Q_MAX_NESTING)
+    return ray_error("q: maximum nesting exceeded", NULL);
   if (*len < 1)
     return ray_error("q: buffer underflow (type)", NULL);
 
@@ -1110,6 +1190,8 @@ static ray_t *q_des_obj(uint8_t **buf, int64_t *len) {
       return ray_error("q: buffer underflow", NULL);
     if (n < 0)
       return ray_error("q: negative symbol-vec length", NULL);
+    if ((int64_t)n > *len)
+      return ray_error("q: symbol vector exceeds remaining frame", NULL);
     ray_t *vec = ray_sym_vec_new(RAY_SYM_W64, n);
     if (vec == NULL || RAY_IS_ERR(vec)) {
       if (vec)
@@ -1146,7 +1228,7 @@ static ray_t *q_des_obj(uint8_t **buf, int64_t *len) {
       return ray_error("q: negative list length", NULL);
     ray_t *list = ray_list_new(0);
     for (int32_t i = 0; i < n; i++) {
-      ray_t *elem = q_des_obj(buf, len);
+      ray_t *elem = q_des_obj(buf, len, depth + 1);
       if (elem == NULL || RAY_IS_ERR(elem)) {
         ray_release(list);
         return elem ? elem : ray_error("q: list element decode failed", NULL);
@@ -1165,10 +1247,10 @@ static ray_t *q_des_obj(uint8_t **buf, int64_t *len) {
       return ray_error("q: malformed table marker", NULL);
     (*buf) += 2;
     *len -= 2;
-    ray_t *keys = q_des_obj(buf, len);
+    ray_t *keys = q_des_obj(buf, len, depth + 1);
     if (keys == NULL || RAY_IS_ERR(keys))
       return keys;
-    ray_t *vals = q_des_obj(buf, len);
+    ray_t *vals = q_des_obj(buf, len, depth + 1);
     if (vals == NULL || RAY_IS_ERR(vals)) {
       ray_release(keys);
       return vals;
@@ -1177,10 +1259,10 @@ static ray_t *q_des_obj(uint8_t **buf, int64_t *len) {
   }
 
   case Q_XD: { /* dict = keys + values; could be a keyed table */
-    ray_t *keys = q_des_obj(buf, len);
+    ray_t *keys = q_des_obj(buf, len, depth + 1);
     if (keys == NULL || RAY_IS_ERR(keys))
       return keys;
-    ray_t *vals = q_des_obj(buf, len);
+    ray_t *vals = q_des_obj(buf, len, depth + 1);
     if (vals == NULL || RAY_IS_ERR(vals)) {
       ray_release(keys);
       return vals;
@@ -1198,6 +1280,11 @@ static ray_t *q_des_obj(uint8_t **buf, int64_t *len) {
       if (kt && !RAY_IS_ERR(kt))
         kt->attrs |= RAY_ATTR_DICT;
       return kt;
+    }
+    if (keys->type == RAY_TABLE || vals->type == RAY_TABLE) {
+      ray_release(keys);
+      ray_release(vals);
+      return ray_error("q: unsupported table dictionary", NULL);
     }
     return ray_dict_new(keys, vals); /* consumes both refs */
   }
@@ -1373,7 +1460,7 @@ int q_close(int fd) {
 
 int q_encode(ray_t *msg, uint8_t **req, int64_t *req_len, char *err,
              size_t errlen) {
-  int64_t body_size = q_size_obj(msg);
+  int64_t body_size = q_size_obj(msg, 0);
   if (body_size <= 0) {
     q_set_err(err, errlen, "q: cannot serialize message");
     return -1;
@@ -1389,7 +1476,7 @@ int q_encode(ray_t *msg, uint8_t **req, int64_t *req_len, char *err,
     return -1;
   }
   int64_t written = q_ser_obj(buf + sizeof(q_header_t), msg);
-  if (written < 0) {
+  if (written < 0 || written != body_size) {
     free(buf);
     q_set_err(err, errlen, "q: serialization failed");
     return -1;
@@ -1413,11 +1500,20 @@ int q_exchange(int fd, const uint8_t *req, int64_t req_len, uint8_t **resp,
     q_set_err(err, errlen, "q: invalid handle");
     return -1;
   }
+  if (req == NULL || req_len <= 0 || resp == NULL || resp_len == NULL ||
+      compressed == NULL) {
+    q_set_err(err, errlen, "q: invalid exchange arguments");
+    return -1;
+  }
+  *resp = NULL;
+  *resp_len = 0;
+  *compressed = 0;
   if (q_send_all(fd, req, (size_t)req_len) < 0) {
     q_set_err(err, errlen,
               (errno == EAGAIN || errno == EWOULDBLOCK) ? "q: send timed out"
               : (errno == EBADF || errno == ENOTSOCK)   ? "q: invalid handle"
                                                         : "q: send failed");
+    shutdown(fd, SHUT_RDWR);
     return -1;
   }
 
@@ -1427,14 +1523,22 @@ int q_exchange(int fd, const uint8_t *req, int64_t req_len, uint8_t **resp,
               (errno == EAGAIN || errno == EWOULDBLOCK)
                   ? "q: recv timed out"
                   : "q: recv header failed");
+    shutdown(fd, SHUT_RDWR);
     return -1;
   }
   if (header.endianness != Q_LITTLE_ENDIAN) {
     q_set_err(err, errlen, "q: big-endian peer not supported");
+    shutdown(fd, SHUT_RDWR);
     return -1;
   }
   if (header.msgtype != Q_MSG_RESPONSE) {
     q_set_err(err, errlen, "q: expected response message type");
+    shutdown(fd, SHUT_RDWR);
+    return -1;
+  }
+  if (header.compressed > 1) {
+    q_set_err(err, errlen, "q: invalid compressed flag");
+    shutdown(fd, SHUT_RDWR);
     return -1;
   }
   int64_t body_len = (int64_t)header.size - (int64_t)sizeof header;
@@ -1442,11 +1546,13 @@ int q_exchange(int fd, const uint8_t *req, int64_t req_len, uint8_t **resp,
     q_set_err(err, errlen,
               body_len <= 0 ? "q: empty response body"
                             : "q: response body too large");
+    shutdown(fd, SHUT_RDWR);
     return -1;
   }
   uint8_t *body = (uint8_t *)malloc((size_t)body_len);
   if (body == NULL) {
     q_set_err(err, errlen, "q: out of memory");
+    shutdown(fd, SHUT_RDWR);
     return -1;
   }
   if (q_recv_all(fd, body, (size_t)body_len) < 0) {
@@ -1455,6 +1561,7 @@ int q_exchange(int fd, const uint8_t *req, int64_t req_len, uint8_t **resp,
               (errno == EAGAIN || errno == EWOULDBLOCK)
                   ? "q: recv timed out"
                   : "q: recv body failed");
+    shutdown(fd, SHUT_RDWR);
     return -1;
   }
   *resp = body;
@@ -1477,14 +1584,13 @@ ray_t *q_decode(uint8_t *resp, int64_t resp_len, int compressed, char *err,
   }
   uint8_t *cursor = decoded;
   int64_t remaining = decoded_len;
-  ray_t *result = q_des_obj(&cursor, &remaining);
+  int q_error_frame = decoded_len > 0 && decoded[0] == 0x80;
+  ray_t *result = q_des_obj(&cursor, &remaining, 0);
   if (decompressed)
     free(decompressed);
   if (result == NULL)
     q_set_err(err, errlen, "q: deserialization returned null");
-  else if (RAY_IS_ERR(result)) {
-    return result;
-  } else if (remaining != 0) {
+  else if (remaining != 0 && (!RAY_IS_ERR(result) || q_error_frame)) {
     q_release_any(result);
     q_set_err(err, errlen, "q: trailing bytes after object");
     return NULL;
@@ -1509,5 +1615,7 @@ ray_t *q_send(int fd, ray_t *msg, char *err, size_t errlen) {
 
   ray_t *result = q_decode(resp, resp_len, compressed, err, errlen);
   free(resp);
+  if (result == NULL)
+    shutdown(fd, SHUT_RDWR);
   return result;
 }
