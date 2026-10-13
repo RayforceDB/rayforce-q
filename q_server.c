@@ -97,6 +97,13 @@ typedef struct {
   int64_t rx_body_total;
 } q_conn_t;
 
+/* The outbound connection whose pushed frame is being evaluated, or -1. A
+ * handler reads it through q_conn_current (`.q.handle`), which is how one
+ * process subscribed to several publishers tells their frames apart. */
+static int64_t q_current_handle = -1;
+
+int64_t q_conn_current(void) { return q_current_handle; }
+
 static void q_release_any(ray_t *obj) {
   if (obj == NULL)
     return;
@@ -420,9 +427,16 @@ static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
     return NULL;
   }
 
+  /* Published for the handler's duration only, and restored rather than
+   * cleared: a handler that pumps another connection (a .q.send on it)
+   * dispatches that connection's frames from inside this one. */
+  int64_t prev_handle = q_current_handle;
+  if (cd->outbound)
+    q_current_handle = id;
   ray_t *result = req ? eval_request(req)
                       : ray_error("q server: malformed request", "%s",
                                   err[0] ? err : "q server: decode failed");
+  q_current_handle = prev_handle;
   if (req)
     q_release_any(req);
 

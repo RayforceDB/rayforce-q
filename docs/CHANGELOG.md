@@ -2,6 +2,23 @@
 
 All notable changes to `rayforce-q` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/), and the project adheres to [Semantic Versioning](https://semver.org/). Bindings pin a tag, so each release is a stable point they can build against.
 
+## [2.4.0]
+
+Built and tested (`make test` with a real q) against rayforce core `dev` at
+`12502a6e` and `master` at `dc9b12a` (v2.11.0); the core did not change.
+
+### Added
+
+- **`(.q.handle)`** names the connection whose pushed frame is being handled:
+  inside a handler a `` (`upd;x) `` called, the handle `.q.connect` returned
+  for that connection; anywhere else, -1. One process subscribed to several
+  publishers can now tell their frames apart, which q itself does with
+  `.z.w`. A handler that sends on another connection and dispatches that
+  connection's frames meanwhile gets its own handle back when the send
+  returns; a handler that closes its own connection still reads the handle
+  it was called on. For bindings the same value is `q_conn_current()` in
+  `q_server.h`.
+
 ## [2.3.0]
 
 Built and tested (`make test` with a real q) against rayforce core `dev` at

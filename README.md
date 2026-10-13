@@ -26,6 +26,12 @@ Connections live on the runtime's event loop, so the peer can **push** to them �
 (.q.send h ".net.sub[0]")                        ;; subscribe once — packets then arrive on their own
 ```
 
+Inside a handler, `(.q.handle)` is the connection the frame came in on (the value `.q.connect` returned), `-1` anywhere else — so one process can subscribe to several publishers and still tell whose packet it holds:
+
+```clojure
+(set upd (fn [packet] (record (cluster-of (.q.handle)) packet)))
+```
+
 A host without a poll (a binding that embeds only the client) keeps the plain blocking `q.c` path and its raw-fd handle.
 
 ### Server

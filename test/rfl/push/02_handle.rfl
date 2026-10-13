@@ -1,0 +1,49 @@
+;; Which connection pushed the frame (driver --poll).
+;;
+;; A process subscribed to several publishers gets every (`upd;x) through the
+;; same handler, and q gives it no way to tell them apart: .z.w names the peer
+;; of the message being handled, but that is q's state, not ours. (.q.handle)
+;; is that name here: inside a handler a pushed frame called, the handle the
+;; frame came in on; anywhere else, -1.
+;;
+;; The two q servers of the client leg stand in for two publishers.
+
+(.q.handle) -- -1
+(set a (.q.connect qhost qport))
+(set b (.q.connect qhost qauthport quser qpass))
+(== a b) -- false
+
+;; ---- each publisher's frame names its own connection ----------------------
+(set seen-a -2)
+(set seen-b -2)
+(set upd (fn [x] (if (== x 1) (set seen-a (.q.handle)) (set seen-b (.q.handle)))))
+(.q.send a "neg[.z.w](`upd;1); 1") -- 1
+(.q.send b "neg[.z.w](`upd;2); 2") -- 2
+(== seen-a a) -- true
+(== seen-b b) -- true
+(.q.handle) -- -1                         ;; nothing is being handled now
+
+;; ---- a handler that pumps another connection gets its own handle back -----
+;; upd (on a) sends on b; b pushes upd2 during that send, which sees b; when
+;; the send returns, upd is still on a.
+(set inner -2)
+(set after -2)
+(set seen-b -2)
+(set upd2 (fn [x] (set seen-b (.q.handle))))
+(set upd (fn [x] (do (set inner (.q.send b "neg[.z.w](`upd2;2); 9")) (set after (.q.handle)))))
+(.q.send a "neg[.z.w](`upd;1); 3") -- 3
+inner -- 9
+(== seen-b b) -- true
+(== after a) -- true
+(.q.handle) -- -1
+
+;; ---- a handler that closes its own connection still knows which it was ----
+;; The handle is a number noted before the handler runs, not a lookup of a
+;; selector the handler may have freed. The round-trip the push rode in on
+;; cannot complete, so the send reports an io error (connection closed).
+(set seen-a -2)
+(set upd (fn [x] (do (.q.close a) (set seen-a (.q.handle)))))
+(.q.send a "neg[.z.w](`upd;1); 4") !- io
+(== seen-a a) -- true
+(.q.send a "1+1") !- handle
+(.q.close b)

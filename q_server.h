@@ -84,6 +84,10 @@ ray_t *q_conn_send(ray_poll_t *poll, int64_t id, ray_t *msg);
 /* Check whether `id` identifies an open Q connection owned by this module. */
 int q_conn_is_handle(ray_poll_t *poll, int64_t id);
 
+/* The attached connection whose pushed frame is being evaluated right now:
+ * valid inside a handler such a frame called, -1 everywhere else. */
+int64_t q_conn_current(void);
+
 /* Close an attached connection and release its state. */
 void q_conn_close(ray_poll_t *poll, int64_t id);
 

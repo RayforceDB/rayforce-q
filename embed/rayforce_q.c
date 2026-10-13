@@ -220,6 +220,15 @@ static ray_t *qb_close(ray_t *handle) {
   return RAY_NULL_OBJ;
 }
 
+/* (.q.handle) -> the connection whose pushed frame is being handled, -1
+ * outside such a handler. */
+static ray_t *qb_handle(ray_t **args, int64_t n) {
+  (void)args;
+  if (n != 0)
+    return ray_error("arity", ".q.handle takes no arguments");
+  return ray_i64(q_poll() != NULL ? q_conn_current() : -1);
+}
+
 /* Bind a builtin under its reserved-namespace name (`.q.*`): ray_env_bind
  * builds the namespace dict, ray_env_bind_flat registers the flat name for REPL
  * completion. */
@@ -243,6 +252,10 @@ void q_env_register(void) {
 
   f = ray_fn_unary(".q.close", RAY_FN_RESTRICTED, qb_close);
   q_bind(".q.close", f);
+  ray_release(f);
+
+  f = ray_fn_vary(".q.handle", RAY_FN_NONE, qb_handle);
+  q_bind(".q.handle", f);
   ray_release(f);
 }
 
