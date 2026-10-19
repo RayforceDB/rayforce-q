@@ -622,6 +622,18 @@ static int run_codec_selftest(void) {
     ray_release(rs);
   release_any(r);
 
+  /* A table whose one column is a long atom: ray_table_add_col rejects the
+   * column and releases the table itself, so the decode must not release it
+   * again, only return the error. */
+  uint8_t atom_column[] = {98, 0, 99, 11, 0,    1,  0, 0, 0, 'a', 0, 0, 0,
+                           1,  0, 0,  0,  0xF9, 42, 0, 0, 0, 0,   0, 0, 0};
+  r = q_decode(atom_column, (int64_t)sizeof atom_column, 0, err, sizeof err);
+  if (r == NULL || !RAY_IS_ERR(r)) {
+    fprintf(stderr, "codec selftest: a table with an atom column decoded\n");
+    failures++;
+  }
+  release_any(r);
+
   uint8_t oversized_compressed[4];
   uint32_t oversized_size =
       (uint32_t)((256u << 20) + sizeof(test_q_header_t) + 1u);

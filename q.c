@@ -146,12 +146,11 @@ static ray_t *q_build_table(const int64_t *col_ids, ray_t *const *cols,
       return ray_error("table column is null", NULL);
     }
     /* ray_table_add_col retains the column internally and may return a new
-     * pointer on realloc. */
+     * pointer on realloc. It consumes tbl on every path, failure included,
+     * so a failed add has already released it. */
     ray_t *res = ray_table_add_col(tbl, col_ids[i], cols[i]);
-    if (res == NULL || RAY_IS_ERR(res)) {
-      ray_release(tbl);
+    if (res == NULL || RAY_IS_ERR(res))
       return res ? res : ray_error("table_add_col failed", NULL);
-    }
     tbl = res;
   }
   return tbl;
