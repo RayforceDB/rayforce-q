@@ -358,6 +358,9 @@ echo "q servers up: open=$HOST:$PORT auth=$HOST:$AUTHPORT; running client tests.
   --authport "$AUTHPORT" --user "$Q_USER" --pass "$Q_PASS" \
   "$RFL_DIR"/client/*.rfl
 
+echo "running q_decode_cols selftest against q..."
+"$DRIVER" --cols-selftest "$HOST" "$PORT"
+
 # ---- Leg 4: the same client tests with connections on an event loop, plus
 # the push tests that only exist in that mode. Re-running client/ is the point:
 # the poll path must be a drop-in for every request/response case, not just a

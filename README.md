@@ -71,10 +71,16 @@ int    q_encode(ray_t *msg, uint8_t **req, int64_t *req_len, char *err, size_t n
 int    q_exchange(int fd, const uint8_t *req, int64_t req_len, uint8_t **resp,
                   int64_t *resp_len, int *compressed, char *err, size_t n);
 ray_t *q_decode(uint8_t *resp, int64_t resp_len, int compressed, char *err, size_t n);
+
+/* q_decode, but a table keeps only the named columns, in the order named. */
+ray_t *q_decode_cols(uint8_t *resp, int64_t resp_len, int compressed,
+                     const char *const *cols, int ncols, char *err, size_t n);
 ```
 
 The connection handle is the raw socket fd, so the client is thread-safe and unbounded (no shared connection table). `q_send` returns a freshly-owned
 `ray_t`, which may itself be a `RAY_ERROR` carrying a Q server-side error. A `NULL` return signals a transport/serialization failure with a short reason in `err`.
+
+`q_decode_cols` is for a caller that keeps a few columns of a wide table. The other columns are skipped by their serialized length: no allocation per string cell and no symbol interning. A name the table lacks comes back as a `RAY_ERROR`. See `q.h` for keyed tables and edge cases.
 
 
 ### Server

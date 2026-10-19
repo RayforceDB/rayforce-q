@@ -91,6 +91,17 @@ ray_t *result = q_decode(resp, resp_len, compressed, err, sizeof err);
 free(resp);
 ```
 
+If the reply is a wide table and you keep only some of its columns, decode
+with `q_decode_cols` instead. It takes the same arguments plus the column
+names, and returns a table of only those columns, in the order given. The
+others are skipped without being built, so you don't pay for one string per
+cell or one symbol intern per cell in columns you would drop anyway:
+
+```c
+const char *keep[] = {"date", "sym", "px"};
+ray_t *result = q_decode_cols(resp, resp_len, compressed, keep, 3, err, sizeof err);
+```
+
 ### Reference: CPython binding
 
 The Python binding (`rayforce-py`) is the canonical example. A thin glue layer

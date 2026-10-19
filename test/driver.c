@@ -337,6 +337,239 @@ static void release_any(ray_t *r) {
     ray_release(r);
 }
 
+/* ---- q_decode_cols -------------------------------------------------- */
+
+#define TEST_ATTR_DICT 0x02 /* q.c's RAY_ATTR_DICT, marking a keyed table */
+
+/* q_encode v. Returns the whole message (header + body) to free(), or NULL. */
+static uint8_t *encode_value(ray_t *v, int64_t *len) {
+  char err[128] = {0};
+  uint8_t *msg = NULL;
+  if (q_encode(v, &msg, len, err, sizeof err) < 0) {
+    fprintf(stderr, "cols selftest: q_encode failed: %s\n", err);
+    return NULL;
+  }
+  return msg;
+}
+
+static uint8_t *encode_expr(const char *src, int64_t *len) {
+  ray_t *v = ray_eval_str(src);
+  if (v == NULL || RAY_IS_ERR(v)) {
+    fprintf(stderr, "cols selftest: cannot evaluate %s\n", src);
+    release_any(v);
+    return NULL;
+  }
+  uint8_t *msg = encode_value(v, len);
+  ray_release(v);
+  return msg;
+}
+
+/* A keyed table as q.c decodes one: (key table; value table) + dict attr. */
+static ray_t *keyed(ray_t *k, ray_t *v) {
+  ray_t *kt = ray_list_new(0);
+  kt = ray_list_append(kt, k);
+  kt = ray_list_append(kt, v);
+  kt->attrs |= TEST_ATTR_DICT;
+  return kt;
+}
+
+/* q_decode_cols(got body, names) must format exactly as q_decode(want body). */
+static int expect_cols(const char *what, uint8_t *got, int64_t got_len,
+                       int got_compressed, const char *const *names, int n,
+                       uint8_t *want, int64_t want_len, int want_compressed) {
+  char err[128] = {0};
+  ray_t *g =
+      q_decode_cols(got, got_len, got_compressed, names, n, err, sizeof err);
+  ray_t *w = q_decode(want, want_len, want_compressed, err, sizeof err);
+  int ok = g != NULL && w != NULL && !RAY_IS_ERR(g) && !RAY_IS_ERR(w) &&
+           fmt_eq(g, w);
+  if (!ok) {
+    char gs[512], ws[512];
+    fmt_into(g, gs, sizeof gs);
+    fmt_into(w, ws, sizeof ws);
+    fprintf(stderr, "cols selftest: %s: got %s, want %s %s\n", what, gs, ws,
+            err);
+  }
+  release_any(g);
+  release_any(w);
+  return ok ? 0 : 1;
+}
+
+/* Cutting a message anywhere must give an error, never a value or a crash,
+ * wherever the cut falls in a skipped column. */
+static int expect_cuts_fail(const char *what, uint8_t *body, int64_t len,
+                            const char *const *names, int n) {
+  char err[128];
+  for (int64_t cut = 0; cut < len; cut++) {
+    ray_t *r = q_decode_cols(body, cut, 0, names, n, err, sizeof err);
+    int decoded = r != NULL && !RAY_IS_ERR(r);
+    release_any(r);
+    if (decoded) {
+      fprintf(stderr, "cols selftest: %s cut at %lld of %lld decoded\n", what,
+              (long long)cut, (long long)len);
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* q_decode_cols over q_encode'd and hand-built messages; needs no q. */
+static int cols_codec_checks(void) {
+  int failures = 0;
+  char err[128];
+  ray_t *r = NULL, *w = NULL;
+  static const char *T =
+      "(table ['a 's 'str 'f 'd 'ts] (list [1 2 3] ['alpha 'beta 'gamma] "
+      "(list \"ab\" \"c\" \"\") [1.5 2.5 3.5] [2024.01.15 2024.01.16 "
+      "2024.01.17] [2024.01.15D09:30:00.000000000 "
+      "2024.01.15D09:30:01.000000000 2024.01.15D09:30:02.000000000]))";
+  int64_t full_len = 0, proj_len = 0, kt_len = 0, ktf_len = 0, vec_len = 0;
+  uint8_t *full = encode_expr(T, &full_len);
+  uint8_t *proj = encode_expr(
+      "(table ['str 'a] (list (list \"ab\" \"c\" \"\") [1 2 3]))", &proj_len);
+  uint8_t *vec = encode_expr("[1 2 3]", &vec_len);
+  ray_t *k = ray_eval_str("(table ['k] (list [7 8 9]))");
+  ray_t *v = ray_eval_str(T);
+  ray_t *vf = ray_eval_str("(table ['f] (list [1.5 2.5 3.5]))");
+  ray_t *kt = NULL, *ktf = NULL;
+  uint8_t *ktm = NULL, *ktfm = NULL;
+  if (full == NULL || proj == NULL || vec == NULL || k == NULL ||
+      RAY_IS_ERR(k) || v == NULL || RAY_IS_ERR(v) || vf == NULL ||
+      RAY_IS_ERR(vf)) {
+    fprintf(stderr, "cols selftest: fixtures did not build\n");
+    failures++;
+    goto out;
+  }
+  kt = keyed(k, v);
+  ktf = keyed(k, vf);
+  ktm = encode_value(kt, &kt_len);
+  ktfm = encode_value(ktf, &ktf_len);
+  if (ktm == NULL || ktfm == NULL) {
+    failures++;
+    goto out;
+  }
+
+  const char *str_a[] = {"str", "a"};
+  failures += expect_cols("requested order", full + 8, full_len - 8, 0, str_a,
+                          2, proj + 8, proj_len - 8, 0);
+
+  /* Keyed: the key comes back whole and the names pick value columns; a
+   * name the key side holds needs no value column. */
+  const char *f[] = {"f"}, *f_k[] = {"f", "k"};
+  failures += expect_cols("keyed", ktm + 8, kt_len - 8, 0, f, 1, ktfm + 8,
+                          ktf_len - 8, 0);
+  failures += expect_cols("keyed, key named", ktm + 8, kt_len - 8, 0, f_k, 2,
+                          ktfm + 8, ktf_len - 8, 0);
+
+  failures += expect_cols("no names", full + 8, full_len - 8, 0, NULL, 0,
+                          full + 8, full_len - 8, 0);
+  failures += expect_cols("not a table", vec + 8, vec_len - 8, 0, f, 1, vec + 8,
+                          vec_len - 8, 0);
+
+  const char *missing[] = {"a", "nope"};
+  r = q_decode_cols(full + 8, full_len - 8, 0, missing, 2, err, sizeof err);
+  const char *msg = r != NULL && RAY_IS_ERR(r) ? ray_error_msg() : NULL;
+  if (msg == NULL || strstr(msg, "`nope`") == NULL) {
+    fprintf(stderr, "cols selftest: missing column not reported: %s\n",
+            msg ? msg : err);
+    failures++;
+  }
+  release_any(r);
+
+  const char *twice[] = {"a", "a"}, *null_name[] = {"a", NULL};
+  err[0] = '\0';
+  r = q_decode_cols(full + 8, full_len - 8, 0, twice, 2, err, sizeof err);
+  if (r != NULL || strstr(err, "named twice") == NULL) {
+    fprintf(stderr, "cols selftest: repeated name accepted: %s\n", err);
+    failures++;
+  }
+  release_any(r);
+  err[0] = '\0';
+  r = q_decode_cols(full + 8, full_len - 8, 0, null_name, 2, err, sizeof err);
+  if (r != NULL || strstr(err, "null column name") == NULL) {
+    fprintf(stderr, "cols selftest: NULL name accepted: %s\n", err);
+    failures++;
+  }
+  release_any(r);
+
+  /* ([] a:1 2; n:0D00:00:01 0D00:00:02; qcolsskipped:`qcolsunseen`), by
+   * hand: rayforce cannot encode a timespan. Skipping n works although
+   * q_decode rejects it, and the skipped symbol column's name and values
+   * are never interned. */
+  uint8_t span[] = {/* table, attrs, dict; column names `a`n`qcolsskipped */
+                    98, 0, 99, 11, 0, 3, 0, 0, 0, 'a', 0, 'n', 0, 'q', 'c', 'o',
+                    'l', 's', 's', 'k', 'i', 'p', 'p', 'e', 'd', 0,
+                    /* values: a list of 3 columns */
+                    0, 0, 3, 0, 0, 0,
+                    /* a: longs 1 2 */
+                    7, 0, 2, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0,
+                    0, 0,
+                    /* n: timespans 1s 2s */
+                    16, 0, 2, 0, 0, 0, 0x00, 0xca, 0x9a, 0x3b, 0, 0, 0, 0, 0x00,
+                    0x94, 0x35, 0x77, 0, 0, 0, 0,
+                    /* qcolsskipped: symbols `qcolsunseen` */
+                    11, 0, 2, 0, 0, 0, 'q', 'c', 'o', 'l', 's', 'u', 'n', 's',
+                    'e', 'e', 'n', 0, 0};
+  const char *a[] = {"a"}, *n[] = {"n"};
+  r = q_decode_cols(span, (int64_t)sizeof span, 0, a, 1, err, sizeof err);
+  w = ray_eval_str("(table ['a] (list [1 2]))");
+  if (r == NULL || RAY_IS_ERR(r) || !fmt_eq(r, w)) {
+    fprintf(stderr, "cols selftest: timespan column was not skipped: %s\n",
+            err);
+    failures++;
+  }
+  if (ray_sym_find("qcolsunseen", 11) >= 0 ||
+      ray_sym_find("qcolsskipped", 12) >= 0) {
+    fprintf(stderr, "cols selftest: a skipped column was interned\n");
+    failures++;
+  }
+  release_any(r);
+  release_any(w);
+  r = q_decode_cols(span, (int64_t)sizeof span, 0, n, 1, err, sizeof err);
+  if (r == NULL || !RAY_IS_ERR(r) || strcmp(ray_err_code(r), "q: unsu") != 0) {
+    fprintf(stderr, "cols selftest: a kept timespan was not rejected\n");
+    failures++;
+  }
+  release_any(r);
+
+  /* Symbols are skipped a word at a time: end a skipped symbol column at
+   * every offset within a word, with the next column's bytes after it. */
+  w = ray_eval_str("(table ['a] (list [7]))");
+  for (int k = 1; k <= 17; k++) {
+    char src[64], sym[18];
+    memset(sym, 's', (size_t)k);
+    sym[k] = '\0';
+    snprintf(src, sizeof src, "(table ['s 'a] (list ['%s] [7]))", sym);
+    int64_t m_len = 0;
+    uint8_t *m = encode_expr(src, &m_len);
+    r = m ? q_decode_cols(m + 8, m_len - 8, 0, a, 1, err, sizeof err) : NULL;
+    if (r == NULL || RAY_IS_ERR(r) || !fmt_eq(r, w)) {
+      fprintf(stderr, "cols selftest: a %d-char symbol was mis-skipped\n", k);
+      failures++;
+    }
+    release_any(r);
+    free(m);
+  }
+  release_any(w);
+
+  failures += expect_cuts_fail("encoded table", full + 8, full_len - 8, f, 1);
+  failures +=
+      expect_cuts_fail("timespan table", span, (int64_t)sizeof span, a, 1);
+
+out:
+  free(full);
+  free(proj);
+  free(vec);
+  free(ktm);
+  free(ktfm);
+  release_any(kt);
+  release_any(ktf);
+  release_any(k);
+  release_any(v);
+  release_any(vf);
+  return failures;
+}
+
 static int run_codec_selftest(void) {
   int failures = 0;
   ray_runtime_t *rt = ray_runtime_create(0, NULL);
@@ -476,6 +709,8 @@ static int run_codec_selftest(void) {
     }
     release_any(r);
   }
+
+  failures += cols_codec_checks();
 
   int listener = socket(AF_INET, SOCK_STREAM, 0);
   if (listener < 0) {
@@ -660,9 +895,122 @@ static int run_exchange_selftest(void) {
   return failures ? 1 : 0;
 }
 
+/* Send a q expression and return the raw response body to free(), or NULL. */
+static uint8_t *q_fetch(int fd, const char *expr, int64_t *len,
+                        int *compressed) {
+  char err[128] = {0};
+  ray_t *msg = ray_str(expr, strlen(expr));
+  uint8_t *req = NULL, *resp = NULL;
+  int64_t req_len = 0;
+  int rc = q_encode(msg, &req, &req_len, err, sizeof err);
+  ray_release(msg);
+  if (rc == 0) {
+    rc = q_exchange(fd, req, req_len, &resp, len, compressed, err, sizeof err);
+    free(req);
+  }
+  if (rc < 0) {
+    fprintf(stderr, "cols selftest: %s: %s\n", expr, err);
+    return NULL;
+  }
+  return resp;
+}
+
+/* --cols-selftest HOST PORT: q_decode_cols over bytes real q serialized,
+ * against q_decode of the same projection made by q (cols#t). */
+static int run_cols_selftest(const char *host, int port) {
+  int failures = 0;
+  ray_runtime_t *rt = ray_runtime_create(0, NULL);
+  int fd = q_connect(host, port, "", "", 5000);
+  if (rt == NULL || fd < 0) {
+    fprintf(stderr, "cols selftest: cannot reach q at %s:%d\n", host, port);
+    if (rt)
+      ray_runtime_destroy(rt);
+    return 1;
+  }
+
+  /* Every q type q_decode reads, plus a timespan it rejects, with the
+   * attributes an HDB carries. Columns are listed out of table order. */
+  static const char *setup =
+      "t:([] date:2024.01.15 2024.01.15 2024.01.16; sym:`p#`a`a`b; "
+      "id:`s#1 2 3; str:(\"ab\";enlist \"c\";\"\"); mx:(1;`a;\"x\"); "
+      "b:101b; x:0x0102ff; h:(1h;0Nh;3h); i:(1i;2i;0Ni); e:(1.5e;0Ne;2.5e); "
+      "px:1.5 0n 3.5; c:\"xyz\"; m:(2024.01m;2024.02m;0Nm); "
+      "u:(09:30;09:31;0Nu); v:(09:30:00;09:30:01;0Nv); "
+      "tm:(09:30:00.000;09:30:00.001;0Nt); "
+      "z:(2024.01.15T09:30:00.000;0Nz;2024.01.16T00:00:00.000); "
+      "ts:2024.01.15D09:30:00+0D00:00:01*til 3; "
+      "span:(0D00:00:01;0D00:00:02;0Nn); "
+      "g:\"G\"$(\"d49f18a4-1969-49e8-9b8a-6bb9a4832eea\";\"\";"
+      "\"00000000-0000-0000-0000-000000000001\"));"
+      "kt:`id xkey t; big:1000#t; 1b";
+  static const struct {
+    const char *what, *full, *proj;
+    const char *names[4];
+    int n;
+  } cases[] = {
+      {"q table", "t", "`str`date`px`sym#t", {"str", "date", "px", "sym"}, 4},
+      {"q keyed table", "kt", "(key kt)!`px`str#value kt", {"px", "str"}, 2},
+  };
+
+  int64_t len = 0, full_len = 0, proj_len = 0;
+  int cz = 0, full_cz = 0, proj_cz = 0;
+  char err[128] = {0};
+  uint8_t *ok = q_fetch(fd, setup, &len, &cz);
+  ray_t *okv = ok ? q_decode(ok, len, cz, err, sizeof err) : NULL;
+  if (okv == NULL || RAY_IS_ERR(okv)) {
+    char s[256];
+    fmt_into(okv, s, sizeof s);
+    fprintf(stderr, "cols selftest: q setup failed: %s %s\n", s, err);
+    failures++;
+  }
+  release_any(okv);
+  free(ok);
+
+  for (size_t i = 0; failures == 0 && i < sizeof cases / sizeof cases[0]; i++) {
+    uint8_t *full = q_fetch(fd, cases[i].full, &full_len, &full_cz);
+    uint8_t *proj = q_fetch(fd, cases[i].proj, &proj_len, &proj_cz);
+    if (full == NULL || proj == NULL)
+      failures++;
+    else
+      failures +=
+          expect_cols(cases[i].what, full, full_len, full_cz, cases[i].names,
+                      cases[i].n, proj, proj_len, proj_cz);
+    free(full);
+    free(proj);
+  }
+
+  /* A compressed message: q's own -18! output, header and all. */
+  if (failures == 0) {
+    uint8_t *z = q_fetch(fd, "-18!big", &len, &cz);
+    ray_t *zv = z ? q_decode(z, len, cz, err, sizeof err) : NULL;
+    uint8_t *proj = q_fetch(fd, "`str`px#big", &proj_len, &proj_cz);
+    const char *str_px[] = {"str", "px"};
+    if (zv == NULL || RAY_IS_ERR(zv) || zv->type != RAY_U8 || zv->len < 9 ||
+        ((uint8_t *)ray_data(zv))[2] != 1 || proj == NULL) {
+      fprintf(stderr, "cols selftest: q did not return a compressed table\n");
+      failures++;
+    } else {
+      uint8_t *msg = (uint8_t *)ray_data(zv);
+      failures += expect_cols("q compressed table", msg + 8, zv->len - 8, 1,
+                              str_px, 2, proj, proj_len, proj_cz);
+    }
+    release_any(zv);
+    free(z);
+    free(proj);
+  }
+
+  q_close(fd);
+  ray_runtime_destroy(rt);
+  printf("cols selftest: %s\n", failures ? "FAIL" : "ok");
+  return failures ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
   if (argc >= 2 && strcmp(argv[1], "--codec-selftest") == 0)
     return run_codec_selftest();
+
+  if (argc >= 4 && strcmp(argv[1], "--cols-selftest") == 0)
+    return run_cols_selftest(argv[2], atoi(argv[3]));
 
   if (argc >= 2 && strcmp(argv[1], "--exchange-selftest") == 0)
     return run_exchange_selftest();

@@ -383,6 +383,30 @@ static ray_t *q_make_table(ray_t *keys, ray_t *vals) {
   return tbl;
 }
 
+/* Build a dict from its decoded keys and values; consumes both refs. A plain
+ * dict (e.g. `a`b!1 2) becomes a native rayforce dict. A keyed table arrives
+ * as a dict whose key and value are both tables. Rayforce has no keyed-table
+ * type here, so keep that as a 2-element RAY_LIST + ATTR_DICT (key-table,
+ * value-table). */
+static ray_t *q_make_dict(ray_t *keys, ray_t *vals) {
+  if (keys->type == RAY_TABLE && vals->type == RAY_TABLE) {
+    ray_t *kt = ray_list_new(0);
+    kt = ray_list_append(kt, keys);
+    ray_release(keys); /* append retains; drop our ref */
+    kt = ray_list_append(kt, vals);
+    ray_release(vals);
+    if (kt && !RAY_IS_ERR(kt))
+      kt->attrs |= RAY_ATTR_DICT;
+    return kt;
+  }
+  if (keys->type == RAY_TABLE || vals->type == RAY_TABLE) {
+    ray_release(keys);
+    ray_release(vals);
+    return ray_error("q: unsupported table dictionary", NULL);
+  }
+  return ray_dict_new(keys, vals); /* consumes both refs */
+}
+
 static int q_add_size(int64_t *size, int64_t part) {
   if (part < 0 || *size > INT64_MAX - part)
     return -1;
@@ -1265,26 +1289,7 @@ static ray_t *q_des_obj(uint8_t **buf, int64_t *len, int depth) {
       ray_release(keys);
       return vals;
     }
-    /* A plain dict (e.g. `a`b!1 2) becomes a native rayforce dict. A keyed
-     * table arrives as a dict whose key and value are both tables. Rayforce
-     * has no keyed-table type here, so keep that as a 2-element
-     * RAY_LIST + ATTR_DICT (key-table, value-table). */
-    if (keys->type == RAY_TABLE && vals->type == RAY_TABLE) {
-      ray_t *kt = ray_list_new(0);
-      kt = ray_list_append(kt, keys);
-      ray_release(keys); /* append retains; drop our ref */
-      kt = ray_list_append(kt, vals);
-      ray_release(vals);
-      if (kt && !RAY_IS_ERR(kt))
-        kt->attrs |= RAY_ATTR_DICT;
-      return kt;
-    }
-    if (keys->type == RAY_TABLE || vals->type == RAY_TABLE) {
-      ray_release(keys);
-      ray_release(vals);
-      return ray_error("q: unsupported table dictionary", NULL);
-    }
-    return ray_dict_new(keys, vals); /* consumes both refs */
+    return q_make_dict(keys, vals);
   }
 
   case Q_ERR: {
@@ -1317,6 +1322,331 @@ static ray_t *q_des_obj(uint8_t **buf, int64_t *len, int depth) {
   default:
     return ray_error("q: unsupported wire type", NULL);
   }
+}
+
+/* Projected decode (q_decode_cols): a table's unwanted columns are walked by
+ * their serialized length only; nothing is allocated or interned for them. */
+
+/* The column names a projected decode keeps, in the caller's order. */
+typedef struct {
+  const char *const *names;
+  int n;
+} q_proj_t;
+
+/* Byte width of one element of a fixed-width q type (atom or vector code), or
+ * 0 for the rest. Timespan is here although q_des_obj rejects it: a skipped
+ * column needs only its length, never its meaning. */
+static int64_t q_wire_width(int8_t type) {
+  switch (type < 0 ? -type : type) {
+  case Q_KB:
+  case Q_KG:
+  case Q_KC:
+    return 1;
+  case Q_KH:
+    return 2;
+  case Q_KI:
+  case Q_KE:
+  case Q_KM:
+  case Q_KD:
+  case Q_KU:
+  case Q_KV:
+  case Q_KT:
+    return 4;
+  case Q_KJ:
+  case Q_KF:
+  case Q_KP:
+  case Q_KZ:
+  case Q_KN:
+    return 8;
+  case Q_UU:
+    return 16;
+  default:
+    return 0;
+  }
+}
+
+/* Advance past n NUL-terminated strings (symbols, or an error text). Symbols
+ * are short, so instead of a memchr per symbol this counts the NULs of eight
+ * bytes at a time: z has the top bit of each zero byte set, and the multiply
+ * sums those bits into the top byte. */
+static const char *q_skip_cstrs(uint8_t **buf, int64_t *len, int64_t n) {
+  const uint64_t low7 = 0x7F7F7F7F7F7F7F7FULL;
+  const uint8_t *p = *buf, *end = *buf + *len;
+  while (n > 0 && end - p >= 8) {
+    uint64_t v;
+    memcpy(&v, p, 8);
+    uint64_t z = ~(((v & low7) + low7) | v | low7);
+    int64_t zeros = (int64_t)(((z >> 7) * 0x0101010101010101ULL) >> 56);
+    if (zeros >= n)
+      break; /* the last terminator is in this word */
+    n -= zeros;
+    p += 8;
+  }
+  while (n > 0 && p < end)
+    if (*p++ == 0)
+      n--;
+  if (n > 0)
+    return "q: symbol not null-terminated";
+  *len -= p - *buf;
+  *buf = (uint8_t *)p;
+  return NULL;
+}
+
+/* Advance past one serialized object without building it. Returns NULL, or
+ * the ray_error code saying why the object is malformed. Bounds are checked
+ * as q_des_obj checks them; a type with no wire length is unsupported. */
+static const char *q_skip_obj(uint8_t **buf, int64_t *len, int depth) {
+  if (depth > Q_MAX_NESTING)
+    return "q: maximum nesting exceeded";
+  if (*len < 1)
+    return "q: buffer underflow (type)";
+
+  int8_t type = (int8_t)(*buf)[0];
+  (*buf)++;
+  (*len)--;
+
+  int32_t n;
+  switch (type) {
+  case -Q_KS:
+  case Q_ERR:
+    return q_skip_cstrs(buf, len, 1);
+
+  case Q_KS:
+    if (q_read_vec_header(buf, len, &n) < 0)
+      return "q: buffer underflow";
+    if (n < 0)
+      return "q: negative symbol-vec length";
+    if ((int64_t)n > *len)
+      return "q: symbol vector exceeds remaining frame";
+    return q_skip_cstrs(buf, len, n);
+
+  case 0: /* general list */
+    if (q_read_vec_header(buf, len, &n) < 0)
+      return "q: buffer underflow";
+    if (n < 0)
+      return "q: negative list length";
+    for (int32_t i = 0; i < n; i++) {
+      /* A string column is a list of char vectors: step over those here. */
+      int32_t chars;
+      if (*len >= 6 && (*buf)[0] == Q_KC) {
+        memcpy(&chars, *buf + 2, 4);
+        if (chars >= 0 && *len - 6 >= chars) {
+          *buf += 6 + (int64_t)chars;
+          *len -= 6 + (int64_t)chars;
+          continue;
+        }
+      }
+      const char *e = q_skip_obj(buf, len, depth + 1);
+      if (e != NULL)
+        return e;
+    }
+    return NULL;
+
+  case Q_XT: { /* attrs(0) + dict_marker(99) + keys + values */
+    if (*len < 2)
+      return "q: buffer underflow";
+    if ((*buf)[0] != 0 || (*buf)[1] != Q_XD)
+      return "q: malformed table marker";
+    *buf += 2;
+    *len -= 2;
+    const char *e = q_skip_obj(buf, len, depth + 1);
+    return e != NULL ? e : q_skip_obj(buf, len, depth + 1);
+  }
+
+  case Q_XD: {
+    const char *e = q_skip_obj(buf, len, depth + 1);
+    return e != NULL ? e : q_skip_obj(buf, len, depth + 1);
+  }
+
+  case Q_ID:
+    if (*len < 1)
+      return "q: buffer underflow";
+    *buf += 1;
+    *len -= 1;
+    return NULL;
+
+  default: {
+    int64_t width = q_wire_width(type);
+    if (width == 0)
+      return "q: unsupported wire type";
+    int64_t bytes = width;
+    if (type > 0) {
+      if (q_read_vec_header(buf, len, &n) < 0)
+        return "q: buffer underflow";
+      if (n < 0)
+        return "q: negative vector length";
+      bytes = (int64_t)n * width;
+    }
+    if (*len < bytes)
+      return "q: buffer underflow (vec body)";
+    *buf += bytes;
+    *len -= bytes;
+    return NULL;
+  }
+  }
+}
+
+/* Whether `want` is the n-byte column name at p (which holds no NUL). */
+static int q_name_is(const char *want, const uint8_t *p, size_t n) {
+  return strncmp(want, (const char *)p, n) == 0 && want[n] == '\0';
+}
+
+static int q_table_has_col(ray_t *tbl, const char *name) {
+  int64_t id = ray_sym_find(name, strlen(name));
+  if (id < 0)
+    return 0;
+  for (int64_t i = 0; i < ray_table_ncols(tbl); i++)
+    if (ray_table_col_name(tbl, i) == id)
+      return 1;
+  return 0;
+}
+
+/* Decode the table at the cursor (its 98 type byte) keeping only the columns
+ * proj names, in proj's order. key_tbl is a keyed table's decoded key side: a
+ * name that is one of its columns needs no value column. */
+static ray_t *q_des_table_cols(uint8_t **buf, int64_t *len, int depth,
+                               const q_proj_t *proj, ray_t *key_tbl) {
+  Q_NEED(4);
+  if ((*buf)[1] != 0 || (*buf)[2] != Q_XD)
+    return ray_error("q: malformed table marker", NULL);
+  if ((*buf)[3] != Q_KS)
+    return ray_error("q: malformed table — expected (sym-vec, list)", NULL);
+  *buf += 4;
+  *len -= 4;
+  int32_t n;
+  if (q_read_vec_header(buf, len, &n) < 0)
+    return ray_error("q: buffer underflow", NULL);
+  if (n < 0)
+    return ray_error("q: negative symbol-vec length", NULL);
+  if ((int64_t)n > *len)
+    return ray_error("q: symbol vector exceeds remaining frame", NULL);
+
+  /* slot[i]: the proj index table column i fills, or -1 to skip it.
+   * ids[j] / cols[j]: proj name j's interned id and decoded column. */
+  int *slot = (int *)malloc(sizeof(int) * (size_t)(n > 0 ? n : 1));
+  int64_t *ids = (int64_t *)malloc(sizeof(int64_t) * (size_t)proj->n);
+  ray_t **cols = (ray_t **)calloc((size_t)proj->n, sizeof(ray_t *));
+  ray_t *res = NULL;
+  int32_t nvals;
+  int kept = 0;
+  if (slot == NULL || ids == NULL || cols == NULL) {
+    res = ray_error("q: out of memory", NULL);
+    goto done;
+  }
+  for (int j = 0; j < proj->n; j++)
+    ids[j] = -1;
+
+  /* Names are matched by their bytes; only the kept ones are interned. */
+  for (int32_t i = 0; i < n; i++) {
+    const uint8_t *name = *buf;
+    const uint8_t *end = memchr(name, 0, (size_t)*len);
+    if (end == NULL) {
+      res = ray_error("q: symbol not null-terminated in vec", NULL);
+      goto done;
+    }
+    size_t k = (size_t)(end - name);
+    slot[i] = -1;
+    for (int j = 0; j < proj->n; j++) {
+      if (ids[j] >= 0 || !q_name_is(proj->names[j], name, k))
+        continue;
+      ids[j] = ray_sym_intern((const char *)name, k);
+      if (ids[j] < 0) {
+        res = ray_error("q: symbol intern failed", NULL);
+        goto done;
+      }
+      slot[i] = j;
+      break;
+    }
+    *buf += k + 1;
+    *len -= (int64_t)k + 1;
+  }
+
+  /* Every name must be found before any column is decoded. */
+  for (int j = 0; j < proj->n; j++) {
+    if (ids[j] >= 0 ||
+        (key_tbl != NULL && q_table_has_col(key_tbl, proj->names[j])))
+      continue;
+    res = ray_error("q: column not in table", "q: column `%s` not in table",
+                    proj->names[j]);
+    goto done;
+  }
+
+  if (*len < 1 || (*buf)[0] != 0) {
+    res = ray_error("q: malformed table — expected (sym-vec, list)", NULL);
+    goto done;
+  }
+  *buf += 1;
+  *len -= 1;
+  if (q_read_vec_header(buf, len, &nvals) < 0) {
+    res = ray_error("q: buffer underflow", NULL);
+    goto done;
+  }
+  if (nvals != n) {
+    res = ray_error("q: malformed table — expected (sym-vec, list)", NULL);
+    goto done;
+  }
+  for (int32_t i = 0; i < n; i++) {
+    if (slot[i] < 0) {
+      const char *e = q_skip_obj(buf, len, depth + 2);
+      if (e != NULL) {
+        res = ray_error(e, NULL);
+        goto done;
+      }
+      continue;
+    }
+    ray_t *col = q_des_obj(buf, len, depth + 2);
+    if (col == NULL || RAY_IS_ERR(col)) {
+      res = col ? col : ray_error("q: list element decode failed", NULL);
+      goto done;
+    }
+    cols[slot[i]] = col;
+  }
+
+  /* Close up the names the key side answered, keeping proj's order. */
+  for (int j = 0; j < proj->n; j++) {
+    if (cols[j] == NULL)
+      continue;
+    ids[kept] = ids[j];
+    cols[kept] = cols[j];
+    if (kept != j)
+      cols[j] = NULL;
+    kept++;
+  }
+  res = q_build_table(ids, cols, kept);
+
+done:
+  if (cols != NULL)
+    for (int j = 0; j < proj->n; j++)
+      if (cols[j] != NULL)
+        ray_release(cols[j]);
+  free(slot);
+  free(ids);
+  free(cols);
+  return res;
+}
+
+/* q_des_obj for a whole message, but a table — or a keyed table's value side
+ * — keeps only the columns proj names. */
+static ray_t *q_des_cols(uint8_t **buf, int64_t *len, const q_proj_t *proj) {
+  if (*len < 1)
+    return ray_error("q: buffer underflow (type)", NULL);
+  if ((*buf)[0] == Q_XT)
+    return q_des_table_cols(buf, len, 0, proj, NULL);
+  if ((*buf)[0] != Q_XD)
+    return q_des_obj(buf, len, 0);
+  (*buf)++;
+  (*len)--;
+  ray_t *keys = q_des_obj(buf, len, 1);
+  if (keys == NULL || RAY_IS_ERR(keys))
+    return keys;
+  ray_t *vals = (keys->type == RAY_TABLE && *len > 0 && (*buf)[0] == Q_XT)
+                    ? q_des_table_cols(buf, len, 1, proj, keys)
+                    : q_des_obj(buf, len, 1);
+  if (vals == NULL || RAY_IS_ERR(vals)) {
+    ray_release(keys);
+    return vals;
+  }
+  return q_make_dict(keys, vals);
 }
 
 /* Decompression */
@@ -1568,8 +1898,9 @@ int q_exchange(int fd, const uint8_t *req, int64_t req_len, uint8_t **resp,
   return 0;
 }
 
-ray_t *q_decode(uint8_t *resp, int64_t resp_len, int compressed, char *err,
-                size_t errlen) {
+/* q_decode, or q_decode_cols when proj is non-NULL. */
+static ray_t *q_decode_with(uint8_t *resp, int64_t resp_len, int compressed,
+                            const q_proj_t *proj, char *err, size_t errlen) {
   uint8_t *decoded = resp;
   int64_t decoded_len = resp_len;
   uint8_t *decompressed = NULL;
@@ -1583,7 +1914,8 @@ ray_t *q_decode(uint8_t *resp, int64_t resp_len, int compressed, char *err,
   uint8_t *cursor = decoded;
   int64_t remaining = decoded_len;
   int q_error_frame = decoded_len > 0 && decoded[0] == 0x80;
-  ray_t *result = q_des_obj(&cursor, &remaining, 0);
+  ray_t *result = proj ? q_des_cols(&cursor, &remaining, proj)
+                       : q_des_obj(&cursor, &remaining, 0);
   if (decompressed)
     free(decompressed);
   if (result == NULL)
@@ -1594,6 +1926,36 @@ ray_t *q_decode(uint8_t *resp, int64_t resp_len, int compressed, char *err,
     return NULL;
   }
   return result;
+}
+
+ray_t *q_decode(uint8_t *resp, int64_t resp_len, int compressed, char *err,
+                size_t errlen) {
+  return q_decode_with(resp, resp_len, compressed, NULL, err, errlen);
+}
+
+ray_t *q_decode_cols(uint8_t *resp, int64_t resp_len, int compressed,
+                     const char *const *cols, int ncols, char *err,
+                     size_t errlen) {
+  if (ncols < 0 || (ncols > 0 && cols == NULL)) {
+    q_set_err(err, errlen, "q: invalid column list");
+    return NULL;
+  }
+  for (int j = 0; j < ncols; j++) {
+    if (cols[j] == NULL) {
+      q_set_err(err, errlen, "q: null column name");
+      return NULL;
+    }
+    for (int i = 0; i < j; i++) {
+      if (strcmp(cols[i], cols[j]) != 0)
+        continue;
+      if (err != NULL && errlen > 0)
+        snprintf(err, errlen, "q: column `%s` named twice", cols[j]);
+      return NULL;
+    }
+  }
+  q_proj_t proj = {cols, ncols};
+  return q_decode_with(resp, resp_len, compressed, ncols > 0 ? &proj : NULL,
+                       err, errlen);
 }
 
 ray_t *q_send(int fd, ray_t *msg, char *err, size_t errlen) {

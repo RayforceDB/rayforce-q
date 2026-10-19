@@ -73,6 +73,19 @@ int q_exchange(int fd, const uint8_t *req, int64_t req_len, uint8_t **resp,
 ray_t *q_decode(uint8_t *resp, int64_t resp_len, int compressed, char *err,
                 size_t errlen);
 
+/* As q_decode, but a table comes back with only the named columns, in the
+ * order named (as q's cols#t). The other columns are skipped by their
+ * serialized length: not allocated, not interned, and not checked beyond
+ * their length, so a column q_decode rejects (a timespan) can be skipped. For
+ * a keyed table the key columns always come back and the names pick among
+ * the value columns; naming a key column is allowed and changes nothing. A
+ * name the table lacks is a RAY_ERROR naming it. A NULL or repeated name
+ * returns NULL with err set. With ncols == 0, or a message that is not a
+ * table, this is q_decode. A compressed message still decompresses whole. */
+ray_t *q_decode_cols(uint8_t *resp, int64_t resp_len, int compressed,
+                     const char *const *cols, int ncols, char *err,
+                     size_t errlen);
+
 /* Convenience: q_encode + q_exchange + q_decode, all under the caller's
  * current lock. Bindings that need to release a lock around the network wait
  * should call the three steps directly instead. Returns the decoded object
