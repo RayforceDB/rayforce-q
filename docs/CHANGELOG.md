@@ -2,6 +2,24 @@
 
 All notable changes to `rayforce-q` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/), and the project adheres to [Semantic Versioning](https://semver.org/). Bindings pin a tag, so each release is a stable point they can build against.
 
+## [2.5.0]
+
+Built and tested (`make test` with a real q) against rayforce core `master`
+at `5d5f47c2` (v2.11.5); the core did not change.
+
+### Added
+
+- **`q_decode_cols`** decodes a table message keeping only the named
+  columns, in the order named, as q's `` cols#t `` does. The other columns are
+  skipped by their serialized length: nothing is allocated for a string cell
+  and no symbol is interned, so a column `q_decode` rejects (a timespan) can
+  be skipped too. For a keyed table the key comes back whole and the names
+  pick among the value columns. A name the table lacks is a `RAY_ERROR`
+  naming it. With no names, or for a message that is not a table, it is
+  `q_decode`. On a 100 000-row, 142-column window kept to 23 columns, it
+  decodes in ~43 ms against `q_decode`'s ~182 ms; a message holding only
+  those 23 columns decodes in ~37 ms.
+
 ## [2.4.0]
 
 Built and tested (`make test` with a real q) against rayforce core `dev` at
