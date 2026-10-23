@@ -21,7 +21,10 @@ git tags (e.g. `1.0.0`).
 against. Its requirements:
 
 - Include paths: the core's public `include/` (for `<rayforce.h>`) **and** its
-  `src/` (for the internal `table/sym.h`, used by `RAY_SYM_W64`).
+  `src/` (for the internal `table/sym.h`, used by `RAY_SYM_W64`, and
+  `core/ipc.h` and `core/sock.h`, for keepalive).
+- A core with `ray_sock_set_keepalive`: v2.11.0 or later (core #589).
+  `q.c` uses it and its constants, so an older core fails to compile.
 - No other dependencies. `q.c` defines its own `RAY_ATTR_DICT` and
   `ray_scalar_elem_size` fallbacks, so it needs nothing from your binding.
 - Standard POSIX sockets (`<sys/socket.h>`, `<netdb.h>`).
@@ -46,6 +49,9 @@ the client is thread-safe and unbounded.
 ```c
 int    q_connect(const char *host, int port, const char *user,
                   const char *password, int timeout_ms);   /* -> fd >= 0, or Q_ERR_* */
+int    q_connect_opts(const char *host, int port, const char *user,
+                      const char *password, int timeout_ms,
+                      int keepalive_ms);                   /* q_connect, keepalive chosen */
 int    q_close(int fd);
 ray_t *q_send(int fd, ray_t *msg, char *err, size_t n);   /* convenience: encode+exchange+decode */
 ```
@@ -66,6 +72,37 @@ Your glue does two jobs:
    - `q_connect` < 0: branch on `Q_ERR_SOCKET` / `Q_ERR_HANDSHAKE` / `Q_ERR_TIMEOUT`.
    - `q_send` returns `NULL` → transport/serialization failure; the reason is in your `err` buffer.
    - `q_send` returns a `ray_t` that is itself a `RAY_ERROR`: a Q server-side error (the q error text is in both the error code and message). Surface it as a normal error, not a value.
+
+### Keepalive
+
+Every `q_connect` connection has kernel TCP keepalive, so a peer that vanishes
+without closing (a suspended host, a NAT or VPN that drops the flow) is
+noticed instead of a read waiting forever. `q_connect_opts` takes the same
+`keepalive_ms` as the core's `ray_ipc_connect_opts`:
+
+| `keepalive_ms`         | Armed                                                                  |
+|------------------------|------------------------------------------------------------------------|
+| `Q_KEEPALIVE_AUTO` (0) | keepalive at the core's 60 s default; no bound on unacknowledged data |
+| `Q_KEEPALIVE_OFF` (-1) | nothing                                                                |
+| `n > 0`                | keepalive at budget `n` ms, plus `TCP_USER_TIMEOUT` of `n` ms          |
+
+A budget maps onto the socket as the core's `ray_sock_set_keepalive` does: the
+first probe after `n/2` of idle, then a probe every `n/6`, each in whole
+seconds of at least 1. On Linux, with a budget, `TCP_USER_TIMEOUT` decides:
+the peer is dead at the first probe tick (`idle + k·interval`) at or after
+`n`, up to one interval late (25 s → 28 s). Otherwise (`Q_KEEPALIVE_AUTO`, or
+a budget on another platform) it is dead after three unanswered probes, at
+`idle + 3·interval` in whole seconds, which can come up to a third early
+(10 s → 8 s); `Q_KEEPALIVE_AUTO` is 60 s. Probes only go out while nothing is
+in flight, so a live peer that is slow to answer is never affected.
+`TCP_USER_TIMEOUT` also fails a send that stays unacknowledged for `n` ms
+(`TCP_RXT_CONNDROPTIME` on macOS), which includes a live peer that stops
+reading, so it comes only with an explicit budget.
+
+Keepalive is armed after the handshake, on the blocking socket, and survives
+`q_conn_attach`. Arming is best-effort, as in the core: if `SO_KEEPALIVE`
+itself fails, the connection is returned without keepalive; a tuning option
+the platform lacks or rejects keeps its system default.
 
 ### Releasing a runtime lock around the network wait
 
