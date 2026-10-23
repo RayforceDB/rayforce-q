@@ -28,7 +28,13 @@
 
 #include "q.h"
 
+#include "core/ipc.h"  /* RAY_IPC_KEEPALIVE_* */
+#include "core/sock.h" /* ray_sock_set_keepalive */
 #include "table/sym.h" /* RAY_SYM_W64 */
+
+_Static_assert(Q_KEEPALIVE_AUTO == RAY_IPC_KEEPALIVE_AUTO &&
+                   Q_KEEPALIVE_OFF == RAY_IPC_KEEPALIVE_OFF,
+               "q keepalive constants must mean what the core's do");
 
 #include <errno.h>
 #include <fcntl.h>
@@ -1724,6 +1730,12 @@ static int q_decompress(const uint8_t *src, int64_t src_len, uint8_t **out_buf,
 /* Public API */
 int q_connect(const char *host, int port, const char *user,
               const char *password, int timeout_ms) {
+  return q_connect_opts(host, port, user, password, timeout_ms,
+                        Q_KEEPALIVE_AUTO);
+}
+
+int q_connect_opts(const char *host, int port, const char *user,
+                   const char *password, int timeout_ms, int keepalive_ms) {
   if (host == NULL || host[0] == '\0' || port < 1 || port > 65535)
     return Q_ERR_SOCKET;
 
@@ -1776,6 +1788,16 @@ int q_connect(const char *host, int port, const char *user,
     close(fd);
     return Q_ERR_HANDSHAKE;
   }
+
+  /* A peer that vanishes without closing while nothing is in flight (a
+   * subscription waiting for pushes) is noticed only by keepalive. Armed on
+   * the blocking socket; q_conn_attach keeps it. Best-effort, as in the
+   * core's ray_ipc_connect_opts: failing to arm it leaves the link no worse
+   * than before. */
+  if (keepalive_ms == Q_KEEPALIVE_AUTO)
+    ray_sock_set_keepalive(fd, RAY_IPC_KEEPALIVE_DEFAULT_MS, false);
+  else if (keepalive_ms > 0)
+    ray_sock_set_keepalive(fd, keepalive_ms, true);
   return fd;
 }
 

@@ -34,6 +34,7 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <sys/time.h>
@@ -907,6 +908,139 @@ static int run_exchange_selftest(void) {
   return failures ? 1 : 0;
 }
 
+#if defined(TCP_KEEPIDLE)
+#define TEST_TCP_KEEPIDLE TCP_KEEPIDLE
+#elif defined(TCP_KEEPALIVE) /* macOS spelling */
+#define TEST_TCP_KEEPIDLE TCP_KEEPALIVE
+#endif
+
+static int sockopt_int(int fd, int level, int name) {
+  int v = -1;
+  socklen_t n = sizeof v;
+  return getsockopt(fd, level, name, &v, &n) < 0 ? -1 : v;
+}
+
+typedef struct {
+  const char *what;
+  int keepalive_ms; /* what q_connect_opts is given */
+  int on, idle, intvl, cnt;
+  int user_timeout_ms; /* 0 = not armed */
+} keepalive_case_t;
+
+static int expect_sockopt(const keepalive_case_t *c, const char *when,
+                          const char *opt, int got, int want) {
+  if (got == want)
+    return 0;
+  fprintf(stderr, "keepalive selftest: %s, %s: %s is %d, want %d\n", c->what,
+          when, opt, got, want);
+  return 1;
+}
+
+/* The core's mapping (ray_sock_set_keepalive): idle budget/2, interval
+ * budget/6, both whole seconds of at least 1, three probes. */
+static int expect_keepalive(const keepalive_case_t *c, const char *when,
+                            int fd) {
+  int failures = 0;
+  /* BSD reports a set boolean option as its flag bit, not 1. */
+  failures +=
+      expect_sockopt(c, when, "SO_KEEPALIVE",
+                     sockopt_int(fd, SOL_SOCKET, SO_KEEPALIVE) != 0, c->on);
+  if (c->on) {
+#ifdef TEST_TCP_KEEPIDLE
+    failures += expect_sockopt(c, when, "the keepalive idle time",
+                               sockopt_int(fd, IPPROTO_TCP, TEST_TCP_KEEPIDLE),
+                               c->idle);
+#endif
+#ifdef TCP_KEEPINTVL
+    failures +=
+        expect_sockopt(c, when, "TCP_KEEPINTVL",
+                       sockopt_int(fd, IPPROTO_TCP, TCP_KEEPINTVL), c->intvl);
+#endif
+#ifdef TCP_KEEPCNT
+    failures +=
+        expect_sockopt(c, when, "TCP_KEEPCNT",
+                       sockopt_int(fd, IPPROTO_TCP, TCP_KEEPCNT), c->cnt);
+#endif
+  }
+#if defined(TCP_USER_TIMEOUT)
+  failures += expect_sockopt(c, when, "TCP_USER_TIMEOUT",
+                             sockopt_int(fd, IPPROTO_TCP, TCP_USER_TIMEOUT),
+                             c->user_timeout_ms);
+#elif defined(TCP_RXT_CONNDROPTIME) /* macOS: whole seconds */
+  failures += expect_sockopt(c, when, "TCP_RXT_CONNDROPTIME",
+                             sockopt_int(fd, IPPROTO_TCP, TCP_RXT_CONNDROPTIME),
+                             c->user_timeout_ms / 1000);
+#endif
+  return failures;
+}
+
+/* --keepalive-selftest HOST PORT: connect to `driver --serve` with each
+ * keepalive choice and read the socket options back, before and after
+ * q_conn_attach, against the core's mapping. Mirrors the core's
+ * test_ipc_keepalive_sockopts. */
+static int run_keepalive_selftest(const char *host, int port) {
+  static const keepalive_case_t cases[] = {
+      /* q_connect: the core's 60 s default, no user timeout. */
+      {"q_connect", Q_KEEPALIVE_AUTO, 1, 30, 10, 3, 0},
+      /* A 4 s budget: 4000/6000 truncates to 0 and the core raises it to 1. */
+      {"a 4000 ms budget", 4000, 1, 2, 1, 3, 4000},
+      {"Q_KEEPALIVE_OFF", Q_KEEPALIVE_OFF, 0, 0, 0, 0, 0},
+  };
+  ray_runtime_t *rt = ray_runtime_create(0, NULL);
+  ray_poll_t *poll = rt ? ray_poll_create() : NULL;
+  if (poll == NULL) {
+    fprintf(stderr, "keepalive selftest: failed to create runtime/poll\n");
+    if (rt)
+      ray_runtime_destroy(rt);
+    return 1;
+  }
+
+  int failures = 0;
+  for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+    const keepalive_case_t *c = &cases[i];
+    int fd = c->keepalive_ms == Q_KEEPALIVE_AUTO
+                 ? q_connect(host, port, "", "", 5000)
+                 : q_connect_opts(host, port, "", "", 5000, c->keepalive_ms);
+    if (fd < 0) {
+      fprintf(stderr, "keepalive selftest: %s: cannot connect to %s:%d (%d)\n",
+              c->what, host, port, fd);
+      failures++;
+      continue;
+    }
+    failures += expect_keepalive(c, "connected", fd);
+    int64_t id = q_conn_attach(poll, fd);
+    if (id < 0) {
+      fprintf(stderr, "keepalive selftest: %s: q_conn_attach failed\n",
+              c->what);
+      q_close(fd);
+      failures++;
+      continue;
+    }
+    failures += expect_keepalive(c, "attached", fd);
+
+    if (c->keepalive_ms > 0) {
+      /* The link still answers with the options set. */
+      ray_t *msg = ray_str("(+ 1 2)", 7);
+      ray_t *r = q_conn_send(poll, id, msg);
+      if (r == NULL || r->type != -RAY_I64 || r->i64 != 3) {
+        char s[256];
+        fmt_into(r, s, sizeof s);
+        fprintf(stderr, "keepalive selftest: %s: (+ 1 2) answered %s\n",
+                c->what, s);
+        failures++;
+      }
+      release_any(r);
+      ray_release(msg);
+    }
+  }
+
+  /* Closes every attached connection. */
+  ray_poll_destroy(poll);
+  ray_runtime_destroy(rt);
+  printf("keepalive selftest: %s\n", failures ? "FAIL" : "ok");
+  return failures ? 1 : 0;
+}
+
 /* Send a q expression and return the raw response body to free(), or NULL. */
 static uint8_t *q_fetch(int fd, const char *expr, int64_t *len,
                         int *compressed) {
@@ -1023,6 +1157,9 @@ int main(int argc, char **argv) {
 
   if (argc >= 4 && strcmp(argv[1], "--cols-selftest") == 0)
     return run_cols_selftest(argv[2], atoi(argv[3]));
+
+  if (argc >= 4 && strcmp(argv[1], "--keepalive-selftest") == 0)
+    return run_keepalive_selftest(argv[2], atoi(argv[3]));
 
   if (argc >= 2 && strcmp(argv[1], "--exchange-selftest") == 0)
     return run_exchange_selftest();

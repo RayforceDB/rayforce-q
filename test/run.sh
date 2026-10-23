@@ -102,6 +102,9 @@ wait_for_port "$HOST" "$SERVERPORT" || { echo "driver --serve did not come up on
 echo "server up on $HOST:$SERVERPORT; running server round-trip tests..."
 "$DRIVER" --host "$HOST" --port "$SERVERPORT" "$RFL_DIR"/server/*.rfl
 
+echo "checking client keepalive socket options..."
+"$DRIVER" --keepalive-selftest "$HOST" "$SERVERPORT"
+
 echo "checking malformed Q frame handling..."
 python3 - "$HOST" "$SERVERPORT" <<'PY'
 import socket
