@@ -27,6 +27,14 @@
  */
 
 #include "q.h"
+/* q_decode_bounded is declared in q_server.h, so check the definition against
+ * it where the header ships beside q.c. A binding that copies q.c and q.h alone
+ * still builds. */
+#if defined(__has_include)
+#if __has_include("q_server.h")
+#include "q_server.h"
+#endif
+#endif
 
 #include "table/sym.h" /* RAY_SYM_W64 */
 
