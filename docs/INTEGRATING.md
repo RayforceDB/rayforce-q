@@ -88,18 +88,21 @@ noticed instead of a read waiting forever. `q_connect_opts` takes the same
 
 A budget maps onto the socket as the core's `ray_sock_set_keepalive` does: the
 first probe after `n/2` of idle, then a probe every `n/6`, each in whole
-seconds of at least 1. After three unanswered probes the peer is dead, at
-`n/2 + 3·n/6`: about `n` ms after the last thing it sent, a little more under
-6 s, where the 1 s floor rounds up. On Linux, with a budget, `TCP_USER_TIMEOUT`
-decides the moment probing gives up. Probes only go out while nothing is in
-flight, so a live peer that is slow to answer is never affected.
+seconds of at least 1. On Linux, with a budget, `TCP_USER_TIMEOUT` decides:
+the peer is dead at the first probe tick (`idle + k·interval`) at or after
+`n`, up to one interval late (25 s → 28 s). Otherwise (`Q_KEEPALIVE_AUTO`, or
+a budget on another platform) it is dead after three unanswered probes, at
+`idle + 3·interval` in whole seconds, which can come up to a third early
+(10 s → 8 s); `Q_KEEPALIVE_AUTO` is 60 s. Probes only go out while nothing is
+in flight, so a live peer that is slow to answer is never affected.
 `TCP_USER_TIMEOUT` also fails a send that stays unacknowledged for `n` ms
 (`TCP_RXT_CONNDROPTIME` on macOS), which includes a live peer that stops
 reading, so it comes only with an explicit budget.
 
 Keepalive is armed after the handshake, on the blocking socket, and survives
-`q_conn_attach`. A failure to arm it is ignored, as in the core: the
-connection is returned without keepalive.
+`q_conn_attach`. Arming is best-effort, as in the core: if `SO_KEEPALIVE`
+itself fails, the connection is returned without keepalive; a tuning option
+the platform lacks or rejects keeps its system default.
 
 ### Releasing a runtime lock around the network wait
 

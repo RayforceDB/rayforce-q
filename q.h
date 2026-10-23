@@ -68,8 +68,9 @@ int q_connect(const char *host, int port, const char *user,
 
 /* As q_connect, with the keepalive chosen: Q_KEEPALIVE_AUTO,
  * Q_KEEPALIVE_OFF, or a budget in ms. It is armed once the handshake has
- * succeeded; failing to arm it is ignored, and the connection is returned
- * without keepalive. */
+ * succeeded, best-effort as in the core: if SO_KEEPALIVE fails, the
+ * connection is returned without keepalive; a tuning option the platform
+ * lacks or rejects keeps its system default. */
 int q_connect_opts(const char *host, int port, const char *user,
                    const char *password, int timeout_ms, int keepalive_ms);
 

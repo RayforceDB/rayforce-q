@@ -24,7 +24,9 @@ Needs rayforce core v2.11.0 or later, for `ray_sock_set_keepalive` (core
   VPN tunnel reaped without a FIN, is now noticed, where a connection used
   to wait on it forever. Every caller gets it, `.q.connect` included. It is
   armed after the handshake and survives `q_conn_attach`. A failure to arm it
-  is ignored, as in the core.
+  is ignored, as in the core. The other side: an idle connection whose
+  network is down for 30-60 s or more (a Wi-Fi roam, a VPN reconnect) is now
+  closed, where it used to resume. `Q_KEEPALIVE_OFF` keeps the old behaviour.
 
 ## [2.5.0]
 
