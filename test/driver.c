@@ -1132,6 +1132,39 @@ static int is_big_vector(ray_t *v) {
   return x[0] == 7 && x[BIG_LONGS - 1] == BIG_LAST;
 }
 
+/* An async (`upd;v) cut to half, with `tail` behind it. Compressed, the
+ * decompression runs out of input and the decode is NULL. Plain, the vector
+ * runs past the frame and the decode is an error object. */
+static uint8_t *truncated_push(int compress, const uint8_t *tail,
+                               int64_t tail_len, int64_t *len) {
+  uint8_t body[sizeof UPD_PREFIX + 6 + 8 * 1000] = {0};
+  memcpy(body, UPD_PREFIX, sizeof UPD_PREFIX);
+  uint8_t *v = body + sizeof UPD_PREFIX;
+  uint32_t count = 1000;
+  v[0] = 7;
+  memcpy(v + 2, &count, sizeof count);
+  for (int i = 0; i < 1000; i++)
+    v[6 + 8 * i] = (uint8_t)(i % 7);
+  int64_t full = 0;
+  uint8_t *msg =
+      test_message(0, body, (int64_t)sizeof body, compress, NULL, 0, &full);
+  if (msg == NULL)
+    return NULL;
+  int64_t hdr = (int64_t)sizeof(test_q_header_t);
+  int64_t cut = hdr + (full - hdr) / 2;
+  uint32_t size = (uint32_t)cut;
+  memcpy(msg + 4, &size, sizeof size);
+  uint8_t *out = (uint8_t *)realloc(msg, (size_t)(cut + tail_len));
+  if (out == NULL) {
+    free(msg);
+    return NULL;
+  }
+  if (tail_len > 0)
+    memcpy(out + cut, tail, (size_t)tail_len);
+  *len = cut + tail_len;
+  return out;
+}
+
 /* Fork a peer on sv[1] that writes `out`, then reads until the other end
  * closes and answers nothing. A RESPONSE the test needs is queued in `out`,
  * since a response need not wait for its request. Returns its pid, or -1. */
@@ -1289,11 +1322,22 @@ static int frame_limit_client_checks(ray_poll_t *poll) {
          sizeof IDENTITY_REPLY);
   failures += attached_closes(poll, past_limit, (int64_t)sizeof past_limit,
                               "a 4 GiB header");
+
+  for (int compress = 0; compress <= 1; compress++) {
+    int64_t cut_len = 0;
+    uint8_t *cut = truncated_push(compress, IDENTITY_REPLY,
+                                  (int64_t)sizeof IDENTITY_REPLY, &cut_len);
+    failures += cut ? attached_closes(poll, cut, cut_len,
+                                      compress ? "a compressed push cut short"
+                                               : "a push cut short")
+                    : 1;
+    free(cut);
+  }
   return failures;
 }
 
 /* The listener side, against driver --serve: a connection it accepted keeps
- * the 256 MiB limit. */
+ * the 256 MiB limit, and an undecodable push there is dropped, not fatal. */
 static int frame_limit_listener_checks(const char *host, int port) {
   int failures = 0;
   int fd = q_connect(host, port, "", "", 5000);
@@ -1313,12 +1357,34 @@ static int frame_limit_listener_checks(const char *host, int port) {
     failures++;
   }
   q_close(fd);
+
+  fd = q_connect(host, port, "", "", 5000);
+  int64_t cut_len = 0;
+  uint8_t *cut = truncated_push(1, NULL, 0, &cut_len);
+  char err[128] = {0};
+  ray_t *ask = ray_str("(+ 1 1)", 7);
+  ray_t *r = NULL;
+  if (fd >= 0 && cut != NULL &&
+      send(fd, cut, (size_t)cut_len, 0) == (ssize_t)cut_len)
+    r = q_send(fd, ask, err, sizeof err);
+  if (r == NULL || RAY_IS_ERR(r)) {
+    fprintf(stderr,
+            "frame-limit selftest: listener closed on an undecodable push: "
+            "%s\n",
+            err);
+    failures++;
+  }
+  release_any(r);
+  ray_release(ask);
+  free(cut);
+  if (fd >= 0)
+    q_close(fd);
   return failures;
 }
 
 /* --frame-limit-selftest HOST PORT: a connection rayforce-q opened takes
- * frames up to 2 GiB, and one the listener at HOST:PORT accepted keeps
- * 256 MiB. */
+ * frames up to 2 GiB and closes on a push it cannot decode. One the listener
+ * at HOST:PORT accepted keeps 256 MiB and survives such a push. */
 static int run_frame_limit_selftest(const char *host, int port) {
   ray_runtime_t *rt = ray_runtime_create(0, NULL);
   ray_poll_t *poll = rt ? ray_poll_create() : NULL;

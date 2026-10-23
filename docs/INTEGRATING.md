@@ -113,6 +113,14 @@ cannot make your process allocate more than that. A frame over its limit
 fails the read, and the connection is closed. Messages over 2 GiB need a
 later capability in the handshake, which rayforce-q does not offer.
 
+A frame pushed on an attached connection that does not decode, such as a
+compressed one cut short, closes the connection and logs the reason with the
+frame's size. Your subscription sees it closed and can reconnect, rather
+than carry on with a hole where that frame was. A pushed frame that decodes
+and whose handler raises an error is only logged, and the connection stays.
+A connection the listener accepted answers a bad sync request with an error
+and drops a bad async one, as before.
+
 The memory is yours to budget. At its peak a frame is held as received, then
 decompressed if it came compressed, then decoded into `ray_t`s: about twice
 its uncompressed size. A q publisher's catch-up can be large. One measured

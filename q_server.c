@@ -437,6 +437,23 @@ static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
     return NULL;
   }
 
+  /* A frame a connection this process opened cannot decode is a hole in what
+   * its peer sent. Nothing fills it: the peer will not send it again, and
+   * the handler that should have seen it never runs. Closing makes the hole
+   * a dead connection, which a subscriber notices and reconnects from. A q
+   * peer cannot push an error value, so an error here is the decode's own.
+   * An inbound peer gets the error instead, below, as it always has. */
+  if (cd->outbound && (req == NULL || RAY_IS_ERR(req))) {
+    fprintf(stderr,
+            "q: a pushed frame of %u bytes did not decode, closing the "
+            "connection: %s\n",
+            (unsigned)hdr.size,
+            req ? ray_err_code(req) : (err[0] ? err : "decode failed"));
+    q_release_any(req);
+    ray_poll_deregister(poll, id);
+    return NULL;
+  }
+
   /* Published for the handler's duration only, and restored rather than
    * cleared: a handler that pumps another connection (a .q.send on it)
    * dispatches that connection's frames from inside this one. */

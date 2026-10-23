@@ -14,6 +14,11 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
   decompression refused it. A connection a `q_serve` listener accepted keeps
   256 MiB, so a stranger cannot make the process allocate more. A frame costs
   about twice its uncompressed size in memory at its peak.
+- **An attached connection closes on a push it cannot decode**, and logs the
+  reason with the frame's size. It used to log "q: async message raised an
+  error", drop the frame and stay open, so a subscriber carried on missing
+  that data with nothing to make it reconnect. A push whose handler raises is
+  still only logged. A connection a `q_serve` listener accepted is unchanged.
 
 ## [2.5.0]
 
