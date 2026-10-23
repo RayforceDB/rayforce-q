@@ -12,13 +12,21 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
   connection under `q_conn_attach`. A q publisher's catch-up passed the old
   limit: a frame of 661 MiB uncompressed came in 116 MiB on the wire, and
   decompression refused it. A connection a `q_serve` listener accepted keeps
-  256 MiB, so a stranger cannot make the process allocate more. A frame costs
-  about twice its uncompressed size in memory at its peak.
-- **An attached connection closes on a push it cannot decode**, and logs the
-  reason with the frame's size. It used to log "q: async message raised an
-  error", drop the frame and stay open, so a subscriber carried on missing
-  that data with nothing to make it reconnect. A push whose handler raises is
-  still only logged. A connection a `q_serve` listener accepted is unchanged.
+  256 MiB, so a stranger cannot make the process allocate more. Decoding a
+  frame adds several times its uncompressed size in memory: a 661 MiB frame
+  peaked at about 3 GB.
+- **An attached connection closes on a frame it cannot decode**, and logs the
+  reason with the frame's size. That covers a frame cut short, a q type
+  rayforce-q does not decode, such as a timespan or a lambda, and running out
+  of memory, on an async push or a sync request alike. It used to log "q:
+  async message raised an error", drop the frame and stay open, so a
+  subscriber carried on missing that data with nothing to make it reconnect.
+  The failure repeats on every replay of that frame, so a subscriber should
+  back off between reconnects. A frame whose handler raises is still only
+  logged. A connection a `q_serve` listener accepted is unchanged.
+- **A decode error carries its whole text** in its message, where
+  `ray_error_msg()` reads it. Its code still holds only the first 7 bytes, as
+  before, so "q: buffer underflow (vec body)" no longer reads "q: buff".
 
 ## [2.5.0]
 

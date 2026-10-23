@@ -452,8 +452,10 @@ static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
   /* A frame a connection this process opened cannot decode is a hole in what
    * its peer sent. Nothing fills it: the peer will not send it again, and
    * the handler that should have seen it never runs. Closing makes the hole
-   * a dead connection, which a subscriber notices and reconnects from. A q
-   * peer cannot push an error value, so an error here is the decode's own.
+   * a dead connection, which a subscriber notices and reconnects from. A kdb+
+   * peer cannot push an error value, so from one an error here is the
+   * decode's own. A rayforce-q peer can, since q_encode writes an error as
+   * one, and that is treated the same: the subscriber cannot use it either.
    * An inbound peer gets the error instead, below, as it always has. */
   if (cd->outbound && (req == NULL || RAY_IS_ERR(req))) {
     if (hdr.compressed)

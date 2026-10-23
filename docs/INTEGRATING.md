@@ -109,22 +109,34 @@ header, the most the classic q header can declare. That covers `q_connect`'s
 responses, read through `q_send` or `q_exchange` with `q_decode` or
 `q_decode_cols`, and a connection `q_conn_attach` put under a poll. A
 connection a `q_serve` listener accepted is held to 256 MiB, so a stranger
-cannot make your process allocate more than that. A frame over its limit
-fails the read, and the connection is closed. Messages over 2 GiB need a
+cannot make your process allocate more than that. Messages over 2 GiB need a
 later capability in the handshake, which rayforce-q does not offer.
 
-A frame pushed on an attached connection that does not decode, such as a
-compressed one cut short, closes the connection and logs the reason with the
-frame's size. Your subscription sees it closed and can reconnect, rather
-than carry on with a hole where that frame was. A pushed frame that decodes
-and whose handler raises an error is only logged, and the connection stays.
-A connection the listener accepted answers a bad sync request with an error
-and drops a bad async one, as before.
+A frame whose header declares more than its limit fails the read, and the
+connection is closed. A compressed frame can declare a small size on the wire
+and an uncompressed size over the limit. Decompression refuses that one, and
+it fails like any frame that does not decode, by the rules below. `q_send`
+shuts the connection down. A caller of `q_exchange` and `q_decode` gets the
+error, and the connection stays open.
 
-The memory is yours to budget. At its peak a frame is held as received, then
-decompressed if it came compressed, then decoded into `ray_t`s: about twice
-its uncompressed size. A q publisher's catch-up can be large. One measured
-at 661 MiB uncompressed came in 116 MiB on the wire.
+A frame on an attached connection that does not decode closes the connection
+and logs the reason with the frame's size. That holds for a sync request from
+the peer too, which gets no reply. A frame fails to decode when it is cut
+short, when it holds a q type rayforce-q does not decode, such as a timespan
+or a lambda, or when memory runs out while decoding it. Your subscription sees
+the connection closed and can reconnect, rather than carry on with a hole
+where that frame was. The failure is permanent for that frame. A subscriber
+that replays from the start meets it again on every reconnect, so back off
+between attempts. A frame that decodes and whose handler raises an error is
+only logged, and the connection stays. A connection the listener accepted
+answers a bad sync request with an error and drops a bad async one, as before.
+
+The memory is yours to budget. While a frame decodes, the body as received,
+its decompressed copy and the decoded `ray_t`s are all alive. The decoded
+objects alone can take several times the input, depending on the data's
+shape. Measured on real frames, decoding added about 4.4 times the
+uncompressed size: a frame of 661 MiB uncompressed, 116 MiB on the wire,
+peaked at about 3 GB.
 
 ### Reference: CPython binding
 
