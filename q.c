@@ -142,6 +142,10 @@ static void q_suppress_sigpipe(int fd) {
 #endif
 }
 
+/* A decode error. ray_error keeps only the first 7 bytes of its code, so the
+ * text goes in the message too, where ray_error_msg() reads it whole. */
+static ray_t *q_des_err(const char *msg) { return ray_error(msg, "%s", msg); }
+
 /* Build a v2 table from a RAY_SYM-vec of column ids and an array of column
  * vectors. Retains each column internally; the caller keeps ownership of the
  * inputs. (Local copy so q has no binding-specific dependencies.) */
@@ -149,20 +153,20 @@ static ray_t *q_build_table(const int64_t *col_ids, ray_t *const *cols,
                             int64_t ncols) {
   ray_t *tbl = ray_table_new(ncols);
   if (tbl == NULL)
-    return ray_error("table_new failed", NULL);
+    return q_des_err("table_new failed");
   if (RAY_IS_ERR(tbl))
     return tbl;
   for (int64_t i = 0; i < ncols; i++) {
     if (cols[i] == NULL) {
       ray_release(tbl);
-      return ray_error("table column is null", NULL);
+      return q_des_err("table column is null");
     }
     /* ray_table_add_col retains the column internally and may return a new
      * pointer on realloc. It consumes tbl on every path, failure included,
      * so a failed add has already released it. */
     ray_t *res = ray_table_add_col(tbl, col_ids[i], cols[i]);
     if (res == NULL || RAY_IS_ERR(res))
-      return res ? res : ray_error("table_add_col failed", NULL);
+      return res ? res : q_des_err("table_add_col failed");
     tbl = res;
   }
   return tbl;
@@ -385,7 +389,7 @@ static ray_t *q_make_table(ray_t *keys, ray_t *vals) {
       ray_release(keys);
     if (vals)
       ray_release(vals);
-    return ray_error("q: malformed table — expected (sym-vec, list)", NULL);
+    return q_des_err("q: malformed table — expected (sym-vec, list)");
   }
   ray_t *tbl = q_build_table((const int64_t *)ray_data(keys),
                              (ray_t *const *)ray_data(vals), keys->len);
@@ -413,7 +417,7 @@ static ray_t *q_make_dict(ray_t *keys, ray_t *vals) {
   if (keys->type == RAY_TABLE || vals->type == RAY_TABLE) {
     ray_release(keys);
     ray_release(vals);
-    return ray_error("q: unsupported table dictionary", NULL);
+    return q_des_err("q: unsupported table dictionary");
   }
   return ray_dict_new(keys, vals); /* consumes both refs */
 }
@@ -791,7 +795,7 @@ static int64_t q_ser_obj(uint8_t *buf, ray_t *obj) {
 #define Q_NEED(n)                                                              \
   do {                                                                         \
     if (*len < (int64_t)(n))                                                   \
-      return ray_error("q: buffer underflow", NULL);                           \
+      return q_des_err("q: buffer underflow");                                 \
   } while (0)
 
 /* Decode a width-byte atom and re-tag as the requested ray_type */
@@ -914,18 +918,18 @@ static ray_t *q_des_vec_i(uint8_t **buf, int64_t *len, int8_t ray_type,
                           int width) {
   int32_t n;
   if (q_read_vec_header(buf, len, &n) < 0)
-    return ray_error("q: buffer underflow", NULL);
+    return q_des_err("q: buffer underflow");
   if (n < 0)
-    return ray_error("q: negative vector length", NULL);
+    return q_des_err("q: negative vector length");
   int64_t bytes = (int64_t)n * width;
   if (*len < bytes)
-    return ray_error("q: buffer underflow (vec body)", NULL);
+    return q_des_err("q: buffer underflow (vec body)");
 
   ray_t *vec = ray_vec_new(ray_type, n);
   if (vec == NULL || RAY_IS_ERR(vec)) {
     if (vec)
       ray_release(vec);
-    return ray_error("q: vector alloc failed", NULL);
+    return q_des_err("q: vector alloc failed");
   }
   memcpy(ray_data(vec), *buf, bytes);
   vec->len = n;
@@ -1005,17 +1009,17 @@ static ray_t *q_des_vec_i32_conv(uint8_t **buf, int64_t *len, int8_t ray_type,
                                  int32_t arg) {
   int32_t n;
   if (q_read_vec_header(buf, len, &n) < 0)
-    return ray_error("q: buffer underflow", NULL);
+    return q_des_err("q: buffer underflow");
   if (n < 0)
-    return ray_error("q: negative vector length", NULL);
+    return q_des_err("q: negative vector length");
   int64_t bytes = (int64_t)n * 4;
   if (*len < bytes)
-    return ray_error("q: buffer underflow (vec body)", NULL);
+    return q_des_err("q: buffer underflow (vec body)");
   ray_t *vec = ray_vec_new(ray_type, n);
   if (vec == NULL || RAY_IS_ERR(vec)) {
     if (vec)
       ray_release(vec);
-    return ray_error("q: vector alloc failed", NULL);
+    return q_des_err("q: vector alloc failed");
   }
   int32_t *out = (int32_t *)ray_data(vec);
   for (int32_t i = 0; i < n; i++) {
@@ -1032,9 +1036,9 @@ static ray_t *q_des_vec_i32_conv(uint8_t **buf, int64_t *len, int8_t ray_type,
 
 static ray_t *q_des_obj(uint8_t **buf, int64_t *len, int depth) {
   if (depth > Q_MAX_NESTING)
-    return ray_error("q: maximum nesting exceeded", NULL);
+    return q_des_err("q: maximum nesting exceeded");
   if (*len < 1)
-    return ray_error("q: buffer underflow (type)", NULL);
+    return q_des_err("q: buffer underflow (type)");
 
   int8_t type = (int8_t)**buf;
   (*buf)++;
@@ -1107,11 +1111,11 @@ static ray_t *q_des_obj(uint8_t **buf, int64_t *len, int depth) {
     while (n < *len && (*buf)[n] != '\0')
       n++;
     if (n >= *len)
-      return ray_error("q: symbol not null-terminated", NULL);
+      return q_des_err("q: symbol not null-terminated");
     int64_t id = ray_sym_intern((const char *)*buf, (size_t)n);
     *buf += n + 1;
     *len -= n + 1;
-    return (id < 0) ? ray_error("q: symbol intern failed", NULL) : ray_sym(id);
+    return (id < 0) ? q_des_err("q: symbol intern failed") : ray_sym(id);
   }
   case -Q_UU: {
     Q_NEED(16);
@@ -1147,17 +1151,17 @@ static ray_t *q_des_obj(uint8_t **buf, int64_t *len, int depth) {
   case Q_KZ: {
     int32_t n;
     if (q_read_vec_header(buf, len, &n) < 0)
-      return ray_error("q: buffer underflow", NULL);
+      return q_des_err("q: buffer underflow");
     if (n < 0)
-      return ray_error("q: negative datetime-vec length", NULL);
+      return q_des_err("q: negative datetime-vec length");
     int64_t bytes = (int64_t)n * 8;
     if (*len < bytes)
-      return ray_error("q: buffer underflow (datetime-vec)", NULL);
+      return q_des_err("q: buffer underflow (datetime-vec)");
     ray_t *vec = ray_vec_new(RAY_TIMESTAMP, n);
     if (vec == NULL || RAY_IS_ERR(vec)) {
       if (vec)
         ray_release(vec);
-      return ray_error("q: vector alloc failed", NULL);
+      return q_des_err("q: vector alloc failed");
     }
     int64_t *out = (int64_t *)ray_data(vec);
     for (int32_t i = 0; i < n; i++) {
@@ -1175,17 +1179,17 @@ static ray_t *q_des_obj(uint8_t **buf, int64_t *len, int depth) {
     /* Real (4-byte float) vector — convert to F64 vec for v2. */
     int32_t n;
     if (q_read_vec_header(buf, len, &n) < 0)
-      return ray_error("q: buffer underflow", NULL);
+      return q_des_err("q: buffer underflow");
     if (n < 0)
-      return ray_error("q: negative real-vec length", NULL);
+      return q_des_err("q: negative real-vec length");
     int64_t bytes = (int64_t)n * 4;
     if (*len < bytes)
-      return ray_error("q: buffer underflow (real-vec)", NULL);
+      return q_des_err("q: buffer underflow (real-vec)");
     ray_t *vec = ray_vec_new(RAY_F64, n);
     if (vec == NULL || RAY_IS_ERR(vec)) {
       if (vec)
         ray_release(vec);
-      return ray_error("q: vector alloc failed", NULL);
+      return q_des_err("q: vector alloc failed");
     }
     double *out = (double *)ray_data(vec);
     for (int32_t i = 0; i < n; i++) {
@@ -1207,11 +1211,11 @@ static ray_t *q_des_obj(uint8_t **buf, int64_t *len, int depth) {
     /* KC vector → RAY_STR atom of length n */
     int32_t n;
     if (q_read_vec_header(buf, len, &n) < 0)
-      return ray_error("q: buffer underflow", NULL);
+      return q_des_err("q: buffer underflow");
     if (n < 0)
-      return ray_error("q: negative char-vec length", NULL);
+      return q_des_err("q: negative char-vec length");
     if (*len < n)
-      return ray_error("q: buffer underflow (char-vec)", NULL);
+      return q_des_err("q: buffer underflow (char-vec)");
     ray_t *s = ray_str((const char *)*buf, (size_t)n);
     *buf += n;
     *len -= n;
@@ -1220,16 +1224,16 @@ static ray_t *q_des_obj(uint8_t **buf, int64_t *len, int depth) {
   case Q_KS: {
     int32_t n;
     if (q_read_vec_header(buf, len, &n) < 0)
-      return ray_error("q: buffer underflow", NULL);
+      return q_des_err("q: buffer underflow");
     if (n < 0)
-      return ray_error("q: negative symbol-vec length", NULL);
+      return q_des_err("q: negative symbol-vec length");
     if ((int64_t)n > *len)
-      return ray_error("q: symbol vector exceeds remaining frame", NULL);
+      return q_des_err("q: symbol vector exceeds remaining frame");
     ray_t *vec = ray_sym_vec_new(RAY_SYM_W64, n);
     if (vec == NULL || RAY_IS_ERR(vec)) {
       if (vec)
         ray_release(vec);
-      return ray_error("q: symbol vector alloc failed", NULL);
+      return q_des_err("q: symbol vector alloc failed");
     }
     int64_t *ids = (int64_t *)ray_data(vec);
     for (int32_t i = 0; i < n; i++) {
@@ -1238,12 +1242,12 @@ static ray_t *q_des_obj(uint8_t **buf, int64_t *len, int depth) {
         k++;
       if (k >= *len) {
         ray_release(vec);
-        return ray_error("q: symbol not null-terminated in vec", NULL);
+        return q_des_err("q: symbol not null-terminated in vec");
       }
       int64_t id = ray_sym_intern((const char *)*buf, (size_t)k);
       if (id < 0) {
         ray_release(vec);
-        return ray_error("q: symbol intern failed", NULL);
+        return q_des_err("q: symbol intern failed");
       }
       ids[i] = id;
       *buf += k + 1;
@@ -1256,20 +1260,20 @@ static ray_t *q_des_obj(uint8_t **buf, int64_t *len, int depth) {
   case 0: { /* general list */
     int32_t n;
     if (q_read_vec_header(buf, len, &n) < 0)
-      return ray_error("q: buffer underflow", NULL);
+      return q_des_err("q: buffer underflow");
     if (n < 0)
-      return ray_error("q: negative list length", NULL);
+      return q_des_err("q: negative list length");
     ray_t *list = ray_list_new(0);
     for (int32_t i = 0; i < n; i++) {
       ray_t *elem = q_des_obj(buf, len, depth + 1);
       if (elem == NULL || RAY_IS_ERR(elem)) {
         ray_release(list);
-        return elem ? elem : ray_error("q: list element decode failed", NULL);
+        return elem ? elem : q_des_err("q: list element decode failed");
       }
       list = ray_list_append(list, elem);
       ray_release(elem); /* append retains its own ref; drop ours */
       if (list == NULL || RAY_IS_ERR(list))
-        return list ? list : ray_error("q: list append failed", NULL);
+        return list ? list : q_des_err("q: list append failed");
     }
     return list;
   }
@@ -1277,7 +1281,7 @@ static ray_t *q_des_obj(uint8_t **buf, int64_t *len, int depth) {
   case Q_XT: { /* table = attrs(0) + dict_marker(99) + keys + values */
     Q_NEED(2);
     if ((*buf)[0] != 0 || (*buf)[1] != Q_XD)
-      return ray_error("q: malformed table marker", NULL);
+      return q_des_err("q: malformed table marker");
     (*buf) += 2;
     *len -= 2;
     ray_t *keys = q_des_obj(buf, len, depth + 1);
@@ -1311,7 +1315,7 @@ static ray_t *q_des_obj(uint8_t **buf, int64_t *len, int depth) {
     while (i < *len && s[i] != '\0')
       i++;
     if (i == *len)
-      return ray_error("q: malformed error frame", NULL);
+      return q_des_err("q: malformed error frame");
     *buf += i + 1;
     *len -= i + 1;
     /* Put the q error text in both the code (short, shown by ray_fmt) and the
@@ -1327,11 +1331,11 @@ static ray_t *q_des_obj(uint8_t **buf, int64_t *len, int depth) {
     *len -= 1;
     if (primitive == 0)
       return RAY_NULL_OBJ;
-    return ray_error("q: unsupported q primitive", NULL);
+    return q_des_err("q: unsupported q primitive");
   }
 
   default:
-    return ray_error("q: unsupported wire type", NULL);
+    return q_des_err("q: unsupported wire type");
   }
 }
 
@@ -1519,18 +1523,18 @@ static ray_t *q_des_table_cols(uint8_t **buf, int64_t *len, int depth,
                                const q_proj_t *proj, ray_t *key_tbl) {
   Q_NEED(4);
   if ((*buf)[1] != 0 || (*buf)[2] != Q_XD)
-    return ray_error("q: malformed table marker", NULL);
+    return q_des_err("q: malformed table marker");
   if ((*buf)[3] != Q_KS)
-    return ray_error("q: malformed table — expected (sym-vec, list)", NULL);
+    return q_des_err("q: malformed table — expected (sym-vec, list)");
   *buf += 4;
   *len -= 4;
   int32_t n;
   if (q_read_vec_header(buf, len, &n) < 0)
-    return ray_error("q: buffer underflow", NULL);
+    return q_des_err("q: buffer underflow");
   if (n < 0)
-    return ray_error("q: negative symbol-vec length", NULL);
+    return q_des_err("q: negative symbol-vec length");
   if ((int64_t)n > *len)
-    return ray_error("q: symbol vector exceeds remaining frame", NULL);
+    return q_des_err("q: symbol vector exceeds remaining frame");
 
   /* slot[i]: the proj index table column i fills, or -1 to skip it.
    * ids[j] / cols[j]: proj name j's interned id and decoded column. */
@@ -1541,7 +1545,7 @@ static ray_t *q_des_table_cols(uint8_t **buf, int64_t *len, int depth,
   int32_t nvals;
   int kept = 0;
   if (slot == NULL || ids == NULL || cols == NULL) {
-    res = ray_error("q: out of memory", NULL);
+    res = q_des_err("q: out of memory");
     goto done;
   }
   for (int j = 0; j < proj->n; j++)
@@ -1552,7 +1556,7 @@ static ray_t *q_des_table_cols(uint8_t **buf, int64_t *len, int depth,
     const uint8_t *name = *buf;
     const uint8_t *end = memchr(name, 0, (size_t)*len);
     if (end == NULL) {
-      res = ray_error("q: symbol not null-terminated in vec", NULL);
+      res = q_des_err("q: symbol not null-terminated in vec");
       goto done;
     }
     size_t k = (size_t)(end - name);
@@ -1562,7 +1566,7 @@ static ray_t *q_des_table_cols(uint8_t **buf, int64_t *len, int depth,
         continue;
       ids[j] = ray_sym_intern((const char *)name, k);
       if (ids[j] < 0) {
-        res = ray_error("q: symbol intern failed", NULL);
+        res = q_des_err("q: symbol intern failed");
         goto done;
       }
       slot[i] = j;
@@ -1583,31 +1587,31 @@ static ray_t *q_des_table_cols(uint8_t **buf, int64_t *len, int depth,
   }
 
   if (*len < 1 || (*buf)[0] != 0) {
-    res = ray_error("q: malformed table — expected (sym-vec, list)", NULL);
+    res = q_des_err("q: malformed table — expected (sym-vec, list)");
     goto done;
   }
   *buf += 1;
   *len -= 1;
   if (q_read_vec_header(buf, len, &nvals) < 0) {
-    res = ray_error("q: buffer underflow", NULL);
+    res = q_des_err("q: buffer underflow");
     goto done;
   }
   if (nvals != n) {
-    res = ray_error("q: malformed table — expected (sym-vec, list)", NULL);
+    res = q_des_err("q: malformed table — expected (sym-vec, list)");
     goto done;
   }
   for (int32_t i = 0; i < n; i++) {
     if (slot[i] < 0) {
       const char *e = q_skip_obj(buf, len, depth + 2);
       if (e != NULL) {
-        res = ray_error(e, NULL);
+        res = q_des_err(e);
         goto done;
       }
       continue;
     }
     ray_t *col = q_des_obj(buf, len, depth + 2);
     if (col == NULL || RAY_IS_ERR(col)) {
-      res = col ? col : ray_error("q: list element decode failed", NULL);
+      res = col ? col : q_des_err("q: list element decode failed");
       goto done;
     }
     cols[slot[i]] = col;
@@ -1640,7 +1644,7 @@ done:
  * — keeps only the columns proj names. */
 static ray_t *q_des_cols(uint8_t **buf, int64_t *len, const q_proj_t *proj) {
   if (*len < 1)
-    return ray_error("q: buffer underflow (type)", NULL);
+    return q_des_err("q: buffer underflow (type)");
   if ((*buf)[0] == Q_XT)
     return q_des_table_cols(buf, len, 0, proj, NULL);
   if ((*buf)[0] != Q_XD)

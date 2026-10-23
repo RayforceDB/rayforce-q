@@ -412,6 +412,18 @@ static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
   char err[128] = {0};
   ray_t *req = q_decode_bounded(cd->rx_body, cd->rx_body_len, hdr.compressed,
                                 q_conn_max_body(cd), err, sizeof err);
+  /* Kept for the close below. The error's code holds 7 bytes, and the next
+   * error made on this thread replaces its message, so copy the message now.
+   * A compressed frame's body opens with the size it declares uncompressed,
+   * which says more about a refused frame than its size on the wire. */
+  char reason[256] = {0};
+  if (req != NULL && RAY_IS_ERR(req)) {
+    const char *msg = ray_error_msg();
+    snprintf(reason, sizeof reason, "%s", msg ? msg : ray_err_code(req));
+  }
+  uint32_t size_uncompressed = 0;
+  if (hdr.compressed && cd->rx_body_len >= 4)
+    memcpy(&size_uncompressed, cd->rx_body, sizeof size_uncompressed);
   free(cd->rx_body);
   cd->rx_body = NULL;
   cd->rx_body_len = 0;
@@ -444,11 +456,18 @@ static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
    * peer cannot push an error value, so an error here is the decode's own.
    * An inbound peer gets the error instead, below, as it always has. */
   if (cd->outbound && (req == NULL || RAY_IS_ERR(req))) {
-    fprintf(stderr,
-            "q: a pushed frame of %u bytes did not decode, closing the "
-            "connection: %s\n",
-            (unsigned)hdr.size,
-            req ? ray_err_code(req) : (err[0] ? err : "decode failed"));
+    if (hdr.compressed)
+      fprintf(stderr,
+              "q: a pushed frame of %u bytes, %u uncompressed, did not "
+              "decode, closing the connection: %s\n",
+              (unsigned)hdr.size, (unsigned)size_uncompressed,
+              req ? reason : (err[0] ? err : "decode failed"));
+    else
+      fprintf(stderr,
+              "q: a pushed frame of %u bytes did not decode, closing the "
+              "connection: %s\n",
+              (unsigned)hdr.size,
+              req ? reason : (err[0] ? err : "decode failed"));
     q_release_any(req);
     ray_poll_deregister(poll, id);
     return NULL;
