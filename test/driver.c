@@ -1023,13 +1023,22 @@ static int run_cols_selftest(const char *host, int port) {
 /* ---- frame limits --------------------------------------------------- */
 
 /* A long vector past the listener's 256 MiB limit and under the client's
- * 2 GiB: 300 MiB of 7s whose last element differs, so a vector cut short
- * shows. */
+ * 2 GiB: 300 MiB in runs of a thousand equal elements, so it compresses to a
+ * few MiB yet a copy decompression zeroed or misplaced shows. The last
+ * element breaks the pattern, so a vector cut short shows too. */
 #define BIG_LONGS ((int64_t)300 * 1024 * 1024 / 8)
 #define BIG_LAST 42
 
+static int64_t big_elem(int64_t i, int64_t n) {
+  return i == n - 1 ? BIG_LAST : 1 + (i / 1000) % 250;
+}
+
 /* (`upd;...): a list of two whose first item is the symbol upd. */
 static const uint8_t UPD_PREFIX[] = {0, 0, 2, 0, 0, 0, 0xF5, 'u', 'p', 'd', 0};
+
+/* (`count;...), which the listener evaluates to the vector's length. */
+static const uint8_t COUNT_PREFIX[] = {0,   0,   2,   0,   0,   0, 0xF5,
+                                       'c', 'o', 'u', 'n', 't', 0};
 
 /* A RESPONSE carrying the identity. */
 static const uint8_t IDENTITY_REPLY[] = {1, 2, 0, 0, 10, 0, 0, 0, 101, 0};
@@ -1105,21 +1114,24 @@ static uint8_t *test_message(uint8_t msgtype, const uint8_t *body,
   return buf;
 }
 
-/* (`upd;v) where v is the big vector. The vector alone, a response's body,
- * starts sizeof UPD_PREFIX bytes in. */
-static uint8_t *big_push_body(int64_t *len) {
-  int64_t n = (int64_t)sizeof UPD_PREFIX + 6 + BIG_LONGS * 8;
-  uint8_t *b = (uint8_t *)calloc(1, (size_t)n);
+/* `prefix` then a vector of `longs` longs in big_elem's pattern. The vector
+ * alone, a response's body, starts prefix_len bytes in. */
+static uint8_t *call_body(const uint8_t *prefix, size_t prefix_len,
+                          int64_t longs, int64_t *len) {
+  int64_t n = (int64_t)prefix_len + 6 + longs * 8;
+  uint8_t *b = (uint8_t *)malloc((size_t)n);
   if (b == NULL)
     return NULL;
-  memcpy(b, UPD_PREFIX, sizeof UPD_PREFIX);
-  uint8_t *v = b + sizeof UPD_PREFIX;
-  uint32_t count = (uint32_t)BIG_LONGS;
+  memcpy(b, prefix, prefix_len);
+  uint8_t *v = b + prefix_len;
+  uint32_t count = (uint32_t)longs;
   v[0] = 7; /* long vector, no attribute */
+  v[1] = 0;
   memcpy(v + 2, &count, sizeof count);
-  for (int64_t i = 0; i < BIG_LONGS; i++)
-    v[6 + 8 * i] = 7;
-  v[6 + 8 * (BIG_LONGS - 1)] = BIG_LAST;
+  for (int64_t i = 0; i < longs; i++) {
+    int64_t x = big_elem(i, longs);
+    memcpy(v + 6 + 8 * i, &x, sizeof x);
+  }
   *len = n;
   return b;
 }
@@ -1129,7 +1141,10 @@ static int is_big_vector(ray_t *v) {
       ray_len(v) != BIG_LONGS)
     return 0;
   const int64_t *x = (const int64_t *)ray_data(v);
-  return x[0] == 7 && x[BIG_LONGS - 1] == BIG_LAST;
+  for (int64_t i = 0; i < BIG_LONGS; i++)
+    if (x[i] != big_elem(i, BIG_LONGS))
+      return 0;
+  return 1;
 }
 
 /* An async (`upd;v) cut to half, with `tail` behind it. Compressed, the
@@ -1298,7 +1313,8 @@ static int attached_closes(ray_poll_t *poll, const uint8_t *msg, int64_t len,
 static int frame_limit_client_checks(ray_poll_t *poll) {
   int failures = 0;
   int64_t body_len = 0;
-  uint8_t *body = big_push_body(&body_len);
+  uint8_t *body =
+      call_body(UPD_PREFIX, sizeof UPD_PREFIX, BIG_LONGS, &body_len);
   if (body == NULL) {
     fprintf(stderr, "frame-limit selftest: out of memory\n");
     return 1;
@@ -1336,6 +1352,62 @@ static int frame_limit_client_checks(ray_poll_t *poll) {
   return failures;
 }
 
+/* Send (`count;v), v of `longs` longs, to the listener on fd as a compressed
+ * sync request, and return its decoded reply. */
+static ray_t *listener_count(int fd, int64_t longs, char *err, size_t errlen) {
+  int64_t body_len = 0, len = 0;
+  uint8_t *body =
+      call_body(COUNT_PREFIX, sizeof COUNT_PREFIX, longs, &body_len);
+  uint8_t *msg =
+      body ? test_message(1, body, body_len, 1, NULL, 0, &len) : NULL;
+  free(body);
+  uint8_t *resp = NULL;
+  int64_t resp_len = 0;
+  int compressed = 0;
+  ray_t *r = NULL;
+  if (msg != NULL &&
+      q_exchange(fd, msg, len, &resp, &resp_len, &compressed, err, errlen) == 0)
+    r = q_decode(resp, resp_len, compressed, err, errlen);
+  free(msg);
+  free(resp);
+  return r;
+}
+
+/* A compressed request a few MiB on the wire that decompresses past 256 MiB
+ * is refused before it is evaluated: the reply is an error, not the count. A
+ * small request of the same shape is counted first, so the refusal is the
+ * limit's and not a malformed frame's. */
+static int listener_refuses_big_compressed(const char *host, int port) {
+  int fd = q_connect(host, port, "", "", 5000);
+  if (fd < 0) {
+    fprintf(stderr, "frame-limit selftest: cannot reach %s:%d\n", host, port);
+    return 1;
+  }
+  int failures = 0;
+  char err[128] = {0};
+  ray_t *r = listener_count(fd, 1000, err, sizeof err);
+  if (r == NULL || RAY_IS_ERR(r) || r->type != -RAY_I64 || r->i64 != 1000) {
+    fprintf(stderr,
+            "frame-limit selftest: listener did not count a small compressed "
+            "request: %s\n",
+            err);
+    failures++;
+  }
+  release_any(r);
+  err[0] = '\0';
+  r = listener_count(fd, BIG_LONGS, err, sizeof err);
+  if (r == NULL || !RAY_IS_ERR(r)) {
+    fprintf(stderr,
+            "frame-limit selftest: listener took a request decompressing to "
+            "300 MiB: %s\n",
+            r == NULL ? err : "it answered the count");
+    failures++;
+  }
+  release_any(r);
+  q_close(fd);
+  return failures;
+}
+
 /* The listener side, against driver --serve: a connection it accepted keeps
  * the 256 MiB limit, and an undecodable push there is dropped, not fatal. */
 static int frame_limit_listener_checks(const char *host, int port) {
@@ -1357,6 +1429,8 @@ static int frame_limit_listener_checks(const char *host, int port) {
     failures++;
   }
   q_close(fd);
+
+  failures += listener_refuses_big_compressed(host, port);
 
   fd = q_connect(host, port, "", "", 5000);
   int64_t cut_len = 0;
