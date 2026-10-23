@@ -69,8 +69,14 @@ typedef struct {
 #define Q_MSG_ASYNC 0
 #define Q_MSG_SYNC 1
 #define Q_MSG_RESPONSE 2
-#define Q_CAP_MAX 3                     /* matches q.c client capability  */
-#define Q_MAX_BODY ((int64_t)256 << 20) /* reject absurd frames (256 MiB) */
+#define Q_CAP_MAX 3 /* matches q.c client capability  */
+/* A connection the listener accepted may come from anyone, so its frames
+ * are capped at 256 MiB, which bounds what a stranger can make this process
+ * allocate. One q_conn_attach took was opened by this process to a peer it
+ * chose, and gets what the classic header can declare, as in q.c. The replies
+ * q_send_result queues stay within 256 MiB on either. */
+#define Q_MAX_BODY ((int64_t)256 << 20)
+#define Q_MAX_CLIENT_BODY ((int64_t)INT32_MAX - (int64_t)sizeof(q_header_t))
 #define Q_RX_CHUNK_SIZE ((int64_t)64 << 10)
 #define Q_MAX_HANDSHAKE 512             /* credential blob upper bound    */
 #define Q_CONN_MAGIC UINT32_C(0x7150434e)
@@ -103,6 +109,10 @@ typedef struct {
 static int64_t q_current_handle = -1;
 
 int64_t q_conn_current(void) { return q_current_handle; }
+
+static int64_t q_conn_max_body(const q_conn_t *cd) {
+  return cd->outbound ? Q_MAX_CLIENT_BODY : Q_MAX_BODY;
+}
 
 static void q_release_any(ray_t *obj) {
   if (obj == NULL)
@@ -312,7 +322,7 @@ static ray_t *q_read_header(ray_poll_t *poll, ray_selector_t *sel) {
     return NULL;
   }
   int64_t body = (int64_t)cd->hdr.size - (int64_t)sizeof(q_header_t);
-  if (body < 0 || body > Q_MAX_BODY) {
+  if (body < 0 || body > q_conn_max_body(cd)) {
     ray_poll_deregister(poll, sel->id);
     return NULL;
   }
@@ -400,8 +410,8 @@ static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
   q_header_t hdr = cd->hdr;
   int64_t id = sel->id;
   char err[128] = {0};
-  ray_t *req = q_decode(cd->rx_body, cd->rx_body_len, hdr.compressed, err,
-                       sizeof err);
+  ray_t *req = q_decode_bounded(cd->rx_body, cd->rx_body_len, hdr.compressed,
+                                q_conn_max_body(cd), err, sizeof err);
   free(cd->rx_body);
   cd->rx_body = NULL;
   cd->rx_body_len = 0;

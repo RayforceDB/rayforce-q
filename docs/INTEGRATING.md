@@ -102,6 +102,22 @@ const char *keep[] = {"date", "sym", "px"};
 ray_t *result = q_decode_cols(resp, resp_len, compressed, keep, 3, err, sizeof err);
 ```
 
+### How large a frame can be
+
+A connection your process opened takes frames up to 2 GiB less the 8-byte
+header, the most the classic q header can declare. That covers `q_connect`'s
+responses, read through `q_send` or `q_exchange` with `q_decode` or
+`q_decode_cols`, and a connection `q_conn_attach` put under a poll. A
+connection a `q_serve` listener accepted is held to 256 MiB, so a stranger
+cannot make your process allocate more than that. A frame over its limit
+fails the read, and the connection is closed. Messages over 2 GiB need a
+later capability in the handshake, which rayforce-q does not offer.
+
+The memory is yours to budget. At its peak a frame is held as received, then
+decompressed if it came compressed, then decoded into `ray_t`s: about twice
+its uncompressed size. A q publisher's catch-up can be large. One measured
+at 661 MiB uncompressed came in 116 MiB on the wire.
+
 ### Reference: CPython binding
 
 The Python binding (`rayforce-py`) is the canonical example. A thin glue layer

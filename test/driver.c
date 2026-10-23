@@ -33,7 +33,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <arpa/inet.h>
+#include <errno.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <sys/time.h>
@@ -634,9 +636,10 @@ static int run_codec_selftest(void) {
   }
   release_any(r);
 
+  /* The most a classic header can declare is past even the client's
+   * limit, so this is refused before anything is allocated. */
   uint8_t oversized_compressed[4];
-  uint32_t oversized_size =
-      (uint32_t)((256u << 20) + sizeof(test_q_header_t) + 1u);
+  uint32_t oversized_size = UINT32_MAX;
   memcpy(oversized_compressed, &oversized_size, sizeof oversized_size);
   err[0] = '\0';
   r = q_decode(oversized_compressed, (int64_t)sizeof oversized_compressed, 1,
@@ -1017,9 +1020,330 @@ static int run_cols_selftest(const char *host, int port) {
   return failures ? 1 : 0;
 }
 
+/* ---- frame limits --------------------------------------------------- */
+
+/* A long vector past the listener's 256 MiB limit and under the client's
+ * 2 GiB: 300 MiB of 7s whose last element differs, so a vector cut short
+ * shows. */
+#define BIG_LONGS ((int64_t)300 * 1024 * 1024 / 8)
+#define BIG_LAST 42
+
+/* (`upd;...): a list of two whose first item is the symbol upd. */
+static const uint8_t UPD_PREFIX[] = {0, 0, 2, 0, 0, 0, 0xF5, 'u', 'p', 'd', 0};
+
+/* A RESPONSE carrying the identity. */
+static const uint8_t IDENTITY_REPLY[] = {1, 2, 0, 0, 10, 0, 0, 0, 101, 0};
+
+/* q's compression, as q_decompress reads it. A flag byte leads every 8
+ * items, and an item is a literal byte or a back-reference: the xor of the
+ * byte pair it repeats, which keys the pair table both sides rebuild the same
+ * way, then how many bytes past the pair to copy. Writes the uncompressed
+ * message size and the stream to `out`, which holds len + len / 8 + 16
+ * bytes, and returns the bytes written. */
+static int64_t q_compress(const uint8_t *in, int64_t len, uint8_t *out) {
+  uint32_t table[256] = {0};
+  uint32_t total = (uint32_t)(len + (int64_t)sizeof(test_q_header_t));
+  memcpy(out, &total, sizeof total);
+  int64_t s = 0, p = 0, d = 4, flags = 0;
+  int bit = 0;
+  while (s < len) {
+    if (bit == 0) {
+      flags = d++;
+      out[flags] = 0;
+      bit = 1;
+    }
+    int64_t r = s + 1 < len ? table[in[s] ^ in[s + 1]] : 0;
+    int ref =
+        s + 1 < len && r + 1 < s && in[r] == in[s] && in[r + 1] == in[s + 1];
+    int64_t n = 0;
+    if (ref) {
+      while (n < 255 && s + 2 + n < len && in[r + 2 + n] == in[s + 2 + n])
+        n++;
+      out[flags] |= (uint8_t)bit;
+      out[d++] = in[s] ^ in[s + 1];
+      out[d++] = (uint8_t)n;
+      s += 2;
+    } else {
+      out[d++] = in[s++];
+    }
+    for (; p < s - 1; p++)
+      table[in[p] ^ in[p + 1]] = (uint32_t)p;
+    if (ref) {
+      s += n;
+      p = s;
+    }
+    bit = bit == 128 ? 0 : bit * 2;
+  }
+  return d;
+}
+
+/* A message: the header, `body` (compressed when asked), then `tail` as is.
+ * The tail is how a test queues a RESPONSE behind the frame under test.
+ * Returns the message to free(), or NULL. */
+static uint8_t *test_message(uint8_t msgtype, const uint8_t *body,
+                             int64_t body_len, int compress,
+                             const uint8_t *tail, int64_t tail_len,
+                             int64_t *len) {
+  int64_t hdr = (int64_t)sizeof(test_q_header_t);
+  int64_t cap = hdr + body_len + (compress ? body_len / 8 + 16 : 0) + tail_len;
+  uint8_t *buf = (uint8_t *)malloc((size_t)cap);
+  if (buf == NULL)
+    return NULL;
+  int64_t n = body_len;
+  if (compress)
+    n = q_compress(body, body_len, buf + hdr);
+  else
+    memcpy(buf + hdr, body, (size_t)body_len);
+  test_q_header_t h = {.endianness = 1,
+                       .msgtype = msgtype,
+                       .compressed = (uint8_t)compress,
+                       .size = (uint32_t)(hdr + n)};
+  memcpy(buf, &h, sizeof h);
+  if (tail_len > 0)
+    memcpy(buf + hdr + n, tail, (size_t)tail_len);
+  *len = hdr + n + tail_len;
+  return buf;
+}
+
+/* (`upd;v) where v is the big vector. The vector alone, a response's body,
+ * starts sizeof UPD_PREFIX bytes in. */
+static uint8_t *big_push_body(int64_t *len) {
+  int64_t n = (int64_t)sizeof UPD_PREFIX + 6 + BIG_LONGS * 8;
+  uint8_t *b = (uint8_t *)calloc(1, (size_t)n);
+  if (b == NULL)
+    return NULL;
+  memcpy(b, UPD_PREFIX, sizeof UPD_PREFIX);
+  uint8_t *v = b + sizeof UPD_PREFIX;
+  uint32_t count = (uint32_t)BIG_LONGS;
+  v[0] = 7; /* long vector, no attribute */
+  memcpy(v + 2, &count, sizeof count);
+  for (int64_t i = 0; i < BIG_LONGS; i++)
+    v[6 + 8 * i] = 7;
+  v[6 + 8 * (BIG_LONGS - 1)] = BIG_LAST;
+  *len = n;
+  return b;
+}
+
+static int is_big_vector(ray_t *v) {
+  if (v == NULL || RAY_IS_ERR(v) || v->type != RAY_I64 ||
+      ray_len(v) != BIG_LONGS)
+    return 0;
+  const int64_t *x = (const int64_t *)ray_data(v);
+  return x[0] == 7 && x[BIG_LONGS - 1] == BIG_LAST;
+}
+
+/* Fork a peer on sv[1] that writes `out`, then reads until the other end
+ * closes and answers nothing. A RESPONSE the test needs is queued in `out`,
+ * since a response need not wait for its request. Returns its pid, or -1. */
+static pid_t fake_peer(int sv[2], const uint8_t *out, int64_t len) {
+  pid_t pid = fork();
+  if (pid == 0) {
+    signal(SIGPIPE, SIG_IGN);
+    close(sv[0]);
+    for (int64_t sent = 0; sent < len;) {
+      ssize_t n = send(sv[1], out + sent, (size_t)(len - sent), 0);
+      if (n < 0 && errno == EINTR)
+        continue;
+      if (n <= 0)
+        _exit(0);
+      sent += n;
+    }
+    uint8_t sink[4096];
+    while (recv(sv[1], sink, sizeof sink, 0) > 0)
+      ;
+    _exit(0);
+  }
+  close(sv[1]);
+  return pid;
+}
+
+/* The plain client reads `msg`, a RESPONSE holding the big vector, through
+ * q_exchange and q_decode. */
+static int plain_client_reads_big(const uint8_t *msg, int64_t len,
+                                  const char *what) {
+  int sv[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
+    perror("frame-limit selftest: socketpair");
+    return 1;
+  }
+  pid_t pid = fake_peer(sv, msg, len);
+  uint8_t req[] = {1, 1, 0, 0, 10, 0, 0, 0, 101, 0};
+  uint8_t *resp = NULL;
+  int64_t resp_len = 0;
+  int compressed = 0;
+  char err[128] = {0};
+  ray_t *r = NULL;
+  if (q_exchange(sv[0], req, sizeof req, &resp, &resp_len, &compressed, err,
+                 sizeof err) == 0)
+    r = q_decode(resp, resp_len, compressed, err, sizeof err);
+  int failed = !is_big_vector(r);
+  if (failed)
+    fprintf(stderr, "frame-limit selftest: plain client, %s: %s\n", what,
+            err[0] ? err : "wrong vector");
+  release_any(r);
+  free(resp);
+  close(sv[0]);
+  if (pid > 0)
+    waitpid(pid, NULL, 0);
+  return failed;
+}
+
+/* Attach a connection whose peer writes `msg`, then make one sync round-trip,
+ * which dispatches every frame queued before the RESPONSE at the end of
+ * `msg`. Returns the round-trip's result, and in *open whether the
+ * connection outlived it. */
+static ray_t *attached_round_trip(ray_poll_t *poll, const uint8_t *msg,
+                                  int64_t len, int *open) {
+  int sv[2];
+  *open = 0;
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
+    perror("frame-limit selftest: socketpair");
+    return NULL;
+  }
+  pid_t pid = fake_peer(sv, msg, len);
+  int64_t id = q_conn_attach(poll, sv[0]);
+  ray_t *r = NULL;
+  if (id < 0) {
+    close(sv[0]);
+  } else {
+    ray_t *ask = ray_str("::", 2);
+    /* A regression here can be an unbounded wait: let SIGALRM fail the run
+     * instead of hanging it. */
+    alarm(60);
+    r = q_conn_send(poll, id, ask);
+    alarm(0);
+    ray_release(ask);
+    *open = q_conn_is_handle(poll, id);
+    q_conn_close(poll, id);
+  }
+  if (pid > 0)
+    waitpid(pid, NULL, 0);
+  return r;
+}
+
+/* An attached connection receives `body` pushed as an async frame, stays
+ * open, and the bound upd sees the whole vector. */
+static int attached_reads_big(ray_poll_t *poll, const uint8_t *body,
+                              int64_t body_len, int compress,
+                              const char *what) {
+  int64_t len = 0;
+  uint8_t *msg = test_message(0, body, body_len, compress, IDENTITY_REPLY,
+                              sizeof IDENTITY_REPLY, &len);
+  if (msg == NULL) {
+    fprintf(stderr, "frame-limit selftest: %s: out of memory\n", what);
+    return 1;
+  }
+  int open = 0;
+  ray_t *r = attached_round_trip(poll, msg, len, &open);
+  free(msg);
+  ray_t *got = ray_eval_str("got");
+  int failed = r == NULL || RAY_IS_ERR(r) || !open || !is_big_vector(got);
+  if (failed)
+    fprintf(stderr,
+            "frame-limit selftest: attached, %s: upd did not see the whole "
+            "vector\n",
+            what);
+  release_any(got);
+  release_any(r);
+  eval_setup("(set got %s)", "0");
+  return failed;
+}
+
+/* An attached connection whose peer writes `msg` closes on it. */
+static int attached_closes(ray_poll_t *poll, const uint8_t *msg, int64_t len,
+                           const char *what) {
+  int open = 0;
+  ray_t *r = attached_round_trip(poll, msg, len, &open);
+  int failed = r == NULL || !RAY_IS_ERR(r) || open;
+  if (failed)
+    fprintf(stderr, "frame-limit selftest: attached, %s stayed open\n", what);
+  release_any(r);
+  return failed;
+}
+
+/* The client side: frames on socketpairs, the peer a forked writer. */
+static int frame_limit_client_checks(ray_poll_t *poll) {
+  int failures = 0;
+  int64_t body_len = 0;
+  uint8_t *body = big_push_body(&body_len);
+  if (body == NULL) {
+    fprintf(stderr, "frame-limit selftest: out of memory\n");
+    return 1;
+  }
+  const uint8_t *vec = body + sizeof UPD_PREFIX;
+  int64_t vec_len = body_len - (int64_t)sizeof UPD_PREFIX;
+  for (int compress = 0; compress <= 1; compress++) {
+    const char *what = compress ? "300 MiB compressed" : "300 MiB";
+    int64_t len = 0;
+    uint8_t *msg = test_message(2, vec, vec_len, compress, NULL, 0, &len);
+    failures += msg ? plain_client_reads_big(msg, len, what) : 1;
+    free(msg);
+    failures += attached_reads_big(poll, body, body_len, compress, what);
+  }
+  free(body);
+
+  /* The most a classic header can declare is past the client limit too. */
+  uint8_t past_limit[sizeof(test_q_header_t) + sizeof IDENTITY_REPLY] = {
+      1, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF};
+  memcpy(past_limit + sizeof(test_q_header_t), IDENTITY_REPLY,
+         sizeof IDENTITY_REPLY);
+  failures += attached_closes(poll, past_limit, (int64_t)sizeof past_limit,
+                              "a 4 GiB header");
+  return failures;
+}
+
+/* The listener side, against driver --serve: a connection it accepted keeps
+ * the 256 MiB limit. */
+static int frame_limit_listener_checks(const char *host, int port) {
+  int failures = 0;
+  int fd = q_connect(host, port, "", "", 5000);
+  if (fd < 0) {
+    fprintf(stderr, "frame-limit selftest: cannot reach %s:%d\n", host, port);
+    return 1;
+  }
+  test_q_header_t big = {
+      .endianness = 1, .msgtype = 1, .size = (uint32_t)((int64_t)300 << 20)};
+  uint8_t b = 0;
+  ssize_t got = send(fd, &big, sizeof big, 0) == (ssize_t)sizeof big
+                    ? recv(fd, &b, 1, 0)
+                    : 1;
+  /* Closed is EOF or a reset; a timeout means it waits for the body. */
+  if (got > 0 || (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))) {
+    fprintf(stderr, "frame-limit selftest: listener took a 300 MiB request\n");
+    failures++;
+  }
+  q_close(fd);
+  return failures;
+}
+
+/* --frame-limit-selftest HOST PORT: a connection rayforce-q opened takes
+ * frames up to 2 GiB, and one the listener at HOST:PORT accepted keeps
+ * 256 MiB. */
+static int run_frame_limit_selftest(const char *host, int port) {
+  ray_runtime_t *rt = ray_runtime_create(0, NULL);
+  ray_poll_t *poll = rt ? ray_poll_create() : NULL;
+  if (poll == NULL) {
+    fprintf(stderr, "frame-limit selftest: failed to create runtime/poll\n");
+    if (rt)
+      ray_runtime_destroy(rt);
+    return 1;
+  }
+  eval_setup("(set upd (fn [x] (set got x)))", NULL);
+  eval_setup("(set got %s)", "0");
+  int failures = frame_limit_client_checks(poll);
+  failures += frame_limit_listener_checks(host, port);
+  ray_poll_destroy(poll);
+  ray_runtime_destroy(rt);
+  printf("frame-limit selftest: %s\n", failures ? "FAIL" : "ok");
+  return failures ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
   if (argc >= 2 && strcmp(argv[1], "--codec-selftest") == 0)
     return run_codec_selftest();
+
+  if (argc >= 4 && strcmp(argv[1], "--frame-limit-selftest") == 0)
+    return run_frame_limit_selftest(argv[2], atoi(argv[3]));
 
   if (argc >= 4 && strcmp(argv[1], "--cols-selftest") == 0)
     return run_cols_selftest(argv[2], atoi(argv[3]));

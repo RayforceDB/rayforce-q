@@ -91,4 +91,11 @@ int64_t q_conn_current(void);
 /* Close an attached connection and release its state. */
 void q_conn_close(ray_poll_t *poll, int64_t id);
 
+/* q_decode with the decompressed body bounded by `max_body`. q_decode bounds
+ * it at the client's 2 GiB; the rx machine passes each connection's own
+ * limit, so a connection the listener accepted stays at 256 MiB. Internal to
+ * rayforce-q: defined in q.c, called from q_server.c. */
+ray_t *q_decode_bounded(uint8_t *body, int64_t body_len, int compressed,
+                        int64_t max_body, char *err, size_t errlen);
+
 #endif /* RAYFORCE_Q_SERVER_H */

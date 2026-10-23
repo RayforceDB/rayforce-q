@@ -104,7 +104,11 @@ static inline size_t ray_scalar_elem_size(int8_t type) {
 #define Q_MSG_SYNC 1
 #define Q_MSG_RESPONSE 2
 #define Q_CAP_MAX 3
-#define Q_MAX_BODY ((int64_t)256 << 20)
+/* The most a classic header's 4-byte size can declare, less the header. A
+ * connection this process opened takes frames up to it: the peer is one the
+ * caller chose, and capability 3 lets it send no more. q_server.c holds a
+ * connection its listener accepted to 256 MiB instead. */
+#define Q_MAX_CLIENT_BODY ((int64_t)INT32_MAX - (int64_t)sizeof(q_header_t))
 
 typedef struct {
   uint8_t endianness;
@@ -1648,16 +1652,17 @@ static ray_t *q_des_cols(uint8_t **buf, int64_t *len, const q_proj_t *proj) {
   return q_make_dict(keys, vals);
 }
 
-/* Decompression */
-static int q_decompress(const uint8_t *src, int64_t src_len, uint8_t **out_buf,
-                        int64_t *out_len) {
+/* Decompression. The declared size is bounded by max_body, since it is
+ * allocated before a byte of the stream is read. */
+static int q_decompress(const uint8_t *src, int64_t src_len, int64_t max_body,
+                        uint8_t **out_buf, int64_t *out_len) {
   if (src_len < 4)
     return -1;
 
   uint32_t header_size;
   memcpy(&header_size, src, 4);
   int64_t out_size = (int64_t)header_size - (int64_t)sizeof(q_header_t);
-  if (out_size <= 0 || out_size > Q_MAX_BODY)
+  if (out_size <= 0 || out_size > max_body)
     return -1;
 
   uint32_t buffer[256] = {0};
@@ -1869,7 +1874,7 @@ int q_exchange(int fd, const uint8_t *req, int64_t req_len, uint8_t **resp,
     return -1;
   }
   int64_t body_len = (int64_t)header.size - (int64_t)sizeof header;
-  if (body_len <= 0 || body_len > Q_MAX_BODY) {
+  if (body_len <= 0 || body_len > Q_MAX_CLIENT_BODY) {
     q_set_err(err, errlen,
               body_len <= 0 ? "q: empty response body"
                             : "q: response body too large");
@@ -1899,12 +1904,14 @@ int q_exchange(int fd, const uint8_t *req, int64_t req_len, uint8_t **resp,
 
 /* q_decode, or q_decode_cols when proj is non-NULL. */
 static ray_t *q_decode_with(uint8_t *resp, int64_t resp_len, int compressed,
-                            const q_proj_t *proj, char *err, size_t errlen) {
+                            int64_t max_body, const q_proj_t *proj, char *err,
+                            size_t errlen) {
   uint8_t *decoded = resp;
   int64_t decoded_len = resp_len;
   uint8_t *decompressed = NULL;
   if (compressed) {
-    if (q_decompress(resp, resp_len, &decompressed, &decoded_len) < 0) {
+    if (q_decompress(resp, resp_len, max_body, &decompressed, &decoded_len) <
+        0) {
       q_set_err(err, errlen, "q: decompression failed");
       return NULL;
     }
@@ -1927,9 +1934,17 @@ static ray_t *q_decode_with(uint8_t *resp, int64_t resp_len, int compressed,
   return result;
 }
 
+/* A caller outside a listener decodes what it asked for, so it gets the
+ * client's limit. */
 ray_t *q_decode(uint8_t *resp, int64_t resp_len, int compressed, char *err,
                 size_t errlen) {
-  return q_decode_with(resp, resp_len, compressed, NULL, err, errlen);
+  return q_decode_with(resp, resp_len, compressed, Q_MAX_CLIENT_BODY, NULL, err,
+                       errlen);
+}
+
+ray_t *q_decode_bounded(uint8_t *body, int64_t body_len, int compressed,
+                        int64_t max_body, char *err, size_t errlen) {
+  return q_decode_with(body, body_len, compressed, max_body, NULL, err, errlen);
 }
 
 ray_t *q_decode_cols(uint8_t *resp, int64_t resp_len, int compressed,
@@ -1953,8 +1968,8 @@ ray_t *q_decode_cols(uint8_t *resp, int64_t resp_len, int compressed,
     }
   }
   q_proj_t proj = {cols, ncols};
-  return q_decode_with(resp, resp_len, compressed, ncols > 0 ? &proj : NULL,
-                       err, errlen);
+  return q_decode_with(resp, resp_len, compressed, Q_MAX_CLIENT_BODY,
+                       ncols > 0 ? &proj : NULL, err, errlen);
 }
 
 ray_t *q_send(int fd, ray_t *msg, char *err, size_t errlen) {
