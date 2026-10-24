@@ -12,7 +12,7 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
   connection under `q_conn_attach`. A q publisher's catch-up passed the old
   limit: a frame of 661 MiB uncompressed came in 116 MiB on the wire, and
   decompression refused it. A connection a `q_serve` listener accepted keeps
-  256 MiB, so a stranger cannot make the process allocate more. Decoding a
+  256 MiB per frame body, on the wire and decompressed. Decoding a
   frame adds several times its uncompressed size in memory: a 661 MiB frame
   peaked at about 3 GB.
 - **An attached connection closes on a frame it cannot decode**, and logs the
@@ -22,8 +22,9 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
   async message raised an error", drop the frame and stay open, so a
   subscriber carried on missing that data with nothing to make it reconnect.
   The failure repeats on every replay of that frame, so a subscriber should
-  back off between reconnects. A frame whose handler raises is still only
-  logged. A connection a `q_serve` listener accepted is unchanged.
+  back off between reconnects. An async frame whose handler raises is still
+  only logged, and a sync one still gets the error as its response. A
+  connection a `q_serve` listener accepted is unchanged.
 - **A decode error carries its whole text** in its message, where
   `ray_error_msg()` reads it. Its code still holds only the first 7 bytes, as
   before, so "q: buffer underflow (vec body)" no longer reads "q: buff".

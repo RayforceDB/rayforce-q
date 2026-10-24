@@ -108,8 +108,8 @@ A connection your process opened takes frames up to 2 GiB less the 8-byte
 header, the most the classic q header can declare. That covers `q_connect`'s
 responses, read through `q_send` or `q_exchange` with `q_decode` or
 `q_decode_cols`, and a connection `q_conn_attach` put under a poll. A
-connection a `q_serve` listener accepted is held to 256 MiB, so a stranger
-cannot make your process allocate more than that. Messages over 2 GiB need a
+connection a `q_serve` listener accepted is held to 256 MiB per frame body,
+on the wire and decompressed. Messages over 2 GiB need a
 later capability in the handshake, which rayforce-q does not offer.
 
 A frame whose header declares more than its limit fails the read, and the
@@ -127,8 +127,9 @@ or a lambda, or when memory runs out while decoding it. Your subscription sees
 the connection closed and can reconnect, rather than carry on with a hole
 where that frame was. The failure is permanent for that frame. A subscriber
 that replays from the start meets it again on every reconnect, so back off
-between attempts. A frame that decodes and whose handler raises an error is
-only logged, and the connection stays. A connection the listener accepted
+between attempts. An async frame that decodes and whose handler raises an
+error is only logged, and the connection stays; a sync one gets the error as
+its response, as before. A connection the listener accepted
 answers a bad sync request with an error and drops a bad async one, as before.
 
 The memory is yours to budget. While a frame decodes, the body as received,

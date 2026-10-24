@@ -1349,6 +1349,27 @@ static int frame_limit_client_checks(ray_poll_t *poll) {
                     : 1;
     free(cut);
   }
+
+  /* The decompression cap on its own, apart from a malformed stream: a valid
+   * compressed long atom, 9 bytes, decodes at a cap of 9 and is refused at 8,
+   * before anything is allocated for it. */
+  uint8_t atom[9] = {0xF9};
+  uint8_t packed[32];
+  int64_t packed_len = q_compress(atom, (int64_t)sizeof atom, packed);
+  for (int64_t cap = 9; cap >= 8; cap--) {
+    char err[128] = {0};
+    ray_t *r = q_decode_bounded(packed, packed_len, 1, cap, err, sizeof err);
+    int decoded =
+        r != NULL && !RAY_IS_ERR(r) && r->type == -RAY_I64 && r->i64 == 0;
+    if (decoded != (cap == 9)) {
+      fprintf(stderr,
+              "frame-limit selftest: a 9-byte compressed atom at a cap of "
+              "%lld: %s\n",
+              (long long)cap, decoded ? "decoded" : err);
+      failures++;
+    }
+    release_any(r);
+  }
   return failures;
 }
 
