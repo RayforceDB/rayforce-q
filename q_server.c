@@ -60,6 +60,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 
@@ -709,6 +711,13 @@ static void q_close_connection_sigpipe(ray_sock_t fd) {
 #endif
 }
 
+/* Replies and pushed frames are small and latency-bound: never hold them back
+ * for Nagle (a pipelined client would otherwise see a delayed-ACK stall). */
+static void q_set_nodelay(ray_sock_t fd) {
+  int yes = 1;
+  setsockopt((int)fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof yes);
+}
+
 static int64_t q_recv_fn(int64_t fd, uint8_t *buf, int64_t len) {
   return ray_sock_recv((ray_sock_t)fd, buf, (size_t)len);
 }
@@ -725,6 +734,7 @@ static ray_t *q_accept(ray_poll_t *poll, ray_selector_t *sel) {
     return NULL;
   ray_sock_set_nonblocking(nfd);
   q_close_connection_sigpipe(nfd);
+  q_set_nodelay(nfd);
 
   q_conn_t *cd = (q_conn_t *)calloc(1, sizeof *cd);
   if (cd == NULL) {
@@ -1212,6 +1222,7 @@ int64_t q_conn_attach(ray_poll_t *poll, int fd) {
   int timeout_ms = q_sock_recv_timeout_ms(fd);
   ray_sock_set_nonblocking((ray_sock_t)fd);
   q_close_connection_sigpipe((ray_sock_t)fd);
+  q_set_nodelay((ray_sock_t)fd);
 
   q_conn_t *cd = (q_conn_t *)calloc(1, sizeof *cd);
   if (cd == NULL)
