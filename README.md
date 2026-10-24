@@ -34,6 +34,8 @@ Inside a handler, `(.q.handle)` is the connection the frame came in on (the valu
 
 A host without a poll (a binding that embeds only the client) keeps the plain blocking `q.c` path and its raw-fd handle.
 
+Every `.q.connect` connection has TCP keepalive at the core's 60 s default, so a publisher that vanishes without closing (a dropped VPN or NAT flow) fails the connection instead of leaving a subscription waiting forever.
+
 ### Server
 
 The server is exposed via the `-q PORT` flag — it shares the REPL's event loop, so the REPL stays interactive while it serves Q clients:
@@ -61,6 +63,9 @@ See **[INTEGRATING.md](./docs/INTEGRATING.md)** for more details.
 /* host/port + optional auth + connect/op timeout (ms; <= 0 blocks). */
 int    q_connect(const char *host, int port, const char *user,
                  const char *password, int timeout_ms);   /* -> fd >= 0, or Q_ERR_* */
+/* q_connect with the keepalive chosen: Q_KEEPALIVE_AUTO, Q_KEEPALIVE_OFF, or a budget in ms. */
+int    q_connect_opts(const char *host, int port, const char *user,
+                      const char *password, int timeout_ms, int keepalive_ms);
 int    q_close(int fd);
 ray_t *q_send(int fd, ray_t *msg, char *err, size_t n);    /* -> ray_t*, or NULL + err */
 
@@ -79,6 +84,8 @@ ray_t *q_decode_cols(uint8_t *resp, int64_t resp_len, int compressed,
 
 The connection handle is the raw socket fd, so the client is thread-safe and unbounded (no shared connection table). `q_send` returns a freshly-owned
 `ray_t`, which may itself be a `RAY_ERROR` carrying a Q server-side error. A `NULL` return signals a transport/serialization failure with a short reason in `err`.
+
+Keepalive needs rayforce core v2.11.0 or later. See [INTEGRATING.md](./docs/INTEGRATING.md#keepalive) for how a budget maps onto the socket.
 
 `q_decode_cols` is for a caller that keeps a few columns of a wide table. The other columns are skipped by their serialized length: no allocation per string cell and no symbol interning. A name the table lacks comes back as a `RAY_ERROR`. See `q.h` for keyed tables and edge cases.
 

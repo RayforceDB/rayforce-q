@@ -2,6 +2,32 @@
 
 All notable changes to `rayforce-q` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/), and the project adheres to [Semantic Versioning](https://semver.org/). Bindings pin a tag, so each release is a stable point they can build against.
 
+## [Unreleased]
+
+Needs rayforce core v2.11.0 or later, for `ray_sock_set_keepalive` (core
+#589). Built and tested (`make test`, without a q) against core `master` at
+`d4899d9`.
+
+### Added
+
+- **`q_connect_opts`** is `q_connect` with a keepalive argument, which means
+  what `keepalive_ms` means to the core's `ray_ipc_connect_opts`:
+  `Q_KEEPALIVE_AUTO` (0) arms keepalive at the core's 60 s default,
+  `Q_KEEPALIVE_OFF` (-1) arms nothing, and a budget in ms arms keepalive at
+  that budget plus `TCP_USER_TIMEOUT`. A 25 s budget probes after 12 s idle,
+  then every 4 s.
+
+### Changed
+
+- **`q_connect` turns keepalive on** at the core's 60 s default, as
+  `ray_ipc_connect` does. A peer that vanishes without closing, such as a
+  VPN tunnel reaped without a FIN, is now noticed, where a connection used
+  to wait on it forever. Every caller gets it, `.q.connect` included. It is
+  armed after the handshake and survives `q_conn_attach`. A failure to arm it
+  is ignored, as in the core. The other side: an idle connection whose
+  network is down for 30-60 s or more (a Wi-Fi roam, a VPN reconnect) is now
+  closed, where it used to resume. `Q_KEEPALIVE_OFF` keeps the old behaviour.
+
 ## [2.5.0]
 
 Built and tested (`make test` with a real q) against rayforce core `master`

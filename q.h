@@ -46,9 +46,33 @@
 #define Q_ERR_HANDSHAKE (-2) /* socket connected but handshake/auth failed */
 #define Q_ERR_TIMEOUT (-3)   /* connect timed out                        */
 
-/* Open a TCP connection to a Q server and perform the login handshake. */
+/* Dead-peer detection, as the core's RAY_IPC_KEEPALIVE_* (core/ipc.h). A
+ * peer that vanishes without closing (a suspended host, a NAT or VPN that
+ * drops the flow) is noticed by kernel keepalive instead of the connection
+ * waiting forever. See the core's ray_sock_set_keepalive for how a budget
+ * maps onto the socket options.
+ *
+ *   Q_KEEPALIVE_AUTO  keepalive at the core's 60 s default, no
+ *                     unacknowledged-data bound
+ *   Q_KEEPALIVE_OFF   no keepalive
+ *   n > 0             keepalive at budget n ms, plus the unacknowledged-data
+ *                     bound (TCP_USER_TIMEOUT), so a peer that stops reading
+ *                     for n ms counts as dead too */
+#define Q_KEEPALIVE_AUTO 0
+#define Q_KEEPALIVE_OFF (-1)
+
+/* Open a TCP connection to a Q server and perform the login handshake.
+ * Keepalive is Q_KEEPALIVE_AUTO. */
 int q_connect(const char *host, int port, const char *user,
               const char *password, int timeout_ms);
+
+/* As q_connect, with the keepalive chosen: Q_KEEPALIVE_AUTO,
+ * Q_KEEPALIVE_OFF, or a budget in ms. It is armed once the handshake has
+ * succeeded, best-effort as in the core: if SO_KEEPALIVE fails, the
+ * connection is returned without keepalive; a tuning option the platform
+ * lacks or rejects keeps its system default. */
+int q_connect_opts(const char *host, int port, const char *user,
+                   const char *password, int timeout_ms, int keepalive_ms);
 
 /* Close a connection fd. Returns 0 on success, -1 on an invalid fd. */
 int q_close(int fd);
