@@ -2,11 +2,12 @@
 
 All notable changes to `rayforce-q` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/), and the project adheres to [Semantic Versioning](https://semver.org/). Bindings pin a tag, so each release is a stable point they can build against.
 
-## [Unreleased]
+## [2.6.0]
 
 Needs rayforce core v2.11.0 or later, for `ray_sock_set_keepalive` (core
-#589). Built and tested (`make test`, without a q) against core `master` at
-`d4899d9`.
+#589). Built and tested (`make test` with a real q) against rayforce core
+v3.0.1 (`0aa2d6a`) and against v2.11.0 (`dc9b12a`), the oldest core it
+supports. Two PRs from ihrfv (#24, #25).
 
 ### Added
 
