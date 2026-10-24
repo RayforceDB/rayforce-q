@@ -105,6 +105,9 @@ echo "server up on $HOST:$SERVERPORT; running server round-trip tests..."
 echo "checking client keepalive socket options..."
 "$DRIVER" --keepalive-selftest "$HOST" "$SERVERPORT"
 
+echo "checking frame limits, client and listener..."
+"$DRIVER" --frame-limit-selftest "$HOST" "$SERVERPORT"
+
 echo "checking malformed Q frame handling..."
 python3 - "$HOST" "$SERVERPORT" <<'PY'
 import socket

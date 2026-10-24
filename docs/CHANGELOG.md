@@ -27,6 +27,28 @@ Needs rayforce core v2.11.0 or later, for `ray_sock_set_keepalive` (core
   is ignored, as in the core. The other side: an idle connection whose
   network is down for 30-60 s or more (a Wi-Fi roam, a VPN reconnect) is now
   closed, where it used to resume. `Q_KEEPALIVE_OFF` keeps the old behaviour.
+- **A connection rayforce-q opened takes frames up to 2 GiB**, the most the
+  classic header can declare, where every connection stopped at 256 MiB.
+  That is `q_connect`'s responses, `q_decode`, `q_decode_cols` and a
+  connection under `q_conn_attach`. A q publisher's catch-up passed the old
+  limit: a frame of 661 MiB uncompressed came in 116 MiB on the wire, and
+  decompression refused it. A connection a `q_serve` listener accepted keeps
+  256 MiB per frame body, on the wire and decompressed. Decoding a
+  frame adds several times its uncompressed size in memory: a 661 MiB frame
+  peaked at about 3 GB.
+- **An attached connection closes on a frame it cannot decode**, and logs the
+  reason with the frame's size. That covers a frame cut short, a q type
+  rayforce-q does not decode, such as a timespan or a lambda, and running out
+  of memory, on an async push or a sync request alike. It used to log "q:
+  async message raised an error", drop the frame and stay open, so a
+  subscriber carried on missing that data with nothing to make it reconnect.
+  The failure repeats on every replay of that frame, so a subscriber should
+  back off between reconnects. An async frame whose handler raises is still
+  only logged, and a sync one still gets the error as its response. A
+  connection a `q_serve` listener accepted is unchanged.
+- **A decode error carries its whole text** in its message, where
+  `ray_error_msg()` reads it. Its code still holds only the first 7 bytes, as
+  before, so "q: buffer underflow (vec body)" no longer reads "q: buff".
 
 ## [2.5.0]
 
