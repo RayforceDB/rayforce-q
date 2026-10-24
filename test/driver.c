@@ -80,6 +80,24 @@ static int run_server(int port) {
   return 0;
 }
 
+/* The journal admits a request only up to what the core's replay accepts
+ * (hdr.size <= 256 MiB). A LIST [symbol, U8 vector of N bytes] is a q body of
+ * N+17 and a native payload of N+26, so the largest admitted q body of exactly
+ * 256 MiB (N = 256 MiB - 17) has a payload of 256 MiB + 9: refused. */
+static int run_journal_bound_selftest(void) {
+  const int64_t max = 256LL * 1024 * 1024;
+  int failures = 0;
+  failures += !q_journal_size_ok(1);
+  failures += !q_journal_size_ok(max);
+  failures += q_journal_size_ok(max + 1);
+  failures += q_journal_size_ok((max - 17) + 26);
+  failures += !q_journal_size_ok((max - 26) + 26);
+  failures += q_journal_size_ok(0);
+  failures += q_journal_size_ok(-1);
+  printf("journal bound selftest: %s\n", failures ? "FAIL" : "ok");
+  return failures ? 1 : 0;
+}
+
 static int run_q_cli_selftest(void) {
   ray_runtime_t *rt = ray_runtime_create(0, NULL);
   if (rt == NULL) {
@@ -1649,6 +1667,8 @@ int main(int argc, char **argv) {
   if (argc >= 2 && strcmp(argv[1], "--exchange-selftest") == 0)
     return run_exchange_selftest();
 
+  if (argc >= 2 && strcmp(argv[1], "--journal-bound-selftest") == 0)
+    return run_journal_bound_selftest();
   if (argc >= 2 && strcmp(argv[1], "--q-cli-selftest") == 0)
     return run_q_cli_selftest();
 

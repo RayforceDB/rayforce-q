@@ -52,6 +52,11 @@
  * poll selector id (>= 0) on success, or -1 on failure */
 int64_t q_serve(ray_poll_t *poll, int port);
 
+/* Whether a serialized request of `size` bytes may be journaled: the core's
+ * replay rejects a frame payload above 256 MiB, so the q listener refuses one
+ * (a `limit` error) before it writes or evaluates it. Exposed for tests. */
+int q_journal_size_ok(int64_t size);
+
 /* ===== Outbound connections =====
  *
  * q.c's client is blocking and poll-free by design (bindings without an event

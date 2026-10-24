@@ -2,6 +2,30 @@
 
 All notable changes to `rayforce-q` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/), and the project adheres to [Semantic Versioning](https://semver.org/). Bindings pin a tag, so each release is a stable point they can build against.
 
+## [Unreleased]
+
+### Fixed
+
+- **q-wire SYNC frames are journaled when a WAL is open.** The core logs every
+  inbound native SYNC frame before evaluating it (`.log.open` / `-l` / `-L`),
+  but the q listener evaluated its frames with no journal hook, so a Rayfall
+  service fed over `-q` journaled nothing and `.log.replay` rebuilt none of
+  its state. Each decoded q SYNC request is now serialized in the native frame
+  format and written through `ray_journal_write_bytes` before it is evaluated
+  (restricted bit copied into the logged header); if the write fails the
+  request is not evaluated and the client gets an `io` error, as in the core.
+  ASYNC frames are not journaled, following the core (sync is its
+  state-mutation channel): a q feed that needs durable writes must send sync.
+  The request is evaluated, and journaled, in one data form with every LIST
+  argument wrapped in `quote`, so live dispatch and replay run the same
+  expression (the replay does not re-mark `RAY_EVAL_LITERAL_FALLBACK`). A LIST
+  argument whose head names a callable, as in `(`upd;(`in;1 2))`, now reaches
+  the handler as the list, where it used to be called. A request whose native
+  payload is above the 256 MiB the core's replay accepts is refused with a
+  `limit` error before it is written or evaluated. With a core that provides
+  `ray_ipc_set_auto_journal_eval`, the eval runs in the core's auto-journal
+  scope and a nested `.log.write` is refused, as for a native frame.
+
 ## [2.6.0]
 
 Needs rayforce core v2.11.0 or later, for `ray_sock_set_keepalive` (core

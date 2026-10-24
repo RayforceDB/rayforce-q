@@ -54,7 +54,7 @@ test: pull_core
 	@$(MAKE) -C $(CORE) lib
 	@echo "🔧 Building test/driver (client + --serve)..."
 	@$(CC) $(CFLAGS) -o test/driver $(DRIVER_SRCS) $(CORE)/librayforce.a $(LIBS)
-	@./test/run.sh ./test/driver test/rfl
+	@CORE_SRC=$(CORE)/src ./test/run.sh ./test/driver test/rfl
 
 # Re-run the suite against an already-built core (fast; no clone/rebuild).
 # Requires a prior `make test`. Used by the pre-commit hook.
@@ -62,7 +62,7 @@ recheck:
 	@test -f $(CORE)/librayforce.a || { echo "no core build — run 'make test' first" >&2; exit 1; }
 	@test ! -d $(CORE)/src/q || { echo "core was used by 'make rayforce' — run 'make clean && make test'" >&2; exit 1; }
 	@$(CC) $(CFLAGS) -o test/driver $(DRIVER_SRCS) $(CORE)/librayforce.a $(LIBS)
-	@./test/run.sh ./test/driver test/rfl
+	@CORE_SRC=$(CORE)/src ./test/run.sh ./test/driver test/rfl
 
 # Build a rayforce binary with the Q IPC client AND the Q-protocol server compiled in.
 rayforce: pull_core
