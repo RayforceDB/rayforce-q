@@ -297,7 +297,8 @@ static ray_t *eval_request(ray_t *req, int msgtype) {
  * not part of the wire format). A q `(`upd;(`a;1))` journaled verbatim would
  * therefore replay its argument list as a CALL. Rather than persist something
  * different from what ran, the request is turned into ONE data form: every
- * LIST argument wrapped in `quote`, `(upd (quote (a 1)))`. That form is what
+ * argument wrapped in `quote`, `(upd (quote (a 1)))` (symbol atoms and
+ * lists alike are data, an all-symbol request is the call it dispatches as). That form is what
  * is journaled AND what eval_request evaluates, so live dispatch and replay
  * run the same expression by construction, including for a LIST argument
  * whose head names a callable (`(`upd;(`in;1 2))` hands `upd` the list on both
@@ -314,36 +315,67 @@ static ray_t *eval_request(ray_t *req, int msgtype) {
  * already in the log; a nested synthetic record would make replay differ
  * from the live run). q_read_body sets the same flag around the eval through
  * ray_ipc_set_auto_journal_eval when the core provides it. */
+/* (quote v): `v` is borrowed. Returns an owned list or an error object. */
+static ray_t *q_quote_of(ray_t *v, int64_t qid) {
+  ray_t *q = ray_list_new(2);
+  ray_t *head = ray_sym(qid);
+  if (q == NULL || RAY_IS_ERR(q) || head == NULL || RAY_IS_ERR(head)) {
+    if (q && !RAY_IS_ERR(q))
+      ray_release(q);
+    if (head && !RAY_IS_ERR(head))
+      ray_release(head);
+    return ray_error("oom", NULL);
+  }
+  q = ray_list_append(q, head);
+  ray_release(head);
+  if (q && !RAY_IS_ERR(q))
+    q = ray_list_append(q, v);
+  return q;
+}
+
 static ray_t *q_journal_form(ray_t *req) {
+  int64_t qid = ray_sym_intern("quote", 5);
+  /* An all-symbol call such as h (`f;`a;`b) is ONE symbol vector on the q
+   * wire (q unifies the list). The dispatcher runs it as the call (f a b),
+   * so journal that call; the vector itself would replay as a no-op. */
+  if (req->type == RAY_SYM && ray_len(req) >= 2) {
+    ray_t *out = ray_list_new(ray_len(req));
+    for (int64_t i = 0; out && !RAY_IS_ERR(out) && i < ray_len(req); i++) {
+      ray_t *a = ray_sym(ray_vec_get_sym_id(req, i));
+      if (a == NULL || RAY_IS_ERR(a)) {
+        ray_release(out);
+        return ray_error("oom", NULL);
+      }
+      if (i == 0) {
+        out = ray_list_append(out, a);
+      } else {
+        ray_t *q = q_quote_of(a, qid);
+        out = (q && !RAY_IS_ERR(q)) ? ray_list_append(out, q) : q;
+        if (q && !RAY_IS_ERR(q))
+          ray_release(q);
+      }
+      ray_release(a);
+    }
+    return out;
+  }
   if (req->type != RAY_LIST || ray_len(req) < 2)
     return NULL; /* journal the request itself */
   ray_t **elems = (ray_t **)ray_data(req);
-  int64_t qid = ray_sym_intern("quote", 5);
   ray_t *out = ray_list_new(ray_len(req));
   if (out == NULL || RAY_IS_ERR(out))
     return out;
   out = ray_list_append(out, elems[0]);
   for (int64_t i = 1; out && !RAY_IS_ERR(out) && i < ray_len(req); i++) {
-    /* Only list arguments are marked literal on the live path (see
-     * eval_request), so only those are quoted; any other argument is
-     * journaled as is and resolves on replay exactly as it did live. */
-    if (elems[i] == NULL || elems[i]->type != RAY_LIST) {
-      out = ray_list_append(out, elems[i]);
-      continue;
-    }
-    ray_t *q = ray_list_new(2);
-    ray_t *head = ray_sym(qid);
-    if (q == NULL || RAY_IS_ERR(q) || head == NULL || RAY_IS_ERR(head)) {
-      if (q && !RAY_IS_ERR(q))
-        ray_release(q);
-      if (head && !RAY_IS_ERR(head))
-        ray_release(head);
+    /* Every argument is data: replay evaluates the frame without the live
+     * path's literal fallback, so a symbol atom or symbol vector would be
+     * looked up as a variable and a list would be run as a call.
+     * `quote` is the identity, and numbers/strings evaluate to themselves,
+     * so quoting unconditionally is exact. */
+    ray_t *q = q_quote_of(elems[i], qid);
+    if (q == NULL || RAY_IS_ERR(q)) {
       ray_release(out);
-      return ray_error("oom", NULL);
+      return q ? q : ray_error("oom", NULL);
     }
-    q = ray_list_append(q, head);
-    ray_release(head);
-    q = ray_list_append(q, elems[i]);
     out = ray_list_append(out, q);
     ray_release(q);
   }
