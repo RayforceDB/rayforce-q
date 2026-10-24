@@ -599,6 +599,32 @@ static int64_t q_send_fn(int64_t fd, uint8_t *buf, int64_t len) {
  * RESPONSEs and for pushed ASYNC frames alike: nothing here waits on the peer. */
 static int q_queue_frame(ray_poll_t *poll, ray_selector_t *sel, uint8_t *buf,
                          int64_t len) {
+  /* Fast path: nothing is queued ahead of this frame, so write it straight
+   * to the (non-blocking) socket. A small reply almost always fits the send
+   * buffer, which saves the epoll_ctl(MOD) pair, the extra epoll_wait for
+   * EPOLLOUT, the wasted recv the poll loop then tries, and the tx buffer
+   * copy of the queue path. Only an unsent tail (EAGAIN or a short write)
+   * falls through to the queue. */
+  int64_t sent = 0;
+  if (sel->tx.buf == NULL) {
+    while (sent < len) {
+      int64_t n = q_send_fn(sel->fd, buf + sent, len - sent);
+      if (n > 0) {
+        sent += n;
+        continue;
+      }
+      if (n < 0 && errno == EINTR)
+        continue;
+      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        break;
+      free(buf);
+      return -1; /* peer gone or hard error: the caller closes the connection */
+    }
+    if (sent == len) {
+      free(buf);
+      return 0;
+    }
+  }
   int64_t queued = 0;
   for (ray_poll_buf_t *p = sel->tx.buf; p != NULL; p = p->next) {
     int64_t pending = p->size - p->offset;
@@ -608,16 +634,16 @@ static int q_queue_frame(ray_poll_t *poll, ray_selector_t *sel, uint8_t *buf,
     }
     queued += pending;
   }
-  if (len > Q_MAX_BODY - queued) {
+  if (len - sent > Q_MAX_BODY - queued) {
     free(buf);
     return -1;
   }
-  ray_poll_buf_t *out = ray_poll_buf_new(len);
+  ray_poll_buf_t *out = ray_poll_buf_new(len - sent);
   if (out == NULL) {
     free(buf);
     return -1;
   }
-  memcpy(out->data, buf, (size_t)len);
+  memcpy(out->data, buf + sent, (size_t)(len - sent));
   free(buf);
   if (sel->tx.buf == NULL) {
     sel->tx.buf = out;
