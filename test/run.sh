@@ -332,6 +332,8 @@ T["builtin text";    @[h;"(+ 1 \"a\")";{x like "type: *"}]]
 T["no message";      "parse"~@[h;"(+ 1 2";{x}]]
 r:h"(do (set boom (fn [x] (raise \"custom failure\"))) 1)"
 T["raise via call";  $[RA;"domain: custom failure"~@[h;(`boom;::);{x}];@[h;(`boom;::);{x like "domain*"}]]]
+/ a result with no q value (a lambda): the whole text arrives, not its first 7 characters
+T["encode failure text"; @[h;"(fn [m] m)";{(x like "type: *")&0<count x ss "cannot"}]]
 / server-side parse error comes back as a Q error frame
 T["parse err";   @[h;"(+ 1 2";{x like "*parse*"}]]
 hclose h

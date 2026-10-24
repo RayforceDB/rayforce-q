@@ -229,7 +229,11 @@ static int q_send_result(ray_poll_t *poll, ray_selector_t *sel, ray_t *result) {
   if (loaded != NULL)
     ray_error_free(loaded);
   if (enc < 0) {
-    ray_t *e = ray_error(err[0] ? err : "q server: encode failed", NULL);
+    /* The text is the message, not the code: ray_error() keeps only 7 bytes
+     * of a code, so passing it as the code sent a client "q: cann" for
+     * "q: cannot encode ...". Same loading as above so q_encode frames
+     * "category: message". */
+    ray_t *e = ray_error("type", "%s", err[0] ? err : "q server: encode failed");
     int rc = q_encode(e, &buf, &len, err, sizeof err);
     q_release_any(e);
     if (rc < 0)
