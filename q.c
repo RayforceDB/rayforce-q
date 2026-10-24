@@ -356,6 +356,31 @@ static int8_t q_type_of(int8_t ray_type) {
 #define Q_MAX_NESTING 128
 #define Q_SIZE_OVERFLOW (-1)
 
+/* The text of a q error frame for a RAY_ERROR. The code alone is all the
+ * object carries; the explanation lives in the runtime's last-error slot
+ * (ray_error_msg), which the server loads with the error it is about to send
+ * (see q_send_result). q shows the frame as `'<text>`, so give it
+ * "code: message" -- or the message alone when it already starts with the
+ * code -- and the bare code when there is no message. */
+static size_t q_error_text(ray_t *obj, char *buf, size_t cap) {
+  const char *code = ray_err_code(obj);
+  const char *msg = ray_error_msg();
+  if (code == NULL)
+    code = "";
+  size_t cl = strlen(code);
+  int n;
+  if (msg == NULL || msg[0] == '\0')
+    n = snprintf(buf, cap, "%s", code);
+  else if (cl > 0 && strncmp(msg, code, cl) == 0 &&
+           (msg[cl] == '\0' || msg[cl] == ':' || msg[cl] == ' '))
+    n = snprintf(buf, cap, "%s", msg);
+  else
+    n = snprintf(buf, cap, "%s%s%s", code, cl ? ": " : "", msg);
+  if (n < 0)
+    return 0;
+  return (size_t)n < cap ? (size_t)n : cap - 1;
+}
+
 static int64_t q_size_obj(ray_t *obj, int depth);
 static int64_t q_ser_obj(uint8_t *buf, ray_t *obj);
 static ray_t *q_des_obj(uint8_t **buf, int64_t *len, int depth);
@@ -560,8 +585,8 @@ static int64_t q_size_obj(ray_t *obj, int depth) {
     return 1 + keys + vals;
   }
   if (t == RAY_ERROR) {
-    const char *msg = ray_err_code(obj);
-    int64_t n = msg ? (int64_t)strlen(msg) : 0;
+    char text[320];
+    int64_t n = (int64_t)q_error_text(obj, text, sizeof text);
     return 1 + n + 1; /* type byte + msg + null */
   }
   if (t == RAY_NULL)
@@ -752,10 +777,10 @@ static int64_t q_ser_obj(uint8_t *buf, ray_t *obj) {
     return buf - start;
   }
   if (t == RAY_ERROR) {
-    const char *msg = ray_err_code(obj);
-    size_t n = msg ? strlen(msg) : 0;
+    char text[320];
+    size_t n = q_error_text(obj, text, sizeof text);
     if (n)
-      memcpy(buf, msg, n);
+      memcpy(buf, text, n);
     buf[n] = 0;
     return buf + n + 1 - start;
   }

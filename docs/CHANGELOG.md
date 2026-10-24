@@ -2,6 +2,18 @@
 
 All notable changes to `rayforce-q` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/), and the project adheres to [Semantic Versioning](https://semver.org/). Bindings pin a tag, so each release is a stable point they can build against.
 
+## [Unreleased]
+
+### Fixed
+
+- **Error text reaches the q client.** A server-side `(raise "custom failure")`
+  arrived as `'domain` and `(undefined_fn 1)` as `'name`: only the category was
+  encoded. The error frame now reads `category: message` (the message alone
+  when it already starts with the category), so q sees
+  `'domain: custom failure`; an error with no message is still the bare
+  category. The text of an uncaught `raise` is taken from the pending raised
+  value, as the REPL prints it.
+
 ## [2.6.0]
 
 Needs rayforce core v2.11.0 or later, for `ray_sock_set_keepalive` (core
