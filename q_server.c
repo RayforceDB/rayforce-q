@@ -46,6 +46,8 @@
 #include "core/timer.h" /* ray_time_now_ms                                     */
 #include "lang/eval.h" /* ray_eval, RAY_EVAL_LITERAL_FALLBACK                  */
 #include "ops/ops.h" /* ray_is_lazy, ray_lazy_materialize                    */
+#include "lang/internal.h" /* call_fn1: invoke a hook lambda                   */
+#include "core/runtime.h" /* __VM: hooks need a VM on the stack              */
 #include "core/ipc.h" /* RAY_IPC_MSG_*, RAY_IPC_FLAG_RESTRICTED             */
 #include "store/journal.h" /* ray_journal_is_open, ray_journal_write_bytes  */
 #include "store/serde.h" /* ray_ipc_header_t, ray_serde_size, ray_ser_raw   */
@@ -113,6 +115,8 @@ typedef struct {
   uint8_t sync_waiting; /* a q_conn_send is parked on this connection */
   uint8_t sync_ready;   /* its RESPONSE has been deposited below      */
   uint8_t outbound;     /* q_conn_attach client side; may receive RESPONSE */
+  uint8_t established;  /* handshake done: frames flow, posts are allowed  */
+  uint8_t closing;      /* teardown started: no more posts                 */
   ray_t *sync_resp;
   int sync_timeout_ms; /* q_conn_send round-trip budget; <= 0 blocks  */
   uint8_t *rx_body;
@@ -121,15 +125,37 @@ typedef struct {
   int64_t rx_body_total;
 } q_conn_t;
 
-/* The outbound connection whose pushed frame is being evaluated, or -1. A
- * handler reads it through q_conn_current (`.q.handle`), which is how one
- * process subscribed to several publishers tells their frames apart. */
+/* The connection whose frame (or close) is being handled, or -1. A handler
+ * reads it through q_conn_current (`.q.handle`): how one process subscribed to
+ * several publishers tells their frames apart, and how a server learns which
+ * client is calling it, to `.q.post` to it later. */
 static int64_t q_current_handle = -1;
 
 int64_t q_conn_current(void) { return q_current_handle; }
 
 static int64_t q_conn_max_body(const q_conn_t *cd) {
   return cd->outbound ? Q_MAX_CLIENT_BODY : Q_MAX_BODY;
+}
+
+/* ---- Hooks (`.q.on`) -----------------------------------------------------
+ * The Rayfall-settable counterpart of the core's `.ipc.on.*` for q frames
+ * (`.q.on.*` is a reserved name and cannot be `set` from Rayfall). A hook is
+ * a lambda held here, retained; anything else clears it. */
+static ray_t *q_hooks[Q_HOOK_COUNT];
+
+int q_hook_set(int which, ray_t *fn) {
+  if (which < 0 || which >= Q_HOOK_COUNT)
+    return -1;
+  ray_t *old = q_hooks[which];
+  if (fn != NULL && !RAY_IS_ERR(fn) && fn->type == RAY_LAMBDA) {
+    ray_retain(fn);
+    q_hooks[which] = fn;
+  } else {
+    q_hooks[which] = NULL;
+  }
+  if (old != NULL)
+    ray_release(old);
+  return 0;
 }
 
 static void q_release_any(ray_t *obj) {
@@ -141,6 +167,18 @@ static void q_release_any(ray_t *obj) {
     ray_release(obj);
 }
 
+/* A list argument handed to a hook carries data, not variable references:
+ * mark it so a symbol inside it stays a literal instead of resolving against
+ * the environment. Mirrors mark_ipc_literal_fallbacks in core/ipc.c. */
+static void q_mark_literals(ray_t *obj) {
+  if (obj == NULL || RAY_IS_ERR(obj) || obj->type != RAY_LIST)
+    return;
+  obj->attrs |= RAY_EVAL_LITERAL_FALLBACK;
+  ray_t **elems = (ray_t **)ray_data(obj);
+  for (int64_t i = 0; i < ray_len(obj); i++)
+    q_mark_literals(elems[i]);
+}
+
 static ray_t *q_journal_form(ray_t *req);
 
 /* Turn a decoded request into a result. Borrows `req`.
@@ -150,13 +188,34 @@ static ray_t *q_journal_form(ray_t *req);
  * identity for plain data and a call for an expression list: a q peer's
  * `(`fn;arg;…)` message therefore invokes `fn`, exactly as it would in q.
  * Same contract as the native IPC server (core/ipc.c). */
-static ray_t *eval_request(ray_t *req) {
+/* Call a hook lambda on `req`. The hook is retained for the call: it may
+ * replace or clear itself (`.q.on`) while running. */
+static ray_t *q_call_hook(ray_t *hook, ray_t *req) {
+  ray_retain(hook);
+  ray_t *res = call_fn1(hook, req);
+  ray_release(hook);
+  return res;
+}
+
+static ray_t *eval_request(ray_t *req, int msgtype) {
   if (req == NULL)
     return NULL; /* empty request -> identity reply */
   if (RAY_IS_ERR(req))
     return ray_error("q server: malformed request", NULL);
 
+  /* `.q.on 'sync` / `'async`: the hook gets the decoded request exactly as
+   * `.ipc.on.sync` does (a char vector arrives unparsed, a list with its
+   * argument lists marked literal) and its value is the reply. */
+  ray_t *hook = q_hooks[msgtype == Q_MSG_SYNC ? Q_HOOK_SYNC : Q_HOOK_ASYNC];
+
   if (req->type == -RAY_STR) {
+    if (hook != NULL) {
+      ray_raise_clear();
+      ray_t *res = q_call_hook(hook, req);
+      if (res != NULL && ray_is_lazy(res))
+        res = ray_lazy_materialize(res);
+      return res;
+    }
     size_t len = ray_str_len(req);
     /* kdb answers `h ""` with the identity (::); tools and feeds use it as a
      * ping/flush. An empty or whitespace-only request is that, not a parse
@@ -185,12 +244,23 @@ static ray_t *eval_request(ray_t *req) {
    * dispatch and WAL replay run the same expression and cannot disagree
    * (a LIST argument whose head names a callable, such as (`upd;(`in;1 2)),
    * reaches the handler as the list, as it does in kdb+, on both paths). */
-  ray_t *form = q_journal_form(req); /* NULL: not a call, evaluate as is */
+  ray_t *form = hook ? NULL : q_journal_form(req); /* NULL: evaluate as is */
   if (form != NULL && RAY_IS_ERR(form))
     return form;
   if (Q_HAVE_RAISE(ray_raise_clear))
     ray_raise_clear(); /* ray_eval_str does this; a raise left over is not ours */
-  ray_t *res = ray_eval(form ? form : req);
+  ray_t *res;
+  if (hook != NULL) {
+    /* A hook gets the request as data: LIST arguments marked literal. */
+    if (req->type == RAY_LIST) {
+      ray_t **elems = (ray_t **)ray_data(req);
+      for (int64_t i = 1; i < ray_len(req); i++)
+        q_mark_literals(elems[i]);
+    }
+    res = q_call_hook(hook, req);
+  } else {
+    res = ray_eval(form ? form : req);
+  }
   if (form != NULL)
     ray_release(form);
   /* A lazy result is an internal deferred-DAG value that cannot be
@@ -348,6 +418,43 @@ static int64_t q_send_fn(int64_t fd, uint8_t *buf, int64_t len) {
   return (int64_t)send((int)fd, buf, (size_t)len, flags);
 }
 
+/* Queue a complete encoded frame on the connection's tx list and arm the
+ * poll to write it. Takes ownership of `buf` (freed on every path). Used for
+ * RESPONSEs and for pushed ASYNC frames alike: nothing here waits on the peer. */
+static int q_queue_frame(ray_poll_t *poll, ray_selector_t *sel, uint8_t *buf,
+                         int64_t len) {
+  int64_t queued = 0;
+  for (ray_poll_buf_t *p = sel->tx.buf; p != NULL; p = p->next) {
+    int64_t pending = p->size - p->offset;
+    if (pending < 0 || queued > Q_MAX_BODY - pending) {
+      free(buf);
+      return -1;
+    }
+    queued += pending;
+  }
+  if (len > Q_MAX_BODY - queued) {
+    free(buf);
+    return -1;
+  }
+  ray_poll_buf_t *out = ray_poll_buf_new(len);
+  if (out == NULL) {
+    free(buf);
+    return -1;
+  }
+  memcpy(out->data, buf, (size_t)len);
+  free(buf);
+  if (sel->tx.buf == NULL) {
+    sel->tx.buf = out;
+  } else {
+    ray_poll_buf_t *tail = sel->tx.buf;
+    while (tail->next != NULL)
+      tail = tail->next;
+    tail->next = out;
+  }
+  ray_poll_tx_request(poll, sel);
+  return 0;
+}
+
 static int q_send_result(ray_poll_t *poll, ray_selector_t *sel, ray_t *result) {
   uint8_t *buf = NULL;
   int64_t len = 0;
@@ -383,36 +490,7 @@ static int q_send_result(ray_poll_t *poll, ray_selector_t *sel, ray_t *result) {
       return -1;
   }
   buf[1] = Q_MSG_RESPONSE;
-  int64_t queued = 0;
-  for (ray_poll_buf_t *p = sel->tx.buf; p != NULL; p = p->next) {
-    int64_t pending = p->size - p->offset;
-    if (pending < 0 || queued > Q_MAX_BODY - pending) {
-      free(buf);
-      return -1;
-    }
-    queued += pending;
-  }
-  if (len > Q_MAX_BODY - queued) {
-    free(buf);
-    return -1;
-  }
-  ray_poll_buf_t *out = ray_poll_buf_new(len);
-  if (out == NULL) {
-    free(buf);
-    return -1;
-  }
-  memcpy(out->data, buf, (size_t)len);
-  free(buf);
-  if (sel->tx.buf == NULL) {
-    sel->tx.buf = out;
-  } else {
-    ray_poll_buf_t *tail = sel->tx.buf;
-    while (tail->next != NULL)
-      tail = tail->next;
-    tail->next = out;
-  }
-  ray_poll_tx_request(poll, sel);
-  return 0;
+  return q_queue_frame(poll, sel, buf, len);
 }
 
 static void q_close_listener(ray_poll_t *poll, ray_selector_t *sel) {
@@ -484,6 +562,7 @@ static ray_t *q_read_handshake(ray_poll_t *poll, ray_selector_t *sel) {
 
   if (b == 0x00) {
     uint8_t reply = cd->cap < Q_CAP_MAX ? cd->cap : Q_CAP_MAX;
+    cd->established = 1;
     ray_sock_send((ray_sock_t)sel->fd, &reply, 1);
     sel->rx.read_fn = q_read_header;
     ray_poll_rx_request(poll, sel, (int64_t)sizeof(q_header_t));
@@ -666,8 +745,7 @@ static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
    * cleared: a handler that pumps another connection (a .q.send on it)
    * dispatches that connection's frames from inside this one. */
   int64_t prev_handle = q_current_handle;
-  if (cd->outbound)
-    q_current_handle = id;
+  q_current_handle = id; /* inbound and outbound alike */
   ray_t *result = NULL;
   int journaled = req && !RAY_IS_ERR(req) && hdr.msgtype == Q_MSG_SYNC &&
                   ray_journal_is_open();
@@ -681,7 +759,7 @@ static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
 #else
     (void)journaled;
 #endif
-    result = req ? eval_request(req)
+    result = req ? eval_request(req, hdr.msgtype)
                  : ray_error("q server: malformed request", "%s",
                              err[0] ? err : "q server: decode failed");
 #ifdef RAY_IPC_HAS_SET_AUTO_JOURNAL_EVAL
@@ -707,10 +785,36 @@ static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
   return NULL;
 }
 
+/* `.q.on 'close`: once per established inbound connection, just before its
+ * state is torn down, so the hook can still read `.q.handle`. Errors are
+ * logged and swallowed -- a buggy hook must not wedge teardown. */
+static void q_fire_close_hook(int64_t id) {
+  ray_t *hook = q_hooks[Q_HOOK_CLOSE];
+  if (hook == NULL || __VM == NULL)
+    return;
+  ray_t *arg = ray_i64(id);
+  if (arg == NULL || RAY_IS_ERR(arg))
+    return;
+  int64_t prev = q_current_handle;
+  q_current_handle = id;
+  ray_raise_clear();
+  ray_t *r = q_call_hook(hook, arg);
+  q_current_handle = prev;
+  if (r != NULL && RAY_IS_ERR(r))
+    fprintf(stderr, "q: .q.on close hook raised an error (handle=%lld)\n",
+            (long long)id);
+  ray_release(arg);
+  q_release_any(r);
+}
+
 static void q_on_close(ray_poll_t *poll, ray_selector_t *sel) {
   (void)poll;
   if (sel->data) {
     q_conn_t *cd = (q_conn_t *)sel->data;
+    if (!cd->outbound && cd->established) {
+      cd->closing = 1;
+      q_fire_close_hook(sel->id);
+    }
     /* A RESPONSE deposited for a sync wait that never consumed it (peer died
      * mid-round-trip) would otherwise leak. */
     if (cd->sync_resp)
@@ -849,6 +953,25 @@ static int q_send_frame_until(int fd, const uint8_t *buf, size_t len,
   return 0;
 }
 
+/* Write whatever is queued on the selector (RESPONSEs, posted frames) before
+ * a direct write of our own, so the two never interleave inside a frame.
+ * Mirrors conn_tx_drain_blocking in core/ipc.c. */
+static int q_drain_tx(ray_poll_t *poll, ray_selector_t *sel, int bounded,
+                      int64_t deadline_ms) {
+  while (sel->tx.buf != NULL) {
+    ray_poll_buf_t *b = sel->tx.buf;
+    int64_t rem = b->size - b->offset;
+    if (rem > 0 && q_send_frame_until((int)sel->fd, b->data + b->offset,
+                                      (size_t)rem, bounded, deadline_ms) < 0)
+      return -1;
+    sel->tx.buf = b->next;
+    b->next = NULL;
+    ray_poll_buf_free(b);
+  }
+  ray_poll_tx_cancel(poll, sel);
+  return 0;
+}
+
 /* The per-operation timeout q_connect applied to the socket (SO_RCVTIMEO).
  * Once the fd is non-blocking under a poll, the kernel no longer enforces
  * it, so q_conn_send has to — read it here before the switch. 0 = none. */
@@ -873,6 +996,7 @@ int64_t q_conn_attach(ray_poll_t *poll, int fd) {
     return -1;
   cd->magic = Q_CONN_MAGIC;
   cd->outbound = 1;
+  cd->established = 1;
   cd->sync_timeout_ms = timeout_ms;
 
   ray_poll_reg_t reg = {0};
@@ -898,7 +1022,8 @@ int64_t q_conn_attach(ray_poll_t *poll, int fd) {
 ray_t *q_conn_send(ray_poll_t *poll, int64_t id, ray_t *msg) {
   ray_selector_t *sel = poll ? ray_poll_get(poll, id) : NULL;
   if (sel == NULL || sel->close_fn != q_on_close || sel->data == NULL ||
-      ((q_conn_t *)sel->data)->magic != Q_CONN_MAGIC)
+      ((q_conn_t *)sel->data)->magic != Q_CONN_MAGIC ||
+      ((q_conn_t *)sel->data)->closing)
     return ray_error("handle", "q: not an open connection");
   q_conn_t *cd = (q_conn_t *)sel->data;
   if (cd->sync_waiting)
@@ -913,7 +1038,10 @@ ray_t *q_conn_send(ray_poll_t *poll, int64_t id, ray_t *msg) {
     return ray_error("send", "%s", err[0] ? err : "q: encode failed");
   int bounded = cd->sync_timeout_ms > 0;
   int64_t deadline_ms = bounded ? ray_time_now_ms() + cd->sync_timeout_ms : 0;
-  int send_rc = q_send_frame_until((int)sel->fd, req, (size_t)req_len, bounded,
+  /* Frames posted earlier may still be queued: they go first. */
+  int send_rc = q_drain_tx(poll, sel, bounded, deadline_ms);
+  if (send_rc == 0)
+    send_rc = q_send_frame_until((int)sel->fd, req, (size_t)req_len, bounded,
                                    deadline_ms);
   free(req);
   if (send_rc < 0) {
@@ -970,12 +1098,32 @@ ray_t *q_conn_send(ray_poll_t *poll, int64_t id, ray_t *msg) {
   }
 }
 
+ray_t *q_conn_post(ray_poll_t *poll, int64_t id, ray_t *msg) {
+  ray_selector_t *sel = poll ? ray_poll_get(poll, id) : NULL;
+  if (sel == NULL || sel->close_fn != q_on_close || sel->data == NULL ||
+      ((q_conn_t *)sel->data)->magic != Q_CONN_MAGIC ||
+      ((q_conn_t *)sel->data)->closing || !((q_conn_t *)sel->data)->established)
+    return ray_error("handle", "q: not an open connection");
+  uint8_t *buf = NULL;
+  int64_t len = 0;
+  char err[128] = {0};
+  if (q_encode(msg, &buf, &len, err, sizeof err) < 0)
+    return ray_error("io", "%s", err[0] ? err : "q: encode failed");
+  buf[1] = Q_MSG_ASYNC; /* q_encode stamps SYNC */
+  /* Queued, not written: the poll flushes it when the socket is writable, so
+   * a slow subscriber cannot stall the publisher. */
+  if (q_queue_frame(poll, sel, buf, len) < 0)
+    return ray_error("io", "q: post queue full or out of memory");
+  return NULL;
+}
+
 int q_conn_is_handle(ray_poll_t *poll, int64_t id) {
   if (poll == NULL)
     return 0;
   ray_selector_t *sel = ray_poll_get(poll, id);
   return sel != NULL && sel->close_fn == q_on_close && sel->data != NULL &&
-         ((q_conn_t *)sel->data)->magic == Q_CONN_MAGIC;
+         ((q_conn_t *)sel->data)->magic == Q_CONN_MAGIC &&
+         !((q_conn_t *)sel->data)->closing;
 }
 
 void q_conn_close(ray_poll_t *poll, int64_t id) {

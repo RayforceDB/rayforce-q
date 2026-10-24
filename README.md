@@ -44,6 +44,27 @@ The server is exposed via the `-q PORT` flag — it shares the REPL's event loop
 ./rayforce -q 25565        # serve Rayfall over the Q wire on port 25565
 ```
 
+An empty (or whitespace-only) request answers `(::)`, like kdb's `h ""`. An error's text travels with its category, so q sees `'domain: custom failure`. With a journal open (`.log.open`, `-l`/`-L`) every inbound **sync** q frame is journaled before it is evaluated, exactly as the core does for native IPC, and a failed journal write refuses the request with an `io` error; async frames are not journaled.
+
+**Inbound connections** get the same handle, push and hook verbs as outbound ones, enough for a kdb-compatible pub/sub server:
+
+```clojure
+;; (.q.handle)         the connection whose frame (or close) is being handled; -1 elsewhere
+;; (.q.post h msg)     send msg as a q ASYNC frame on any open q connection, inbound or outbound;
+;;                     queued, never waits; null on success, `handle`/`io` errors otherwise
+;; (.q.on 'sync  fn)   hook: gets the decoded request, REPLACES the default eval, its value is the reply
+;; (.q.on 'async fn)   hook: gets the request, no reply
+;; (.q.on 'close fn)   hook: gets the handle, once per inbound connection, just before teardown
+;; (.q.on 'sync 0)     any non-lambda clears the hook
+(.q.on 'sync (fn [r]
+  (if (== (first r) '.net.sub)               ;; q: h(`.net.sub;5) -- a name the default eval could not call
+      (do (set subs (concat subs (list (.q.handle)))) 5)
+      (eval r))))
+(.q.post (first subs) (list 'upd (dict ['a 'b] [1 2])))   ;; q client receives (`upd;`a`b!1 2) async
+```
+
+`.q.on.*` cannot be `set` from Rayfall (dotted names are reserved), hence the verb; semantics mirror the core's `.ipc.on.*`. A char-vector request reaches the sync/async hook as an unparsed string (`(eval (parse r))` reproduces the default), a hook error is encoded to the client (sync) or logged (async, close). `(.q.handle)` is valid inside all three hooks. Hooks are process-global and live as long as the runtime.
+
 Both `-q` and `--q-serve` require a decimal TCP port in `1..65535`. A
 missing or invalid port prints a diagnostic and exits with status `2`, so a
 service supervisor does not mistake a failed Q listener for a healthy
@@ -101,6 +122,10 @@ To *be* a Q server (the mirror of the client), bindings additionally compile [`q
  * runs on the same event loop as the REPL/IPC (no thread). Returns a poll
  * selector id (>= 0), or -1. */
 int64_t q_serve(ray_poll_t *poll, int port);
+
+/* Push, hooks (see the Rayfall verbs above). */
+ray_t  *q_conn_post(ray_poll_t *poll, int64_t id, ray_t *msg);  /* async frame; NULL or error */
+int     q_hook_set(int which, ray_t *fn);   /* Q_HOOK_SYNC / _ASYNC / _CLOSE; non-lambda clears */
 ```
 
 A connected Q client (real Q `hopen`, or `q_connect`) sends a char-vector. The server evaluates it as **Rayfall** against the embedded runtime and returns the result Q-encoded.

@@ -61,6 +61,7 @@ static int run_server(int port) {
     fprintf(stderr, "driver: failed to create rayforce runtime\n");
     return 1;
   }
+  q_env_register(); /* .q.post / .q.on / .q.handle for the served runtime */
   ray_poll_t *poll = ray_poll_create();
   if (poll == NULL) {
     fprintf(stderr, "driver: failed to create poll\n");

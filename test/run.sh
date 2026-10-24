@@ -482,6 +482,58 @@ kill "$WALPID2" 2>/dev/null || true
 wait "$WALPID2" 2>/dev/null || true
 fi
 
+# ---- Leg 2c: inbound connections -- .q.handle, .q.post, .q.on hooks
+# A kdb-compatible pub/sub server on the embedded runtime: a sync hook answers
+# `(.net.sub;5)` (a reserved-looking name arriving as the head symbol of a q
+# list, which the default eval could not call), records the subscriber's handle,
+# and another client makes the server push `(`upd;data)` async frames back
+# with .q.post. A dedicated server keeps the hooks away from the other legs.
+echo "real-q hooks: .q.handle / .q.post / .q.on on inbound connections ..."
+HKPORT="$(free_port)"
+"$DRIVER" --serve "$HKPORT" 2>"$WORK/hooks.err" &
+HKPID=$!
+PIDS+=("$HKPID")
+wait_for_port "$HOST" "$HKPORT" || { echo "hooks server did not come up" >&2; exit 1; }
+cat > "$WORK/hooks.q" <<'QEOF'
+port:"I"$getenv`RFPORT
+h:hopen `$":127.0.0.1:",string port
+h2:hopen `$":127.0.0.1:",string port
+names:();oks:()
+T:{[nm;b] names,:enlist nm; oks,:enlist b}
+got:()
+upd:{got,::enlist x}
+r:h"(do (set subs (list)) (set closed (list)) (set seen (list)) (.q.on 'sync (fn [r] (if (== (type r) 'str) (eval (parse r)) (if (== (first r) '.net.sub) (do (set subs (concat subs (list (.q.handle)))) 5) r)))) (.q.on 'async (fn [r] (set seen (concat seen (list (list r (.q.handle))))))) (.q.on 'close (fn [x] (set closed (concat closed (list (list x (.q.handle))))))) 1)"
+T["reserved name reaches sync hook"; 5~h(`.net.sub;5)]
+sh:h"(first subs)"
+T["handle is the inbound conn"; (sh~h"(.q.handle)")]
+T["hook value is the reply"; (`foo;`a`b!1 2)~h(`foo;`a`b!1 2)]
+T["string reaches hook unparsed"; 7~h"(+ 3 4)"]
+r:h2"(.q.post (first subs) (list 'upd (dict ['a 'b] [1 2])))"
+T["post returns null"; (::)~r]
+r:h"1"
+T["pushed async arrives"; got~enlist `a`b!1 2]
+neg[h](`ping;3); r:h"1"
+T["async hook sees request + handle"; (enlist((`ping;3);sh))~h2"seen"]
+T["post to bad handle"; @[h2;"(.q.post 99999 1)";{x like "handle*"}]]
+hclose h
+system"sleep 0.3"
+T["close hook fired once"; (enlist(sh;sh))~h2"closed"]
+r:h2"(.q.on 'sync (fn [r] (if (== r \"boom\") (raise \"hook failed\") (eval (parse r)))))"
+/ the raised text needs a core with ray_raise_render; before it the category alone arrives
+RA:not"0"=first getenv`RAISE_API
+T["hook error reaches client"; $[RA;"domain: hook failed"~@[h2;"boom";{x}];@[h2;"boom";{x like "domain*"}]]]
+r:h2"(do (.q.on 'sync 0) (.q.on 'async 0) (.q.on 'close 0) 1)"
+T["hook cleared"; 3~h2"(+ 1 2)"]
+hclose h2
+bad:names where not oks
+if[count bad; -2 "q hooks FAILED: ",", " sv bad; exit 1]
+-1 "q hooks ok (",(string count names)," assertions)"
+exit 0
+QEOF
+RAISE_API="$RAISE_API" RFPORT="$HKPORT" QHOME="${QHOME:-$(q_home_for "$QBIN")}" "$QBIN" "$WORK/hooks.q" -q < /dev/null
+kill "$HKPID" 2>/dev/null || true
+wait "$HKPID" 2>/dev/null || true
+
 # ---- Leg 3: client tests against real Q server
 export QHOME="${QHOME:-$(q_home_for "$QBIN")}"
 export QLIC="${QLIC:-$QHOME}"

@@ -4,6 +4,21 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Added
+
+- **Inbound q connections: handle, push, hooks.** `(.q.handle)` now also names
+  an *inbound* connection while its frame is being handled (it was outbound
+  only). `(.q.post h msg)` sends `msg` as a q ASYNC frame on any open q
+  connection and returns at once (queued on the poll; a later `.q.send` on the
+  same handle flushes it first, so order is kept); `handle`/`io` errors
+  otherwise. `(.q.on 'sync|'async|'close fn)` registers hooks that mirror the
+  core's `.ipc.on.*` (`.q.on.*` cannot be `set`): the sync hook receives the
+  decoded request, replaces the default eval and its value is the reply; the
+  async hook has no reply; the close hook gets the handle once per inbound
+  connection just before teardown (errors logged and swallowed). A non-lambda
+  clears a hook. A char-vector request reaches the hooks unparsed. In C:
+  `q_conn_post`, `q_hook_set`.
+
 ### Fixed
 
 - **q-wire SYNC frames are journaled when a WAL is open.** The core logs every
