@@ -144,6 +144,18 @@ static ray_t *eval_request(ray_t *req) {
 
   if (req->type == -RAY_STR) {
     size_t len = ray_str_len(req);
+    /* kdb answers `h ""` with the identity (::); tools and feeds use it as a
+     * ping/flush. An empty or whitespace-only request is that, not a parse
+     * error. */
+    {
+      const char *p = ray_str_ptr(req);
+      size_t i = 0;
+      while (i < len && (p[i] == ' ' || p[i] == '\t' || p[i] == '\n' ||
+                         p[i] == '\r'))
+        i++;
+      if (i == len)
+        return NULL;
+    }
     char *src = (char *)malloc(len + 1);
     if (src == NULL)
       return ray_error("q server: out of memory", NULL);

@@ -26,6 +26,10 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
   `ray_ipc_set_auto_journal_eval`, the eval runs in the core's auto-journal
   scope and a nested `.log.write` is refused, as for a native frame.
 
+- **An empty request returns `(::)`, not `parse`.** q `h ""` (and a
+  whitespace-only string) is the ping/flush kdb tools and feeds use; the
+  server now answers it with the identity instead of a Rayfall parse error.
+
 ## [2.6.0]
 
 Needs rayforce core v2.11.0 or later, for `ray_sock_set_keepalive` (core

@@ -322,6 +322,10 @@ T["null i64";    0N~h"0Nl"]
 T["null i32";    0Ni~h"0Ni"]
 T["null f64";    0n~h"0Nf"]
 T["null sym";    (`)~h"(as 'sym \"\")"]
+/ an empty or blank request is the identity (::), kdb's ping/flush
+T["empty request";   (::)~h""]
+T["blank request";   (::)~h"  "]
+T["still evaluates"; 3~h"(+ 1 2)"]
 / server-side parse error comes back as a Q error frame
 T["parse err";   @[h;"(+ 1 2";{x like "*parse*"}]]
 hclose h
