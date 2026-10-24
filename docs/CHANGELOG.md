@@ -2,6 +2,14 @@
 
 All notable changes to `rayforce-q` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/), and the project adheres to [Semantic Versioning](https://semver.org/). Bindings pin a tag, so each release is a stable point they can build against.
 
+## [Unreleased]
+
+### Fixed
+
+- **An empty request returns `(::)`, not `parse`.** q `h ""` (and a
+  whitespace-only string) is the ping/flush kdb tools and feeds use; the
+  server now answers it with the identity instead of a Rayfall parse error.
+
 ## [2.6.0]
 
 Needs rayforce core v2.11.0 or later, for `ray_sock_set_keepalive` (core
