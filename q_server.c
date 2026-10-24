@@ -41,6 +41,7 @@
 #include "q_server.h" /* q_serve, q_conn_*, ray_poll_t                          */
 #include "q.h" /* pulls in <rayforce.h>: ray_eval_str, q_encode/q_decode */
 
+#include "core/runtime.h" /* ray_error_msg                                     */
 #include "core/sock.h" /* ray_sock_listen/accept/recv/send/close               */
 #include "core/timer.h" /* ray_time_now_ms                                     */
 #include "lang/eval.h" /* ray_eval, RAY_EVAL_LITERAL_FALLBACK                  */
@@ -70,11 +71,11 @@ typedef struct {
 #define Q_MSG_SYNC 1
 #define Q_MSG_RESPONSE 2
 #define Q_CAP_MAX 3 /* matches q.c client capability  */
-/* A connection the listener accepted may come from anyone, so its frames
- * are capped at 256 MiB, which bounds what a stranger can make this process
- * allocate. One q_conn_attach took was opened by this process to a peer it
- * chose, and gets what the classic header can declare, as in q.c. The replies
- * q_send_result queues stay within 256 MiB on either. */
+/* A connection the listener accepted may come from anyone, so a frame's
+ * body, on the wire and decompressed, is capped at 256 MiB. One q_conn_attach
+ * took was opened by this process to a peer it chose, and gets what the
+ * classic header can declare, as in q.c. The replies q_send_result queues
+ * stay within 256 MiB on either. */
 #define Q_MAX_BODY ((int64_t)256 << 20)
 #define Q_MAX_CLIENT_BODY ((int64_t)INT32_MAX - (int64_t)sizeof(q_header_t))
 #define Q_RX_CHUNK_SIZE ((int64_t)64 << 10)
