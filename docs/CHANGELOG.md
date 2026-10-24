@@ -2,6 +2,18 @@
 
 All notable changes to `rayforce-q` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/), and the project adheres to [Semantic Versioning](https://semver.org/). Bindings pin a tag, so each release is a stable point they can build against.
 
+## [Unreleased]
+
+### Changed
+
+- **`-q` listens on loopback by default.** The q listener bound every
+  interface. `rayforce -q [HOST:]PORT` now binds `HOST` (mirroring the core's
+  `--port HOST:PORT`), else `$RAYFORCE_Q_BIND_HOST`, else `127.0.0.1`; pass
+  `0.0.0.0` for the old behaviour. A host that is not an IPv4 address fails
+  instead of widening the bind. **Behaviour change** for deployments that
+  reached `-q` from another machine. In C: `q_serve_at(poll, host, port)`;
+  `q_serve` keeps the wildcard bind for bindings.
+
 ## [2.6.0]
 
 Needs rayforce core v2.11.0 or later, for `ray_sock_set_keepalive` (core
