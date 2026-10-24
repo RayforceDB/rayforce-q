@@ -174,6 +174,7 @@ static ray_t *eval_request(ray_t *req) {
   ray_t *form = q_journal_form(req); /* NULL: not a call, evaluate as is */
   if (form != NULL && RAY_IS_ERR(form))
     return form;
+  ray_raise_clear(); /* ray_eval_str does this; a raise left over is not ours */
   ray_t *res = ray_eval(form ? form : req);
   if (form != NULL)
     ray_release(form);
@@ -336,7 +337,29 @@ static int q_send_result(ray_poll_t *poll, ray_selector_t *sel, ray_t *result) {
   uint8_t *buf = NULL;
   int64_t len = 0;
   char err[128] = {0};
-  if (q_encode(result, &buf, &len, err, sizeof err) < 0) {
+  /* An error object carries only its category. The explanation is either the
+   * runtime's last-error message or, for an uncaught (raise x), the pending
+   * raised value (as the REPL prints it). Load it into the last-error slot
+   * right before q_encode, which frames it as "category: message" so a q
+   * client sees `'domain: custom failure` rather than a bare `'domain`. */
+  ray_t *loaded = NULL;
+  if (result != NULL && RAY_IS_ERR(result)) {
+    char raised[256];
+    const char *detail = ray_error_msg();
+    if (detail == NULL && ray_raise_render(raised, sizeof raised))
+      detail = raised;
+    if (detail != NULL) {
+      char text[256];
+      snprintf(text, sizeof text, "%s", detail);
+      const char *code = ray_err_code(result);
+      loaded = ray_error(code ? code : "error", "%s", text);
+      result = loaded;
+    }
+  }
+  int enc = q_encode(result, &buf, &len, err, sizeof err);
+  if (loaded != NULL)
+    ray_error_free(loaded);
+  if (enc < 0) {
     ray_t *e = ray_error(err[0] ? err : "q server: encode failed", NULL);
     int rc = q_encode(e, &buf, &len, err, sizeof err);
     q_release_any(e);

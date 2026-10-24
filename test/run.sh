@@ -326,6 +326,13 @@ T["null sym";    (`)~h"(as 'sym \"\")"]
 T["empty request";   (::)~h""]
 T["blank request";   (::)~h"  "]
 T["still evaluates"; 3~h"(+ 1 2)"]
+/ the error text reaches q: "category: message", not the bare category
+T["raise text";      "domain: custom failure"~@[h;"(raise \"custom failure\")";{x}]]
+T["name text";       @[h;"(undefined_fn 1)";{(x like "name: *")&0<count x ss "undefined_fn"}]]
+T["builtin text";    @[h;"(+ 1 \"a\")";{x like "type: *"}]]
+T["no message";      "parse"~@[h;"(+ 1 2";{x}]]
+r:h"(do (set boom (fn [x] (raise \"custom failure\"))) 1)"
+T["raise via call";  "domain: custom failure"~@[h;(`boom;::);{x}]]
 / server-side parse error comes back as a Q error frame
 T["parse err";   @[h;"(+ 1 2";{x like "*parse*"}]]
 hclose h
