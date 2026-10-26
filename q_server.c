@@ -60,6 +60,20 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 
+/* ray_raise_clear / ray_raise_render (the pending uncaught-raise slot) exist
+ * in core v3.0.1; v2.11.x has neither. Declaring them weak keeps this file
+ * building and linking against the older cores: the address is NULL there and
+ * the calls below are skipped, so an error frame falls back to the category
+ * plus the last-error message. They live in lang/eval.c beside ray_eval, so a
+ * static libray pulls them in whenever they exist. */
+#if defined(__GNUC__) || defined(__clang__)
+extern void ray_raise_clear(void) __attribute__((weak));
+extern bool ray_raise_render(char *buf, size_t cap) __attribute__((weak));
+#define Q_HAVE_RAISE(fn) ((fn) != NULL)
+#else
+#define Q_HAVE_RAISE(fn) 1
+#endif
+
 /* Wire header — must match q.c byte-for-byte */
 typedef struct {
   uint8_t endianness; /* 1 = little-endian                              */
@@ -144,6 +158,18 @@ static ray_t *eval_request(ray_t *req) {
 
   if (req->type == -RAY_STR) {
     size_t len = ray_str_len(req);
+    /* kdb answers `h ""` with the identity (::); tools and feeds use it as a
+     * ping/flush. An empty or whitespace-only request is that, not a parse
+     * error. */
+    {
+      const char *p = ray_str_ptr(req);
+      size_t i = 0;
+      while (i < len && (p[i] == ' ' || p[i] == '\t' || p[i] == '\n' ||
+                         p[i] == '\r'))
+        i++;
+      if (i == len)
+        return NULL;
+    }
     char *src = (char *)malloc(len + 1);
     if (src == NULL)
       return ray_error("q server: out of memory", NULL);
@@ -162,6 +188,8 @@ static ray_t *eval_request(ray_t *req) {
   ray_t *form = q_journal_form(req); /* NULL: not a call, evaluate as is */
   if (form != NULL && RAY_IS_ERR(form))
     return form;
+  if (Q_HAVE_RAISE(ray_raise_clear))
+    ray_raise_clear(); /* ray_eval_str does this; a raise left over is not ours */
   ray_t *res = ray_eval(form ? form : req);
   if (form != NULL)
     ray_release(form);
@@ -324,8 +352,35 @@ static int q_send_result(ray_poll_t *poll, ray_selector_t *sel, ray_t *result) {
   uint8_t *buf = NULL;
   int64_t len = 0;
   char err[128] = {0};
-  if (q_encode(result, &buf, &len, err, sizeof err) < 0) {
-    ray_t *e = ray_error(err[0] ? err : "q server: encode failed", NULL);
+  /* An error object carries only its category. The explanation is either the
+   * runtime's last-error message or, for an uncaught (raise x), the pending
+   * raised value (as the REPL prints it). Load it into the last-error slot
+   * right before q_encode, which frames it as "category: message" so a q
+   * client sees `'domain: custom failure` rather than a bare `'domain`. */
+  ray_t *loaded = NULL;
+  if (result != NULL && RAY_IS_ERR(result)) {
+    char raised[256];
+    const char *detail = ray_error_msg();
+    if (detail == NULL && Q_HAVE_RAISE(ray_raise_render) &&
+        ray_raise_render(raised, sizeof raised))
+      detail = raised;
+    if (detail != NULL) {
+      char text[256];
+      snprintf(text, sizeof text, "%s", detail);
+      const char *code = ray_err_code(result);
+      loaded = ray_error(code ? code : "error", "%s", text);
+      result = loaded;
+    }
+  }
+  int enc = q_encode(result, &buf, &len, err, sizeof err);
+  if (loaded != NULL)
+    ray_error_free(loaded);
+  if (enc < 0) {
+    /* The text is the message, not the code: ray_error() keeps only 7 bytes
+     * of a code, so passing it as the code sent a client "q: cann" for
+     * "q: cannot encode ...". Same loading as above so q_encode frames
+     * "category: message". */
+    ray_t *e = ray_error("type", "%s", err[0] ? err : "q server: encode failed");
     int rc = q_encode(e, &buf, &len, err, sizeof err);
     q_release_any(e);
     if (rc < 0)
@@ -673,16 +728,23 @@ static void q_on_close(ray_poll_t *poll, ray_selector_t *sel) {
 }
 
 /* Register a Q-protocol listener on `poll`. */
-int64_t q_serve(ray_poll_t *poll, int port) {
+int64_t q_serve_at(ray_poll_t *poll, const char *host, int port) {
   if (poll == NULL)
     return -1;
   if (port < 1 || port > 65535) {
     fprintf(stderr, "q: invalid port %d (expected 1..65535)\n", port);
     return -1;
   }
-  ray_sock_t fd = ray_sock_listen((uint16_t)port);
+  int bound = host != NULL && *host != '\0';
+  /* A NULL or empty host is the wildcard; a host that is not an IPv4 address
+   * fails the bind loudly, never falling back to all interfaces. */
+  ray_sock_t fd = ray_sock_listen_at(bound ? host : NULL, (uint16_t)port);
   if (fd == RAY_INVALID_SOCK) {
-    fprintf(stderr, "q: cannot listen on port %d (in use?)\n", port);
+    if (bound)
+      fprintf(stderr, "q: cannot listen on %s:%d (in use, or not an IPv4 address?)\n",
+              host, port);
+    else
+      fprintf(stderr, "q: cannot listen on port %d (in use?)\n", port);
     return -1;
   }
   ray_sock_set_nonblocking(fd);
@@ -698,8 +760,16 @@ int64_t q_serve(ray_poll_t *poll, int port) {
     ray_sock_close(fd);
     return -1;
   }
-  fprintf(stderr, "q: listening on %d (Rayfall over the Q wire)\n", port);
+  if (bound)
+    fprintf(stderr, "q: listening on %s:%d (Rayfall over the Q wire)\n", host,
+            port);
+  else
+    fprintf(stderr, "q: listening on %d (Rayfall over the Q wire)\n", port);
   return id;
+}
+
+int64_t q_serve(ray_poll_t *poll, int port) {
+  return q_serve_at(poll, NULL, port);
 }
 
 /* ===================== Outbound connections ===============================

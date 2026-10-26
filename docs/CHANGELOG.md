@@ -4,6 +4,16 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Changed
+
+- **`-q` listens on loopback by default.** The q listener bound every
+  interface. `rayforce -q [HOST:]PORT` now binds `HOST` (mirroring the core's
+  `--port HOST:PORT`), else `$RAYFORCE_Q_BIND_HOST`, else `127.0.0.1`; pass
+  `0.0.0.0` for the old behaviour. A host that is not an IPv4 address fails
+  instead of widening the bind. **Behaviour change** for deployments that
+  reached `-q` from another machine. In C: `q_serve_at(poll, host, port)`;
+  `q_serve` keeps the wildcard bind for bindings.
+
 ### Fixed
 
 - **q-wire SYNC frames are journaled when a WAL is open.** The core logs every
@@ -25,6 +35,22 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
   `limit` error before it is written or evaluated. With a core that provides
   `ray_ipc_set_auto_journal_eval`, the eval runs in the core's auto-journal
   scope and a nested `.log.write` is refused, as for a native frame.
+
+- **Error text reaches the q client.** A server-side `(raise "custom failure")`
+  arrived as `'domain` and `(undefined_fn 1)` as `'name`: only the category was
+  encoded. The error frame now reads `category: message` (the message alone
+  when it already starts with the category), so q sees
+  `'domain: custom failure`; an error with no message is still the bare
+  category. The text of an uncaught `raise` is taken from the pending raised
+  value, as the REPL prints it.
+  The core floor stays v2.11.0: `ray_raise_clear`/`ray_raise_render` (v3.0.1, absent in v2.11.x)
+  are weak references, so on v2.11.x an uncaught `raise` is the bare category.
+  Built and tested (`make test` with a real q) against v2.11.5 (`5d5f47c2`) and
+  the pinned dev core.
+
+- **An empty request returns `(::)`, not `parse`.** q `h ""` (and a
+  whitespace-only string) is the ping/flush kdb tools and feeds use; the
+  server now answers it with the identity instead of a Rayfall parse error.
 
 ## [2.6.0]
 

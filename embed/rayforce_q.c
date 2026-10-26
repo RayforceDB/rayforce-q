@@ -272,12 +272,36 @@ int64_t q_serve_from_args(ray_poll_t *poll, int argc, char **argv) {
                 argv[i]);
         return -1;
       }
+      /* PORT or HOST:PORT (mirrors the core's --port HOST:PORT). The host
+       * comes from the argument, else RAYFORCE_Q_BIND_HOST, else loopback:
+       * a q listener evaluates what it is sent, so it must be asked for
+       * before it faces the network ("0.0.0.0" binds every interface). */
+      const char *spec = argv[++i];
+      char host[64];
+      const char *arg_host = NULL;
+      const char *colon = strrchr(spec, ':');
+      if (colon != NULL) {
+        size_t hn = (size_t)(colon - spec);
+        if (hn >= sizeof host) {
+          fprintf(stderr, "q: invalid host in %s\n", spec);
+          return -1;
+        }
+        memcpy(host, spec, hn);
+        host[hn] = '\0';
+        arg_host = host;
+        spec = colon + 1;
+      }
       int port = 0;
-      if (!q_parse_port(argv[++i], &port)) {
-        fprintf(stderr, "q: invalid port %s (expected 1..65535)\n", argv[i]);
+      if (!q_parse_port(spec, &port)) {
+        fprintf(stderr, "q: invalid port %s (expected 1..65535)\n", spec);
         return -1;
       }
-      return q_serve(poll, port);
+      const char *bind_host = arg_host;
+      if (bind_host == NULL || *bind_host == '\0')
+        bind_host = getenv("RAYFORCE_Q_BIND_HOST");
+      if (bind_host == NULL || *bind_host == '\0')
+        bind_host = "127.0.0.1";
+      return q_serve_at(poll, bind_host, port);
     }
   }
   return 0;
