@@ -313,6 +313,9 @@ fi
 # ---- Leg 2: real-q interop against Rayforce server
 find_q
 if [[ -n "$QBIN" ]]; then
+  RAISE_API=1
+  EVAL_H="$(dirname "$0")/tmp/rayforce-c/src/lang/eval.h"
+  if [[ -f "$EVAL_H" ]] && ! grep -q ray_raise_render "$EVAL_H"; then RAISE_API=0; fi
   echo "real-q interop: driving the server from $QBIN ..."
   QSCRIPT="$WORK/interop.q"   # q's loader requires a .q suffix
   # Drive Rayforce server (which evaluates the payloads as Rayfall) from real Q
@@ -358,6 +361,16 @@ T["null i64";    0N~h"0Nl"]
 T["null i32";    0Ni~h"0Ni"]
 T["null f64";    0n~h"0Nf"]
 T["null sym";    (`)~h"(as 'sym \"\")"]
+/ the error text reaches q: "category: message", not the bare category.
+/ A core without ray_raise_render (before v3) cannot recover the text of an
+/ uncaught raise; there the category alone is the contract.
+RA:not"0"=first getenv`RAISE_API
+T["raise text";      $[RA;"domain: custom failure"~@[h;"(raise \"custom failure\")";{x}];@[h;"(raise \"custom failure\")";{x like "domain*"}]]]
+T["name text";       @[h;"(undefined_fn 1)";{(x like "name: *")&0<count x ss "undefined_fn"}]]
+T["builtin text";    @[h;"(+ 1 \"a\")";{x like "type: *"}]]
+T["no message";      "parse"~@[h;"(+ 1 2";{x}]]
+r:h"(do (set boom (fn [x] (raise \"custom failure\"))) 1)"
+T["raise via call";  $[RA;"domain: custom failure"~@[h;(`boom;::);{x}];@[h;(`boom;::);{x like "domain*"}]]]
 / an empty or blank request is the identity (::), kdb's ping/flush
 T["empty request";   (::)~h""]
 T["blank request";   (::)~h"  "]
@@ -370,7 +383,7 @@ if[count bad; -2 "real-q interop FAILED: ",", " sv bad; exit 1]
 -1 "real-q interop ok (",(string count names)," assertions)"
 exit 0
 QEOF
-  RFPORT="$SERVERPORT" QHOME="${QHOME:-$(q_home_for "$QBIN")}" "$QBIN" "$QSCRIPT" -q < /dev/null
+  RAISE_API="$RAISE_API" RFPORT="$SERVERPORT" QHOME="${QHOME:-$(q_home_for "$QBIN")}" "$QBIN" "$QSCRIPT" -q < /dev/null
 else
   echo "SKIP: no q binary found (set Q_BINARY) — skipping real-q interop + client tests"
   exit 0

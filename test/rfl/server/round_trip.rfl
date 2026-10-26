@@ -23,6 +23,11 @@
 ;; A server-side evaluation error comes back as a Q error frame.
 (.q.send h "(+ 1 2") !- parse
 
+
+;; The category still arrives (the full "category: message" text is asserted
+;; from real q in run.sh; this client keeps only the leading 7 chars as code).
+(.q.send h "(raise \"custom failure\")") !- domain
+(.q.send h "(undefined_fn 1)") !- name
 ;; An empty or whitespace-only request is kdb's ping/flush: the identity (::),
 ;; not a parse error.
 (.q.send h "") -- null
