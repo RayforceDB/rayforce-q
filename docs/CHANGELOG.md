@@ -29,6 +29,13 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
 
 ### Fixed
 
+- **A frame left half written closes the connection.** With the direct send, a
+  reply or `.q.post` larger than the socket buffer is written in part and its
+  tail queued. When the tail could not be queued after a prefix had gone out,
+  the call reported `io` but left the handle open, and the next frame would
+  have been read as the rest of this one. The connection is now closed in that
+  case (a refusal with nothing written still leaves it untouched).
+
 - **q-wire SYNC frames are journaled when a WAL is open.** The core logs every
   inbound native SYNC frame before evaluating it (`.log.open` / `-l` / `-L`),
   but the q listener evaluated its frames with no journal hook, so a Rayfall

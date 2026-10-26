@@ -599,6 +599,10 @@ static int64_t q_send_fn(int64_t fd, uint8_t *buf, int64_t len) {
 /* Queue a complete encoded frame on the connection's tx list and arm the
  * poll to write it. Takes ownership of `buf` (freed on every path). Used for
  * RESPONSEs and for pushed ASYNC frames alike: nothing here waits on the peer. */
+/* Test seam: make the next unsent-tail allocation in q_queue_frame fail. */
+static int q_test_fail_tail_alloc;
+void q_test_fail_next_tail_alloc(void) { q_test_fail_tail_alloc = 1; }
+
 static int q_queue_frame(ray_poll_t *poll, ray_selector_t *sel, uint8_t *buf,
                          int64_t len) {
   /* Fast path: nothing is queued ahead of this frame, so write it straight
@@ -606,8 +610,15 @@ static int q_queue_frame(ray_poll_t *poll, ray_selector_t *sel, uint8_t *buf,
    * buffer, which saves the epoll_ctl(MOD) pair, the extra epoll_wait for
    * EPOLLOUT, the wasted recv the poll loop then tries, and the tx buffer
    * copy of the queue path. Only an unsent tail (EAGAIN or a short write)
-   * falls through to the queue. */
+   * falls through to the queue.
+   *
+   * Once a prefix is on the wire the frame can only be completed, never
+   * withdrawn: the peer would read the next frame's bytes as the rest of this
+   * one. So a failure after `sent > 0` closes the connection (the stream is
+   * unusable); a failure with nothing written is a plain refusal and leaves
+   * the connection as it was. */
   int64_t sent = 0;
+  int64_t id = sel->id;
   if (sel->tx.buf == NULL) {
     while (sent < len) {
       int64_t n = q_send_fn(sel->fd, buf + sent, len - sent);
@@ -620,6 +631,8 @@ static int q_queue_frame(ray_poll_t *poll, ray_selector_t *sel, uint8_t *buf,
       if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
         break;
       free(buf);
+      if (sent > 0)
+        ray_poll_deregister(poll, id);
       return -1; /* peer gone or hard error: the caller closes the connection */
     }
     if (sent == len) {
@@ -638,11 +651,19 @@ static int q_queue_frame(ray_poll_t *poll, ray_selector_t *sel, uint8_t *buf,
   }
   if (len - sent > Q_MAX_BODY - queued) {
     free(buf);
+    if (sent > 0)
+      ray_poll_deregister(poll, id);
     return -1;
   }
-  ray_poll_buf_t *out = ray_poll_buf_new(len - sent);
+  ray_poll_buf_t *out = NULL;
+  if (q_test_fail_tail_alloc)
+    q_test_fail_tail_alloc = 0;
+  else
+    out = ray_poll_buf_new(len - sent);
   if (out == NULL) {
     free(buf);
+    if (sent > 0)
+      ray_poll_deregister(poll, id);
     return -1;
   }
   memcpy(out->data, buf + sent, (size_t)(len - sent));
@@ -1001,7 +1022,8 @@ static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
      * its slot before the reply is queued: the slot id alone would send this
      * reply to the newcomer, or drop it on a send failure. */
     ray_selector_t *cur = q_conn_selector(poll, id, gen);
-    if (cur && q_send_result(poll, cur, result) < 0)
+    if (cur && q_send_result(poll, cur, result) < 0 &&
+        q_conn_selector(poll, id, gen) != NULL) /* may be closed already */
       ray_poll_deregister(poll, id);
   } else if (result != NULL && RAY_IS_ERR(result)) {
     /* Async has no reply channel, so an error here would vanish silently —
@@ -1346,10 +1368,15 @@ ray_t *q_conn_post(ray_poll_t *poll, int64_t id, ray_t *msg) {
   if (q_encode(msg, &buf, &len, err, sizeof err) < 0)
     return ray_error("io", "%s", err[0] ? err : "q: encode failed");
   buf[1] = Q_MSG_ASYNC; /* q_encode stamps SYNC */
-  /* Queued, not written: the poll flushes it when the socket is writable, so
-   * a slow subscriber cannot stall the publisher. */
-  if (q_queue_frame(poll, sel, buf, len) < 0)
+  /* Written at once when the socket takes it, else queued for the poll to
+   * flush when it is writable, so a slow subscriber cannot stall the
+   * publisher. */
+  if (q_queue_frame(poll, sel, buf, len) < 0) {
+    if (!q_conn_is_handle(poll, id))
+      return ray_error("io", "q: post failed after part of the frame was "
+                             "sent; connection closed");
     return ray_error("io", "q: post queue full or out of memory");
+  }
   return NULL;
 }
 

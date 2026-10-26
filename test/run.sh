@@ -100,6 +100,9 @@ echo "running hooks teardown selftest..."
 echo "running connection identity selftest..."
 "$DRIVER" --conn-identity-selftest
 
+echo "running partial send selftest..."
+"$DRIVER" --partial-send-selftest
+
 echo "running Q CLI argument selftest..."
 "$DRIVER" --q-cli-selftest
 

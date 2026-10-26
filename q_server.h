@@ -87,10 +87,14 @@ int64_t q_conn_attach(ray_poll_t *poll, int fd);
 ray_t *q_conn_send(ray_poll_t *poll, int64_t id, ray_t *msg);
 
 /* Send `msg` as a q ASYNC frame on an open connection, inbound or outbound,
- * and return at once: the frame is queued on the poll and flushed when the
- * socket is writable. Returns NULL on success or an owned error: `handle` if
- * `id` is not an open, established q connection, `io` if the message cannot be
- * encoded or the connection's queue is full. A later q_conn_send on the same
+ * and return at once: the frame is written straight away when the socket takes
+ * it, else its unsent rest is queued on the poll and flushed when the socket
+ * is writable. Returns NULL on success or an owned error: `handle` if `id` is
+ * not an open, established q connection, `io` if the message cannot be encoded
+ * or the connection's queue is full (nothing was written, the connection is
+ * unchanged). If the frame was already partly written when the rest could not
+ * be kept, the stream cannot be completed: the connection is closed and the
+ * `io` error says so (the handle is then no longer open). A later q_conn_send on the same
  * handle writes any still-queued frames first, so order is kept. */
 ray_t *q_conn_post(ray_poll_t *poll, int64_t id, ray_t *msg);
 
@@ -138,6 +142,9 @@ void q_hooks_forget(void);       /* drop the slots, their heap is gone */
  * replaying (the application loads its code, `.q.on` included, first), or the
  * replay evaluates the requests by default. */
 ray_t *q_dispatch_sync(ray_t *req);
+
+/* Tests only: make the next allocation of an unsent reply/post tail fail. */
+void q_test_fail_next_tail_alloc(void);
 
 /* Close an attached connection and release its state. */
 void q_conn_close(ray_poll_t *poll, int64_t id);
