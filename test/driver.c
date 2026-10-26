@@ -101,6 +101,31 @@ static int run_journal_bound_selftest(void) {
   return failures ? 1 : 0;
 }
 
+/* --serve-args ARGS...: as --serve, but the listener comes from the same
+ * q_serve_from_args the rayforce binary uses (`-q [HOST:]PORT`), so the CLI
+ * and its default bind address are what is under test. */
+static int run_server_args(int argc, char **argv) {
+  ray_runtime_t *rt = ray_runtime_create(0, NULL);
+  if (rt == NULL)
+    return 1;
+  q_env_register();
+  ray_poll_t *poll = ray_poll_create();
+  if (poll == NULL) {
+    ray_runtime_destroy(rt);
+    return 1;
+  }
+  ray_runtime_set_poll(poll);
+  if (q_serve_from_args(poll, argc, argv) < 0) {
+    ray_poll_destroy(poll);
+    ray_runtime_destroy(rt);
+    return 2;
+  }
+  ray_poll_run(poll);
+  ray_poll_destroy(poll);
+  ray_runtime_destroy(rt);
+  return 0;
+}
+
 static int run_q_cli_selftest(void) {
   ray_runtime_t *rt = ray_runtime_create(0, NULL);
   if (rt == NULL) {
@@ -119,6 +144,9 @@ static int run_q_cli_selftest(void) {
   char *junk_port[] = {"rayforce", "--q-serve", "1abc"};
   char *missing_port[] = {"rayforce", "-q"};
   char *app_args[] = {"rayforce", "--", "-q", "70000"};
+  char *bad_hostport[] = {"rayforce", "-q", "127.0.0.1:abc"};
+  char *empty_port[] = {"rayforce", "-q", "127.0.0.1:"};
+  char *bad_host[] = {"rayforce", "-q", "not-an-ip:25999"};
   int failures = 0;
   if (q_serve_from_args(poll, 3, no_flag) != 0)
     failures++;
@@ -129,6 +157,12 @@ static int run_q_cli_selftest(void) {
   if (q_serve_from_args(poll, 2, missing_port) >= 0)
     failures++;
   if (q_serve_from_args(poll, 4, app_args) != 0)
+    failures++;
+  if (q_serve_from_args(poll, 3, bad_hostport) >= 0)
+    failures++;
+  if (q_serve_from_args(poll, 3, empty_port) >= 0)
+    failures++;
+  if (q_serve_from_args(poll, 3, bad_host) >= 0) /* never widens to wildcard */
     failures++;
 
   ray_poll_destroy(poll);
@@ -1982,6 +2016,9 @@ int main(int argc, char **argv) {
     return run_journal_bound_selftest();
   if (argc >= 2 && strcmp(argv[1], "--q-cli-selftest") == 0)
     return run_q_cli_selftest();
+
+  if (argc >= 3 && strcmp(argv[1], "--serve-args") == 0)
+    return run_server_args(argc - 1, argv + 1);
 
   /* Server role: `driver --serve PORT`. */
   if (argc >= 3 && strcmp(argv[1], "--serve") == 0)

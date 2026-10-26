@@ -103,6 +103,45 @@ echo "running connection identity selftest..."
 echo "running Q CLI argument selftest..."
 "$DRIVER" --q-cli-selftest
 
+# ---- Bind address of the `-q` listener: loopback unless asked otherwise.
+# q_serve_from_args is what the rayforce binary runs for `-q`; the driver's
+# --serve-args drives it directly. Reads the kernel's listening table, so it
+# needs /proc/net/tcp (Linux) and skips elsewhere.
+if [[ -r /proc/net/tcp ]]; then
+  echo "checking the -q listener's bind address..."
+  listen_addr() {  # PORT -> local address of its LISTEN socket, e.g. 127.0.0.1
+    python3 - "$1" <<'PY'
+import socket, struct, sys
+port = int(sys.argv[1])
+for line in open("/proc/net/tcp").read().splitlines()[1:]:
+    f = line.split()
+    addr, p = f[1].split(":")
+    if f[3] == "0A" and int(p, 16) == port:
+        print(socket.inet_ntoa(struct.pack("<I", int(addr, 16))))
+        break
+PY
+  }
+  check_bind() {  # WANT PORT-spec [env assignments...] -- start a listener, compare
+    local want="$1" spec="$2" port; shift 2
+    port="${spec##*:}"
+    env "$@" "$DRIVER" --serve-args -q "$spec" 2>/dev/null &
+    local pid=$!
+    PIDS+=("$pid")
+    wait_for_port 127.0.0.1 "$port" || { echo "bind test: -q $spec did not listen" >&2; exit 1; }
+    local got; got="$(listen_addr "$port")"
+    kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+    if [[ "$got" != "$want" ]]; then
+      echo "bind test: -q $spec (env: $*) bound $got, expected $want" >&2; exit 1
+    fi
+  }
+  BP="$(free_port)"
+  check_bind 127.0.0.1 "$BP" RAYFORCE_Q_BIND_HOST=              # no host given: loopback
+  check_bind 0.0.0.0 "$BP" RAYFORCE_Q_BIND_HOST=0.0.0.0          # env var opts in
+  check_bind 127.0.0.1 "127.0.0.1:$BP" RAYFORCE_Q_BIND_HOST=0.0.0.0   # HOST:PORT wins over env
+  check_bind 0.0.0.0 "0.0.0.0:$BP" RAYFORCE_Q_BIND_HOST=127.0.0.1
+  echo "bind address checks ok (loopback by default)"
+fi
+
 # ---- Leg 1: Rayforce server
 SERVERPORT="${SERVERPORT:-$(free_port)}"
 "$DRIVER" --serve "$SERVERPORT" &
@@ -331,10 +370,6 @@ T["null i64";    0N~h"0Nl"]
 T["null i32";    0Ni~h"0Ni"]
 T["null f64";    0n~h"0Nf"]
 T["null sym";    (`)~h"(as 'sym \"\")"]
-/ an empty or blank request is the identity (::), kdb's ping/flush
-T["empty request";   (::)~h""]
-T["blank request";   (::)~h"  "]
-T["still evaluates"; 3~h"(+ 1 2)"]
 / the error text reaches q: "category: message", not the bare category.
 / A core without ray_raise_render (before v3) cannot recover the text of an
 / uncaught raise; there the category alone is the contract.
@@ -345,6 +380,12 @@ T["builtin text";    @[h;"(+ 1 \"a\")";{x like "type: *"}]]
 T["no message";      "parse"~@[h;"(+ 1 2";{x}]]
 r:h"(do (set boom (fn [x] (raise \"custom failure\"))) 1)"
 T["raise via call";  $[RA;"domain: custom failure"~@[h;(`boom;::);{x}];@[h;(`boom;::);{x like "domain*"}]]]
+/ a result with no q value (a lambda): the whole text arrives, not its first 7 characters
+T["encode failure text"; @[h;"(fn [m] m)";{(x like "type: *")&0<count x ss "cannot"}]]
+/ an empty or blank request is the identity (::), kdb's ping/flush
+T["empty request";   (::)~h""]
+T["blank request";   (::)~h"  "]
+T["still evaluates"; 3~h"(+ 1 2)"]
 / server-side parse error comes back as a Q error frame
 T["parse err";   @[h;"(+ 1 2";{x like "*parse*"}]]
 hclose h
