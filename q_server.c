@@ -46,6 +46,9 @@
 #include "core/timer.h" /* ray_time_now_ms                                     */
 #include "lang/eval.h" /* ray_eval, RAY_EVAL_LITERAL_FALLBACK                  */
 #include "ops/ops.h" /* ray_is_lazy, ray_lazy_materialize                    */
+#include "core/ipc.h" /* RAY_IPC_MSG_*, RAY_IPC_FLAG_RESTRICTED             */
+#include "store/journal.h" /* ray_journal_is_open, ray_journal_write_bytes  */
+#include "store/serde.h" /* ray_ipc_header_t, ray_serde_size, ray_ser_raw   */
 
 #include <errno.h>
 #include <limits.h>
@@ -138,17 +141,7 @@ static void q_release_any(ray_t *obj) {
     ray_release(obj);
 }
 
-/* A list argument carries data, not variable references — mark it so a symbol
- * inside it stays a literal instead of resolving against the environment.
- * Mirrors mark_ipc_literal_fallbacks in core/ipc.c. */
-static void q_mark_literals(ray_t *obj) {
-  if (obj == NULL || RAY_IS_ERR(obj) || obj->type != RAY_LIST)
-    return;
-  obj->attrs |= RAY_EVAL_LITERAL_FALLBACK;
-  ray_t **elems = (ray_t **)ray_data(obj);
-  for (int64_t i = 0; i < ray_len(obj); i++)
-    q_mark_literals(elems[i]);
-}
+static ray_t *q_journal_form(ray_t *req);
 
 /* Turn a decoded request into a result. Borrows `req`.
  *
@@ -187,19 +180,161 @@ static ray_t *eval_request(ray_t *req) {
     return res;
   }
 
-  if (req->type == RAY_LIST) {
-    ray_t **elems = (ray_t **)ray_data(req);
-    for (int64_t i = 1; i < ray_len(req); i++)
-      q_mark_literals(elems[i]);
-  }
+  /* Evaluate the request in its data form: every LIST argument wrapped in
+   * (quote ...). That is the exact object a sync request journals, so live
+   * dispatch and WAL replay run the same expression and cannot disagree
+   * (a LIST argument whose head names a callable, such as (`upd;(`in;1 2)),
+   * reaches the handler as the list, as it does in kdb+, on both paths). */
+  ray_t *form = q_journal_form(req); /* NULL: not a call, evaluate as is */
+  if (form != NULL && RAY_IS_ERR(form))
+    return form;
   if (Q_HAVE_RAISE(ray_raise_clear))
     ray_raise_clear(); /* ray_eval_str does this; a raise left over is not ours */
-  ray_t *res = ray_eval(req);
+  ray_t *res = ray_eval(form ? form : req);
+  if (form != NULL)
+    ray_release(form);
   /* A lazy result is an internal deferred-DAG value that cannot be
    * serialized; force it before it can reach the wire. */
   if (res != NULL && ray_is_lazy(res))
     res = ray_lazy_materialize(res);
   return res;
+}
+
+/* ---- WAL auto-journal ---------------------------------------------------
+ *
+ * core/ipc.c eval_payload_core logs every inbound native SYNC frame to the
+ * open journal BEFORE evaluating it, so a crash mid-handler still leaves the
+ * message on disk and `.log.replay` rebuilds the state. A q frame reaches the
+ * runtime through eval_request instead, so it has to do the same itself or a
+ * Rayfall service fed over `-q` journals nothing.
+ *
+ * The frame is written in the NATIVE format (ray_ipc_header_t + ray_ser_raw
+ * payload) because that is what the journal replays. Same rules as the core:
+ *   - SYNC only. ASYNC frames and RESPONSEs are not logged (the core treats
+ *     sync as the state-mutation channel, so background pings and pushes do
+ *     not pollute the log). NOTE: q feeds usually push `neg[h](`upd;x)`, which
+ *     is async and therefore NOT journaled; a q publisher that needs durable
+ *     writes must use a sync send.
+ *   - Nothing is written when no journal is open or while one is replaying
+ *     (ray_journal_write_bytes is a no-op then).
+ *   - The restricted bit of the current eval context is copied into the
+ *     logged header so replay re-imposes it.
+ *   - If the write fails the request is NOT evaluated and the client gets an
+ *     `io` error: an un-logged mutation defeats the point of having a WAL.
+ *
+ * Replay-fidelity: the native replay evaluates the deserialized object with a
+ * plain ray_eval and does not re-mark RAY_EVAL_LITERAL_FALLBACK (the mark is
+ * not part of the wire format). A q `(`upd;(`a;1))` journaled verbatim would
+ * therefore replay its argument list as a CALL. Rather than persist something
+ * different from what ran, the request is turned into ONE data form: every
+ * LIST argument wrapped in `quote`, `(upd (quote (a 1)))`. That form is what
+ * is journaled AND what eval_request evaluates, so live dispatch and replay
+ * run the same expression by construction, including for a LIST argument
+ * whose head names a callable (`(`upd;(`in;1 2))` hands `upd` the list on both
+ * paths). Char-vector and non-list requests are journaled as they are, like
+ * the core.
+ *
+ * Replay bound: the core's replay stops at a frame whose payload is larger
+ * than 256 MiB (`hdr.size`), so a bigger one is refused here, before it is
+ * written or evaluated: a handler must not succeed on a request whose log
+ * entry would end recovery.
+ *
+ * Eval scope: the core evaluates an auto-journaled frame with the
+ * auto-journal flag set, which makes `.log.write` refuse (the frame is
+ * already in the log; a nested synthetic record would make replay differ
+ * from the live run). q_read_body sets the same flag around the eval through
+ * ray_ipc_set_auto_journal_eval when the core provides it. */
+static ray_t *q_journal_form(ray_t *req) {
+  if (req->type != RAY_LIST || ray_len(req) < 2)
+    return NULL; /* journal the request itself */
+  ray_t **elems = (ray_t **)ray_data(req);
+  int64_t qid = ray_sym_intern("quote", 5);
+  ray_t *out = ray_list_new(ray_len(req));
+  if (out == NULL || RAY_IS_ERR(out))
+    return out;
+  out = ray_list_append(out, elems[0]);
+  for (int64_t i = 1; out && !RAY_IS_ERR(out) && i < ray_len(req); i++) {
+    /* Only list arguments are marked literal on the live path (see
+     * eval_request), so only those are quoted; any other argument is
+     * journaled as is and resolves on replay exactly as it did live. */
+    if (elems[i] == NULL || elems[i]->type != RAY_LIST) {
+      out = ray_list_append(out, elems[i]);
+      continue;
+    }
+    ray_t *q = ray_list_new(2);
+    ray_t *head = ray_sym(qid);
+    if (q == NULL || RAY_IS_ERR(q) || head == NULL || RAY_IS_ERR(head)) {
+      if (q && !RAY_IS_ERR(q))
+        ray_release(q);
+      if (head && !RAY_IS_ERR(head))
+        ray_release(head);
+      ray_release(out);
+      return ray_error("oom", NULL);
+    }
+    q = ray_list_append(q, head);
+    ray_release(head);
+    q = ray_list_append(q, elems[i]);
+    out = ray_list_append(out, q);
+    ray_release(q);
+  }
+  return out;
+}
+
+/* Journal one inbound SYNC request. Returns NULL when it is safe to evaluate
+ * (logged, or nothing to log), or an owned `io` error to reply with instead. */
+#define Q_JOURNAL_MAX_PAYLOAD (256LL * 1024 * 1024)
+
+int q_journal_size_ok(int64_t size) {
+  return size > 0 && size <= Q_JOURNAL_MAX_PAYLOAD;
+}
+
+static ray_t *q_journal_request(ray_t *req) {
+  if (req == NULL || RAY_IS_ERR(req) || !ray_journal_is_open())
+    return NULL;
+#ifndef RAY_IPC_HAS_SET_AUTO_JOURNAL_EVAL
+  /* A journaled request must be evaluated in the core's auto-journal scope,
+   * or a nested `.log.write` appends a synthetic record the replay cannot
+   * reproduce.  This core cannot set that scope, so refuse the request here,
+   * before anything is appended or evaluated, rather than journal it unsafely. */
+  return ray_error("domain", "journaling an inbound q request needs a "
+                             "rayforce core with ray_ipc_set_auto_journal_eval; "
+                             "request refused");
+#endif
+  ray_t *form = q_journal_form(req);
+  if (form != NULL && RAY_IS_ERR(form))
+    return form;
+  ray_t *obj = form ? form : req;
+
+  int64_t size = ray_serde_size(obj);
+  if (size > Q_JOURNAL_MAX_PAYLOAD) {
+    if (form)
+      ray_release(form);
+    return ray_error("limit", "request of %lld bytes exceeds the %lld-byte limit "
+                              "of a journal entry; refused",
+                     (long long)size, (long long)Q_JOURNAL_MAX_PAYLOAD);
+  }
+  uint8_t *payload = size > 0 ? (uint8_t *)malloc((size_t)size) : NULL;
+  ray_err_t je = RAY_ERR_IO;
+  if (payload != NULL && ray_ser_raw(payload, obj) == size) {
+    ray_ipc_header_t hdr = {
+        .prefix = RAY_SERDE_PREFIX,
+        .version = RAY_SERDE_WIRE_VERSION,
+        .flags = ray_eval_get_restricted() ? RAY_IPC_FLAG_RESTRICTED : 0,
+        .endian = RAY_SERDE_ENDIAN,
+        .msgtype = RAY_IPC_MSG_SYNC,
+        .size = size,
+    };
+    je = ray_journal_write_bytes(&hdr, payload, size);
+  }
+  free(payload);
+  if (form)
+    ray_release(form);
+  if (je != RAY_OK) {
+    fprintf(stderr, "log: ERROR  journal write failed (rc=%d) — refusing to "
+                    "evaluate\n", (int)je);
+    return ray_error("io", "journal write failed; mutation refused");
+  }
+  return NULL;
 }
 
 /* Encode `result` as a Q response and write it. A NULL result encodes as the
@@ -537,9 +672,26 @@ static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
   int64_t prev_handle = q_current_handle;
   if (cd->outbound)
     q_current_handle = id;
-  ray_t *result = req ? eval_request(req)
-                      : ray_error("q server: malformed request", "%s",
-                                  err[0] ? err : "q server: decode failed");
+  ray_t *result = NULL;
+  int journaled = req && !RAY_IS_ERR(req) && hdr.msgtype == Q_MSG_SYNC &&
+                  ray_journal_is_open();
+  if (req && hdr.msgtype == Q_MSG_SYNC)
+    result = q_journal_request(req); /* io/limit error => do not evaluate */
+  if (result == NULL) {
+#ifdef RAY_IPC_HAS_SET_AUTO_JOURNAL_EVAL
+    /* The core's scope for an auto-journaled eval: `.log.write` refuses. */
+    bool prev_scope = ray_ipc_set_auto_journal_eval(
+        journaled ? true : ray_ipc_auto_journal_eval());
+#else
+    (void)journaled;
+#endif
+    result = req ? eval_request(req)
+                 : ray_error("q server: malformed request", "%s",
+                             err[0] ? err : "q server: decode failed");
+#ifdef RAY_IPC_HAS_SET_AUTO_JOURNAL_EVAL
+    ray_ipc_set_auto_journal_eval(prev_scope);
+#endif
+  }
   q_current_handle = prev_handle;
   if (req)
     q_release_any(req);

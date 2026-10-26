@@ -91,6 +91,9 @@ echo "running codec selftest..."
 echo "running exchange selftest..."
 "$DRIVER" --exchange-selftest
 
+echo "running journal bound selftest..."
+"$DRIVER" --journal-bound-selftest
+
 echo "running Q CLI argument selftest..."
 "$DRIVER" --q-cli-selftest
 
@@ -389,6 +392,135 @@ QEOF
 else
   echo "SKIP: no q binary found (set Q_BINARY) — skipping real-q interop + client tests"
   exit 0
+fi
+
+# ---- Leg 2b: q-wire frames are journaled like native ones when a WAL is open
+# core/ipc.c logs every inbound native SYNC frame before evaluating it; the q
+# listener has to do the same or a Rayfall service fed over -q journals nothing.
+# Process A opens a managed journal and takes q frames; process B is a fresh
+# runtime that replays the log, so the state it rebuilds is what a restart sees.
+echo "real-q WAL: journaling inbound q frames, replaying in a fresh runtime ..."
+WALBASE="$WORK/wal/node"
+HASSCOPE=0
+grep -q RAY_IPC_HAS_SET_AUTO_JOURNAL_EVAL "${CORE_SRC:-/nonexistent}/core/ipc.h" 2>/dev/null && HASSCOPE=1
+mkdir -p "$WORK/wal"
+if [ "$HASSCOPE" != "1" ]; then
+  # A core without ray_ipc_set_auto_journal_eval cannot give the evaluation
+  # the auto-journal scope, so with a journal open every sync request must be
+  # refused before it is appended or evaluated.
+  WALPORT="$(free_port)"
+  "$DRIVER" --serve "$WALPORT" 2>"$WORK/wal_a.err" &
+  WALPID=$!
+  PIDS+=("$WALPID")
+  wait_for_port "$HOST" "$WALPORT" || { echo "WAL server did not come up" >&2; exit 1; }
+  cat > "$WORK/wal_n.q" <<'QEOF'
+port:"I"$getenv`RFPORT
+base:getenv`WALBASE
+h:hopen `$":127.0.0.1:",string port
+names:();oks:()
+T:{[nm;b] names,:enlist nm; oks,:enlist b}
+/ every sync request is refused while the journal is open, so the log file
+/ itself is what shows nothing was appended
+sz:{hcount `$":",base,".log"}
+r:h"(.log.open 'sync \"",base,"\")"
+s0:sz[]
+r:@[h;"(set n 1)";{x}]
+T["refused without the scope API"; r like "domain*"]
+T["refused request not journaled"; s0=sz[]]
+r:hclose h
+bad:names where not oks
+if[count bad; -2 "q WAL (no scope API) FAILED: ",", " sv bad; exit 1]
+-1 "q WAL refused without scope API ok (",(string count names)," assertions)"
+exit 0
+QEOF
+  RFPORT="$WALPORT" WALBASE="$WALBASE" QHOME="${QHOME:-$(q_home_for "$QBIN")}" "$QBIN" "$WORK/wal_n.q" -q < /dev/null
+  kill "$WALPID" 2>/dev/null || true
+  wait "$WALPID" 2>/dev/null || true
+else
+WALPORT="$(free_port)"
+"$DRIVER" --serve "$WALPORT" 2>"$WORK/wal_a.err" &
+WALPID=$!
+PIDS+=("$WALPID")
+wait_for_port "$HOST" "$WALPORT" || { echo "WAL server A did not come up" >&2; exit 1; }
+cat > "$WORK/wal_a.q" <<'QEOF'
+port:"I"$getenv`RFPORT
+base:getenv`WALBASE
+scope:getenv`HASSCOPE
+h:hopen `$":127.0.0.1:",string port
+names:();oks:()
+T:{[nm;b] names,:enlist nm; oks,:enlist b}
+chunks:{first h"(.log.validate \"",base,".log\")"}
+/ `a` and `as` are also globals/builtins on the server: they must stay literal
+r:h"(set tags (list))"
+r:h"(set a 99)"
+r:h"(do (set upd (fn [m] (set tags (concat tags (list m))))) 1)"
+r:h"(.log.open 'sync \"",base,"\")"
+c0:chunks[]            / counts itself: a sync frame is journaled before it runs
+r:h(`upd;(`a;1i;"s"))
+c1:chunks[]
+T["sync frame journaled";    c1=c0+2]
+neg[h](`upd;(`qasync;2i)); r:h"1"
+c2:chunks[]
+T["async frame not journaled (core rule)"; c2=c1+2]  / the h"1" and chunks[] syncs
+r:h(`upd;(`b;`a;3))
+/ a LIST argument is data on both paths, even when its head names a callable
+r:h(`upd;(`in;1 2))
+r:h(`upd;(`sum;1 2))
+T["live state";   ((`a;1i;"s");(`qasync;2i);(`b;`a;3);(`in;1 2);(`sum;1 2))~h"tags"]
+T["journal grew"; chunks[]>c2]
+/ a frame the journal could not replay (native payload above the 256 MiB the
+/ core's replay accepts) is refused before anything is written or evaluated:
+/ a LIST [symbol; byte vector of 256 MiB - 17] is a q body of exactly 256 MiB
+c3:chunks[]
+r:@[h;(`upd;268435439#0x00);{x}]
+T["oversize frame refused";  r like "limit*"]
+T["oversize not journaled";  chunks[]=c3+1]
+T["oversize not evaluated";  5=count h"tags"]
+/ the core refuses .log.write inside an auto-journaled eval (the frame is
+/ already in the log); the q path must run its eval in the same scope
+r:h"(do (set n 0) (set bump (fn [] (set n (+ n 1)))) 1)"
+r:@[h;"(do (.log.write (list 'bump)) (bump) (bump))";{x}]
+T["nested .log.write refused"; $[scope~"1"; r like "domain*"; 1b]]
+T["nested .log.write: no effect"; $[scope~"1"; 0~h"n"; 1b]]
+r:hclose h
+bad:names where not oks
+if[count bad; -2 "q WAL (journal) FAILED: ",", " sv bad; exit 1]
+-1 "q WAL journal ok (",(string count names)," assertions)"
+exit 0
+QEOF
+RFPORT="$WALPORT" WALBASE="$WALBASE" HASSCOPE="$HASSCOPE" QHOME="${QHOME:-$(q_home_for "$QBIN")}" "$QBIN" "$WORK/wal_a.q" -q < /dev/null
+kill "$WALPID" 2>/dev/null || true
+wait "$WALPID" 2>/dev/null || true
+
+WALPORT2="$(free_port)"
+"$DRIVER" --serve "$WALPORT2" 2>"$WORK/wal_b.err" &
+WALPID2=$!
+PIDS+=("$WALPID2")
+wait_for_port "$HOST" "$WALPORT2" || { echo "WAL server B did not come up" >&2; exit 1; }
+cat > "$WORK/wal_b.q" <<'QEOF'
+port:"I"$getenv`RFPORT
+base:getenv`WALBASE
+scope:getenv`HASSCOPE
+h:hopen `$":127.0.0.1:",string port
+names:();oks:()
+T:{[nm;b] names,:enlist nm; oks,:enlist b}
+r:h"(set tags (list))"
+r:h"(set a 1234)"          / different value: replay must not resolve the symbols
+r:h"(do (set n 0) (set bump (fn [] (set n (+ n 1)))) 1)"
+r:h"(do (set upd (fn [m] (set tags (concat tags (list m))))) 1)"
+n:h"(.log.replay \"",base,".log\")"
+T["replayed chunks"; n>=2]
+T["replay: nested-write frame left no effect"; $[scope~"1"; 0~h"n"; 1b]]
+T["sync frames rebuilt (async not journaled)"; ((`a;1i;"s");(`b;`a;3);(`in;1 2);(`sum;1 2))~h"tags"]
+r:hclose h
+bad:names where not oks
+if[count bad; -2 "q WAL (replay) FAILED: ",", " sv bad; exit 1]
+-1 "q WAL replay ok (",(string count names)," assertions)"
+exit 0
+QEOF
+RFPORT="$WALPORT2" WALBASE="$WALBASE" HASSCOPE="$HASSCOPE" QHOME="${QHOME:-$(q_home_for "$QBIN")}" "$QBIN" "$WORK/wal_b.q" -q < /dev/null
+kill "$WALPID2" 2>/dev/null || true
+wait "$WALPID2" 2>/dev/null || true
 fi
 
 # ---- Leg 3: client tests against real Q server
