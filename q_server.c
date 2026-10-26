@@ -55,6 +55,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <poll.h>
+#include <unistd.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -148,6 +149,9 @@ static int64_t q_conn_max_body(const q_conn_t *cd) {
  * a lambda held here, retained; anything else clears it. */
 static ray_t *q_hooks[Q_HOOK_COUNT];
 
+static void q_on_close(ray_poll_t *poll, ray_selector_t *sel);
+static void q_hooks_anchor(ray_poll_t *poll);
+
 int q_hook_set(int which, ray_t *fn) {
   if (which < 0 || which >= Q_HOOK_COUNT)
     return -1;
@@ -155,12 +159,85 @@ int q_hook_set(int which, ray_t *fn) {
   if (fn != NULL && !RAY_IS_ERR(fn) && fn->type == RAY_LAMBDA) {
     ray_retain(fn);
     q_hooks[which] = fn;
+    q_hooks_anchor((ray_poll_t *)ray_runtime_get_poll());
   } else {
     q_hooks[which] = NULL;
   }
   if (old != NULL)
     ray_release(old);
   return 0;
+}
+
+int q_hook_installed(int which) {
+  return which >= 0 && which < Q_HOOK_COUNT && q_hooks[which] != NULL;
+}
+
+/* A hook is an object on the runtime's heap, but the slot is process-global.
+ * Releasing the slots is the runtime's teardown step and has to run while that
+ * heap is alive, after the connections' close hooks have fired.
+ *
+ * - q_hooks_release is that step. An embedder that destroys its runtime
+ *   without a poll calls it first.
+ * - With a poll, a hook installed (or a listener or connection attached) puts
+ *   a private anchor selector on it. ray_poll_destroy closes the selectors in
+ *   slot order, so the anchor's close callback first closes the connections
+ *   still open after it (their `.q.on 'close` hooks run with the hooks intact)
+ *   and then releases the slots, all before ray_runtime_destroy.
+ * - q_env_register, called once per new runtime, drops slots a previous
+ *   runtime left behind without releasing them: that heap is gone. */
+void q_hooks_release(void) {
+  for (int i = 0; i < Q_HOOK_COUNT; i++) {
+    ray_t *fn = q_hooks[i];
+    q_hooks[i] = NULL;
+    if (fn != NULL)
+      ray_release(fn);
+  }
+}
+
+void q_hooks_forget(void) {
+  for (int i = 0; i < Q_HOOK_COUNT; i++)
+    q_hooks[i] = NULL;
+}
+
+static int64_t q_anchor_id = -1;
+
+static void q_anchor_close(ray_poll_t *poll, ray_selector_t *sel) {
+  for (uint32_t i = 0; i < poll->n_sels; i++) {
+    ray_selector_t *s = poll->sels[i];
+    if (s != NULL && s != sel && s->close_fn == q_on_close)
+      ray_poll_deregister(poll, (int64_t)i);
+  }
+  q_hooks_release();
+  q_anchor_id = -1;
+  close((int)(intptr_t)sel->data); /* the write end */
+  close((int)sel->fd);
+}
+
+static void q_hooks_anchor(ray_poll_t *poll) {
+  if (poll == NULL)
+    return;
+  ray_selector_t *cur = ray_poll_get(poll, q_anchor_id);
+  if (cur != NULL && cur->close_fn == q_anchor_close)
+    return;
+  int p[2];
+  if (pipe(p) < 0)
+    return;
+  ray_poll_reg_t reg = {0};
+  reg.fd = p[0];
+  reg.type = RAY_SEL_SOCKET;
+  reg.close_fn = q_anchor_close;
+  reg.data = (void *)(intptr_t)p[1];
+  int64_t id = ray_poll_register(poll, &reg);
+  if (id < 0) {
+    close(p[0]);
+    close(p[1]);
+    return;
+  }
+  q_anchor_id = id;
+  /* The anchor is bookkeeping, not work: leave the poll idle when only it
+   * remains, as it was before. */
+  if (poll->n_live > 0)
+    poll->n_live--;
 }
 
 static void q_release_any(ray_t *obj) {
@@ -945,6 +1022,7 @@ int64_t q_serve(ray_poll_t *poll, int port) {
     ray_sock_close(fd);
     return -1;
   }
+  q_hooks_anchor(poll);
   fprintf(stderr, "q: listening on %d (Rayfall over the Q wire)\n", port);
   return id;
 }
@@ -1108,6 +1186,7 @@ int64_t q_conn_attach(ray_poll_t *poll, int fd) {
   ray_selector_t *sel = ray_poll_get(poll, id);
   if (sel)
     ray_poll_rx_request(poll, sel, (int64_t)sizeof(q_header_t));
+  q_hooks_anchor(poll);
   return id;
 }
 

@@ -115,9 +115,20 @@ int64_t q_conn_current(void);
  *          just before teardown; errors are logged and swallowed.
  * q_conn_current() is the connection inside all three. Returns 0, or -1 for
  * an unknown hook. The lambda is retained; a hook outlives neither its
- * runtime nor a q_hook_set that replaces it. */
+ * runtime nor a q_hook_set that replaces it.
+ *
+ * Teardown: ray_poll_destroy releases the hooks, after the close hooks of the
+ * connections still open have run, once a hook, a listener or an attached
+ * connection has put the server's anchor on that poll (the poll the runtime
+ * holds, ray_runtime_set_poll). A runtime destroyed without a poll needs
+ * q_hooks_release() before ray_runtime_destroy(). q_env_register() (call it
+ * for every new runtime) drops, without releasing, what an earlier runtime
+ * left in the slots. */
 enum { Q_HOOK_SYNC = 0, Q_HOOK_ASYNC = 1, Q_HOOK_CLOSE = 2, Q_HOOK_COUNT = 3 };
 int q_hook_set(int which, ray_t *fn);
+int q_hook_installed(int which); /* 1 when the hook is set */
+void q_hooks_release(void);      /* release every hook, heap still alive */
+void q_hooks_forget(void);       /* drop the slots, their heap is gone */
 
 /* `.q.dispatch_sync`: the sync request `req` (borrowed) answered by the
  * installed sync hook, or by the default evaluation when there is none. A sync

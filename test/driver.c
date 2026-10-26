@@ -1652,7 +1652,151 @@ static int run_frame_limit_selftest(const char *host, int port) {
   return failures ? 1 : 0;
 }
 
+/* ---- hooks across runtime teardown -------------------------------------- */
+
+/* A TCP port nobody listens on right now. */
+static int free_tcp_port(void) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  struct sockaddr_in a = {0};
+  a.sin_family = AF_INET;
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  socklen_t l = sizeof a;
+  int port = 0;
+  if (fd >= 0 && bind(fd, (struct sockaddr *)&a, sizeof a) == 0 &&
+      getsockname(fd, (struct sockaddr *)&a, &l) == 0)
+    port = ntohs(a.sin_port);
+  if (fd >= 0)
+    close(fd);
+  return port;
+}
+
+static int tcp_connect_local(int port) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  struct sockaddr_in a = {0};
+  a.sin_family = AF_INET;
+  a.sin_port = htons((uint16_t)port);
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (fd >= 0 && connect(fd, (struct sockaddr *)&a, sizeof a) < 0) {
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+/* Run the poll for about `ms`, in short slices. */
+static void pump_poll(ray_poll_t *poll, int ms) {
+  for (int i = 0; i < ms / 10; i++)
+    ray_poll_run_for(poll, 10);
+}
+
+static int hooks_clear(void) {
+  return !q_hook_installed(Q_HOOK_SYNC) && !q_hook_installed(Q_HOOK_ASYNC) &&
+         !q_hook_installed(Q_HOOK_CLOSE);
+}
+
+static int64_t eval_i64(const char *src) {
+  ray_t *r = ray_eval_str(src);
+  int64_t v = (r && !RAY_IS_ERR(r) && r->type == -RAY_I64) ? r->i64 : -1;
+  release_any(r);
+  return v;
+}
+
+/* Create / register / set hooks / destroy, then again, in one process. The
+ * hooks live on the first runtime's heap: they must be released by the poll's
+ * teardown while it is alive, and a second runtime must not see, call or
+ * release them. */
+static int run_hooks_teardown_selftest(void) {
+  int failures = 0;
+  signal(SIGPIPE, SIG_IGN);
+  for (int round = 0; round < 3; round++) {
+    ray_runtime_t *rt = ray_runtime_create(0, NULL);
+    if (rt == NULL) {
+      fprintf(stderr, "hooks teardown selftest: no runtime\n");
+      return 1;
+    }
+    q_env_register();
+    if (!hooks_clear()) {
+      fprintf(stderr, "hooks teardown selftest: round %d starts with a hook "
+                      "from the previous runtime\n", round);
+      failures++;
+    }
+    /* replacing or clearing what an old runtime left must not touch its heap */
+    q_hook_set(Q_HOOK_SYNC, NULL);
+    q_hook_set(Q_HOOK_CLOSE, NULL);
+    ray_poll_t *poll = ray_poll_create();
+    if (poll == NULL) {
+      fprintf(stderr, "hooks teardown selftest: no poll\n");
+      return 1;
+    }
+    ray_runtime_set_poll(poll);
+    int port = free_tcp_port();
+    int cfd = -1;
+    if (round < 2) {
+      if (q_serve(poll, port) < 0) {
+        fprintf(stderr, "hooks teardown selftest: cannot listen\n");
+        return 1;
+      }
+      eval_setup("(set closed 0)", NULL);
+      eval_setup("(.q.on 'sync (fn [r] r))", NULL);
+      eval_setup("(.q.on 'close (fn [h] (set closed (+ closed 1))))", NULL);
+      cfd = tcp_connect_local(port);
+      if (cfd >= 0) {
+        const uint8_t login[] = {'u', 3, 0};
+        if (send(cfd, login, sizeof login, 0) != (ssize_t)sizeof login)
+          failures++;
+      }
+      pump_poll(poll, 200); /* accept + handshake: an established connection */
+    } else {
+      /* no server, no connection: the hook is set on a bare poll */
+      eval_setup("(.q.on 'sync (fn [r] r))", NULL);
+    }
+    if (!q_hook_installed(Q_HOOK_SYNC)) {
+      fprintf(stderr, "hooks teardown selftest: hook not installed\n");
+      failures++;
+    }
+    ray_poll_destroy(poll);
+    ray_runtime_set_poll(NULL);
+    if (!hooks_clear()) {
+      fprintf(stderr, "hooks teardown selftest: round %d: poll teardown left "
+                      "a hook set\n", round);
+      failures++;
+    }
+    if (round < 2 && eval_i64("closed") != 1) {
+      fprintf(stderr, "hooks teardown selftest: round %d: close hook ran %lld "
+                      "times at teardown, want 1\n", round,
+              (long long)eval_i64("closed"));
+      failures++;
+    }
+    if (cfd >= 0)
+      close(cfd);
+    ray_runtime_destroy(rt);
+  }
+
+  /* A runtime destroyed with a hook still set and no teardown step: the next
+   * one starts clean, and nothing releases the dead heap's object. */
+  ray_runtime_t *rt = ray_runtime_create(0, NULL);
+  q_env_register();
+  eval_setup("(.q.on 'sync (fn [r] r))", NULL);
+  ray_runtime_destroy(rt);
+  rt = ray_runtime_create(0, NULL);
+  q_env_register();
+  if (!hooks_clear()) {
+    fprintf(stderr, "hooks teardown selftest: a hook outlived its runtime\n");
+    failures++;
+  }
+  q_hook_set(Q_HOOK_SYNC, NULL); /* would release the dead pointer */
+  eval_setup("(.q.on 'sync (fn [r] r))", NULL);
+  q_hooks_release();
+  if (!hooks_clear())
+    failures++;
+  ray_runtime_destroy(rt);
+  printf("hooks teardown selftest: %s\n", failures ? "FAIL" : "ok");
+  return failures ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
+  if (argc >= 2 && strcmp(argv[1], "--hooks-teardown-selftest") == 0)
+    return run_hooks_teardown_selftest();
   if (argc >= 2 && strcmp(argv[1], "--codec-selftest") == 0)
     return run_codec_selftest();
 

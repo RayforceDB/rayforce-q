@@ -63,7 +63,7 @@ An empty (or whitespace-only) request answers `(::)`, like kdb's `h ""`. An erro
 (.q.post (first subs) (list 'upd (dict ['a 'b] [1 2])))   ;; q client receives (`upd;`a`b!1 2) async
 ```
 
-`.q.on.*` cannot be `set` from Rayfall (dotted names are reserved), hence the verb; semantics mirror the core's `.ipc.on.*`. A char-vector request reaches the sync/async hook as an unparsed string (`(eval (parse r))` reproduces the default), a hook error is encoded to the client (sync) or logged (async, close). `(.q.handle)` is valid inside all three hooks. Hooks are process-global and live as long as the runtime.
+`.q.on.*` cannot be `set` from Rayfall (dotted names are reserved), hence the verb; semantics mirror the core's `.ipc.on.*`. A char-vector request reaches the sync/async hook as an unparsed string (`(eval (parse r))` reproduces the default), a hook error is encoded to the client (sync) or logged (async, close). `(.q.handle)` is valid inside all three hooks. Hooks are process-global and live as long as the runtime: `ray_poll_destroy` releases them after the open connections' close hooks have run, a runtime destroyed without a poll needs `q_hooks_release()` first, and `q_env_register()` (once per runtime) drops what an earlier runtime left.
 
 **Hooks and the WAL.** With a sync hook installed, a sync request that is journaled is recorded as `(.q.dispatch_sync (quote <request>))`; `.q.dispatch_sync` applies the sync hook installed at that moment, or evaluates by default when there is none. A replay therefore reproduces the live run if the application installs its hooks (`.q.on`) before `.log.replay`, which is the natural order, since it loads its code first; a replay without the hook evaluates the requests by default.
 
@@ -128,6 +128,7 @@ int64_t q_serve(ray_poll_t *poll, int port);
 /* Push, hooks (see the Rayfall verbs above). */
 ray_t  *q_conn_post(ray_poll_t *poll, int64_t id, ray_t *msg);  /* async frame; NULL or error */
 int     q_hook_set(int which, ray_t *fn);   /* Q_HOOK_SYNC / _ASYNC / _CLOSE; non-lambda clears */
+void    q_hooks_release(void);              /* release every hook; heap still alive */
 ```
 
 A connected Q client (real Q `hopen`, or `q_connect`) sends a char-vector. The server evaluates it as **Rayfall** against the embedded runtime and returns the result Q-encoded.

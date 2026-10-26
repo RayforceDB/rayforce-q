@@ -21,7 +21,11 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
   request is recorded as `(.q.dispatch_sync (quote <request>))`, and
   `.q.dispatch_sync` applies the hook installed at replay time (default
   evaluation without one), so install hooks before `.log.replay`; in C:
-  `q_dispatch_sync`.
+  `q_dispatch_sync`. The hooks are released by the poll's teardown, while the
+  runtime's heap is alive and after the open connections' close hooks ran
+  (`q_hooks_release()` for a runtime destroyed without a poll), and
+  `q_env_register()` drops what an earlier runtime left: a hook no longer
+  outlives its runtime.
 
 ### Fixed
 
