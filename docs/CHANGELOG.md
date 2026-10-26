@@ -14,6 +14,12 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
   reached `-q` from another machine. In C: `q_serve_at(poll, host, port)`;
   `q_serve` keeps the wildcard bind for bindings.
 
+### Fixed
+
+- **An empty request returns `(::)`, not `parse`.** q `h ""` (and a
+  whitespace-only string) is the ping/flush kdb tools and feeds use; the
+  server now answers it with the identity instead of a Rayfall parse error.
+
 ## [2.6.0]
 
 Needs rayforce core v2.11.0 or later, for `ray_sock_set_keepalive` (core
