@@ -46,6 +46,29 @@ The server is exposed via the `-q PORT` flag — it shares the REPL's event loop
 RAYFORCE_Q_BIND_HOST=10.0.0.5 ./rayforce -q 25565   # env fallback when -q has no host
 ```
 
+An empty (or whitespace-only) request answers `(::)`, like kdb's `h ""`. An error's text travels with its category, so q sees `'domain: custom failure`. With a journal open (`.log.open`, `-l`/`-L`) every inbound **sync** q frame is journaled before it is evaluated, exactly as the core does for native IPC, and a failed journal write refuses the request with an `io` error; async frames are not journaled.
+
+**Inbound connections** get the same handle, push and hook verbs as outbound ones, enough for a kdb-compatible pub/sub server:
+
+```clojure
+;; (.q.handle)         the connection whose frame (or close) is being handled; -1 elsewhere
+;; (.q.post h msg)     send msg as a q ASYNC frame on any open q connection, inbound or outbound;
+;;                     queued, never waits; null on success, `handle`/`io` errors otherwise
+;; (.q.on 'sync  fn)   hook: gets the decoded request, REPLACES the default eval, its value is the reply
+;; (.q.on 'async fn)   hook: gets the request, no reply
+;; (.q.on 'close fn)   hook: gets the handle, once per inbound connection, just before teardown
+;; (.q.on 'sync 0)     any non-lambda clears the hook
+(.q.on 'sync (fn [r]
+  (if (== (first r) '.net.sub)               ;; q: h(`.net.sub;5) -- a name the default eval could not call
+      (do (set subs (concat subs (list (.q.handle)))) 5)
+      (eval r))))
+(.q.post (first subs) (list 'upd (dict ['a 'b] [1 2])))   ;; q client receives (`upd;`a`b!1 2) async
+```
+
+`.q.on.*` cannot be `set` from Rayfall (dotted names are reserved), hence the verb; semantics mirror the core's `.ipc.on.*`. A char-vector request reaches the sync/async hook as an unparsed string (`(eval (parse r))` reproduces the default), a hook error is encoded to the client (sync) or logged (async, close). `(.q.handle)` is valid inside all three hooks. Hooks are process-global and live as long as the runtime: `ray_poll_destroy` releases them after the open connections' close hooks have run, a runtime destroyed without a poll needs `q_hooks_release()` first, and `q_env_register()` (once per runtime) drops what an earlier runtime left.
+
+**Hooks and the WAL.** With a sync hook installed, a sync request that is journaled is recorded as `(.q.dispatch_sync (quote <request>))`; `.q.dispatch_sync` applies the sync hook installed at that moment, or evaluates by default when there is none. A replay therefore reproduces the live run if the application installs its hooks (`.q.on`) before `.log.replay`, which is the natural order, since it loads its code first; a replay without the hook evaluates the requests by default.
+
 A Q listener evaluates what it is sent, so it binds **loopback by default**. The address comes from `-q HOST:PORT` (mirroring the core's `--port HOST:PORT`), else `RAYFORCE_Q_BIND_HOST`, else `127.0.0.1`; use `0.0.0.0` for the old all-interfaces behaviour. `HOST` must be an IPv4 address.
 
 Both `-q` and `--q-serve` require a decimal TCP port in `1..65535` (optionally `HOST:PORT`). A
@@ -106,6 +129,11 @@ To *be* a Q server (the mirror of the client), bindings additionally compile [`q
  * selector id (>= 0), or -1. */
 int64_t q_serve(ray_poll_t *poll, int port);                       /* all interfaces */
 int64_t q_serve_at(ray_poll_t *poll, const char *host, int port);  /* one IPv4 address; NULL/"" = q_serve */
+
+/* Push, hooks (see the Rayfall verbs above). */
+ray_t  *q_conn_post(ray_poll_t *poll, int64_t id, ray_t *msg);  /* async frame; NULL or error */
+int     q_hook_set(int which, ray_t *fn);   /* Q_HOOK_SYNC / _ASYNC / _CLOSE; non-lambda clears */
+void    q_hooks_release(void);              /* release every hook; heap still alive */
 ```
 
 A connected Q client (real Q `hopen`, or `q_connect`) sends a char-vector. The server evaluates it as **Rayfall** against the embedded runtime and returns the result Q-encoded.

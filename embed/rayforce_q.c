@@ -220,14 +220,57 @@ static ray_t *qb_close(ray_t *handle) {
   return RAY_NULL_OBJ;
 }
 
-/* (.q.handle) -> the connection whose pushed frame is being handled, -1
- * outside such a handler. */
+/* (.q.handle) -> the connection (inbound or outbound) whose frame is being
+ * handled, or whose close hook is running; -1 outside such a handler. */
 static ray_t *qb_handle(ray_t **args, int64_t n) {
   (void)args;
   if (n != 0)
     return ray_error("arity", ".q.handle takes no arguments");
   return ray_i64(q_poll() != NULL ? q_conn_current() : -1);
 }
+
+/* (.q.post handle msg) -> null. Sends msg as a q ASYNC frame on any open q
+ * connection, inbound or outbound, without waiting: how a publisher pushes
+ * (`upd; data) to a subscriber it learned from (.q.handle). */
+static ray_t *qb_post(ray_t *handle, ray_t *msg) {
+  int ok;
+  int64_t id = q_handle_i64(handle, &ok);
+  if (!ok)
+    return ray_error("type", ".q.post: handle must be a non-negative i64");
+  ray_poll_t *poll = q_poll();
+  if (poll == NULL)
+    return ray_error("handle", ".q.post: needs an event loop (no poll)");
+  ray_t *err = q_conn_post(poll, id, msg);
+  return err ? err : RAY_NULL_OBJ;
+}
+
+/* (.q.on 'sync|'async|'close fn) -> null. Registers (or, for a non-lambda,
+ * clears) the hook for inbound q frames; see q_server.h. */
+static ray_t *qb_on(ray_t *kind, ray_t *fn) {
+  if (kind == NULL || kind->type != -RAY_SYM)
+    return ray_error("type", ".q.on: hook must be 'sync, 'async or 'close");
+  ray_t *name = ray_sym_str(kind->i64); /* borrowed */
+  const char *s = name ? ray_str_ptr(name) : NULL;
+  size_t n = name ? ray_str_len(name) : 0;
+  int which = -1;
+  if (s != NULL) {
+    if (n == 4 && memcmp(s, "sync", 4) == 0)
+      which = Q_HOOK_SYNC;
+    else if (n == 5 && memcmp(s, "async", 5) == 0)
+      which = Q_HOOK_ASYNC;
+    else if (n == 5 && memcmp(s, "close", 5) == 0)
+      which = Q_HOOK_CLOSE;
+  }
+  if (which < 0)
+    return ray_error("domain", ".q.on: hook must be 'sync, 'async or 'close");
+  q_hook_set(which, fn);
+  return RAY_NULL_OBJ;
+}
+
+/* (.q.dispatch_sync req) -> the reply to a sync q request: the `.q.on 'sync`
+ * hook's value, or the default evaluation without one. The journal records a
+ * hooked request as a call of this, so a replay re-runs the hook. */
+static ray_t *qb_dispatch_sync(ray_t *req) { return q_dispatch_sync(req); }
 
 /* Bind a builtin under its reserved-namespace name (`.q.*`): ray_env_bind
  * builds the namespace dict, ray_env_bind_flat registers the flat name for REPL
@@ -241,6 +284,9 @@ static void q_bind(const char *name, ray_t *fn) {
 /* Call once after ray_runtime_create(), before the REPL / script runs. */
 void q_env_register(void) {
   ray_t *f;
+
+  /* A runtime that is gone took its hooks' heap with it. */
+  q_hooks_forget();
 
   f = ray_fn_vary(".q.connect", RAY_FN_RESTRICTED, qb_connect);
   q_bind(".q.connect", f);
@@ -256,6 +302,18 @@ void q_env_register(void) {
 
   f = ray_fn_vary(".q.handle", RAY_FN_NONE, qb_handle);
   q_bind(".q.handle", f);
+  ray_release(f);
+
+  f = ray_fn_binary(".q.post", RAY_FN_RESTRICTED, qb_post);
+  q_bind(".q.post", f);
+  ray_release(f);
+
+  f = ray_fn_binary(".q.on", RAY_FN_RESTRICTED, qb_on);
+  q_bind(".q.on", f);
+  ray_release(f);
+
+  f = ray_fn_unary(".q.dispatch_sync", RAY_FN_NONE, qb_dispatch_sync);
+  q_bind(".q.dispatch_sync", f);
   ray_release(f);
 }
 

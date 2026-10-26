@@ -91,12 +91,58 @@ int64_t q_conn_attach(ray_poll_t *poll, int fd);
  * `timeout` error is returned; the handle is then no longer open. */
 ray_t *q_conn_send(ray_poll_t *poll, int64_t id, ray_t *msg);
 
+/* Send `msg` as a q ASYNC frame on an open connection, inbound or outbound,
+ * and return at once: the frame is queued on the poll and flushed when the
+ * socket is writable. Returns NULL on success or an owned error: `handle` if
+ * `id` is not an open, established q connection, `io` if the message cannot be
+ * encoded or the connection's queue is full. A later q_conn_send on the same
+ * handle writes any still-queued frames first, so order is kept. */
+ray_t *q_conn_post(ray_poll_t *poll, int64_t id, ray_t *msg);
+
 /* Check whether `id` identifies an open Q connection owned by this module. */
 int q_conn_is_handle(ray_poll_t *poll, int64_t id);
 
-/* The attached connection whose pushed frame is being evaluated right now:
- * valid inside a handler such a frame called, -1 everywhere else. */
+/* The connection (inbound or attached) whose frame, or close, is being
+ * handled right now: valid inside a handler such a frame called and inside
+ * the hooks below, -1 everywhere else. */
 int64_t q_conn_current(void);
+
+/* ===== Hooks =====
+ *
+ * What the core's `.ipc.on.*` are for native IPC, for q frames; `.q.on.*` is a
+ * reserved name Rayfall cannot `set`, hence a setter. Each hook is a lambda
+ * (anything else clears it):
+ *   SYNC   called with the decoded request INSTEAD of the default eval; its
+ *          value (or error) is the reply. A char vector arrives unparsed.
+ *   ASYNC  called with the decoded request; there is no reply, an error is
+ *          logged.
+ *   CLOSE  called with the handle once per established inbound connection,
+ *          just before teardown; errors are logged and swallowed.
+ * q_conn_current() is the connection inside all three. Returns 0, or -1 for
+ * an unknown hook. The lambda is retained; a hook outlives neither its
+ * runtime nor a q_hook_set that replaces it.
+ *
+ * Teardown: ray_poll_destroy releases the hooks, after the close hooks of the
+ * connections still open have run, once a hook, a listener or an attached
+ * connection has put the server's anchor on that poll (the poll the runtime
+ * holds, ray_runtime_set_poll). A runtime destroyed without a poll needs
+ * q_hooks_release() before ray_runtime_destroy(). q_env_register() (call it
+ * for every new runtime) drops, without releasing, what an earlier runtime
+ * left in the slots. */
+enum { Q_HOOK_SYNC = 0, Q_HOOK_ASYNC = 1, Q_HOOK_CLOSE = 2, Q_HOOK_COUNT = 3 };
+int q_hook_set(int which, ray_t *fn);
+int q_hook_installed(int which); /* 1 when the hook is set */
+void q_hooks_release(void);      /* release every hook, heap still alive */
+void q_hooks_forget(void);       /* drop the slots, their heap is gone */
+
+/* `.q.dispatch_sync`: the sync request `req` (borrowed) answered by the
+ * installed sync hook, or by the default evaluation when there is none. A sync
+ * request received while a WAL is open and a sync hook is installed is
+ * journaled as (.q.dispatch_sync (quote <request>)), so `.log.replay` runs the
+ * request through whichever hook is installed then: install the hooks before
+ * replaying (the application loads its code, `.q.on` included, first), or the
+ * replay evaluates the requests by default. */
+ray_t *q_dispatch_sync(ray_t *req);
 
 /* Close an attached connection and release its state. */
 void q_conn_close(ray_poll_t *poll, int64_t id);

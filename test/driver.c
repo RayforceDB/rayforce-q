@@ -21,6 +21,7 @@
  * IN THE SOFTWARE.
  */
 
+#define _DEFAULT_SOURCE /* usleep, kill */
 #include <rayforce.h>
 
 #include "core/poll.h"    /* ray_poll_create / run / destroy        */
@@ -34,6 +35,7 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <signal.h>
@@ -61,6 +63,7 @@ static int run_server(int port) {
     fprintf(stderr, "driver: failed to create rayforce runtime\n");
     return 1;
   }
+  q_env_register(); /* .q.post / .q.on / .q.handle for the served runtime */
   ray_poll_t *poll = ray_poll_create();
   if (poll == NULL) {
     fprintf(stderr, "driver: failed to create poll\n");
@@ -1685,7 +1688,315 @@ static int run_frame_limit_selftest(const char *host, int port) {
   return failures ? 1 : 0;
 }
 
+/* ---- hooks across runtime teardown -------------------------------------- */
+
+/* A TCP port nobody listens on right now. */
+static int free_tcp_port(void) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  struct sockaddr_in a = {0};
+  a.sin_family = AF_INET;
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  socklen_t l = sizeof a;
+  int port = 0;
+  if (fd >= 0 && bind(fd, (struct sockaddr *)&a, sizeof a) == 0 &&
+      getsockname(fd, (struct sockaddr *)&a, &l) == 0)
+    port = ntohs(a.sin_port);
+  if (fd >= 0)
+    close(fd);
+  return port;
+}
+
+static int tcp_connect_local(int port) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  struct sockaddr_in a = {0};
+  a.sin_family = AF_INET;
+  a.sin_port = htons((uint16_t)port);
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (fd >= 0 && connect(fd, (struct sockaddr *)&a, sizeof a) < 0) {
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+/* Run the poll for about `ms`, in short slices. */
+static void pump_poll(ray_poll_t *poll, int ms) {
+  for (int i = 0; i < ms / 10; i++)
+    ray_poll_run_for(poll, 10);
+}
+
+static int hooks_clear(void) {
+  return !q_hook_installed(Q_HOOK_SYNC) && !q_hook_installed(Q_HOOK_ASYNC) &&
+         !q_hook_installed(Q_HOOK_CLOSE);
+}
+
+static int64_t eval_i64(const char *src) {
+  ray_t *r = ray_eval_str(src);
+  int64_t v = (r && !RAY_IS_ERR(r) && r->type == -RAY_I64) ? r->i64 : -1;
+  release_any(r);
+  return v;
+}
+
+/* Create / register / set hooks / destroy, then again, in one process. The
+ * hooks live on the first runtime's heap: they must be released by the poll's
+ * teardown while it is alive, and a second runtime must not see, call or
+ * release them. */
+static int run_hooks_teardown_selftest(void) {
+  int failures = 0;
+  signal(SIGPIPE, SIG_IGN);
+  for (int round = 0; round < 3; round++) {
+    ray_runtime_t *rt = ray_runtime_create(0, NULL);
+    if (rt == NULL) {
+      fprintf(stderr, "hooks teardown selftest: no runtime\n");
+      return 1;
+    }
+    q_env_register();
+    if (!hooks_clear()) {
+      fprintf(stderr, "hooks teardown selftest: round %d starts with a hook "
+                      "from the previous runtime\n", round);
+      failures++;
+    }
+    /* replacing or clearing what an old runtime left must not touch its heap */
+    q_hook_set(Q_HOOK_SYNC, NULL);
+    q_hook_set(Q_HOOK_CLOSE, NULL);
+    ray_poll_t *poll = ray_poll_create();
+    if (poll == NULL) {
+      fprintf(stderr, "hooks teardown selftest: no poll\n");
+      return 1;
+    }
+    ray_runtime_set_poll(poll);
+    int port = free_tcp_port();
+    int cfd = -1;
+    if (round < 2) {
+      if (q_serve(poll, port) < 0) {
+        fprintf(stderr, "hooks teardown selftest: cannot listen\n");
+        return 1;
+      }
+      eval_setup("(set closed 0)", NULL);
+      eval_setup("(.q.on 'sync (fn [r] r))", NULL);
+      eval_setup("(.q.on 'close (fn [h] (set closed (+ closed 1))))", NULL);
+      cfd = tcp_connect_local(port);
+      if (cfd >= 0) {
+        const uint8_t login[] = {'u', 3, 0};
+        if (send(cfd, login, sizeof login, 0) != (ssize_t)sizeof login)
+          failures++;
+      }
+      pump_poll(poll, 200); /* accept + handshake: an established connection */
+    } else {
+      /* no server, no connection: the hook is set on a bare poll */
+      eval_setup("(.q.on 'sync (fn [r] r))", NULL);
+    }
+    if (!q_hook_installed(Q_HOOK_SYNC)) {
+      fprintf(stderr, "hooks teardown selftest: hook not installed\n");
+      failures++;
+    }
+    ray_poll_destroy(poll);
+    ray_runtime_set_poll(NULL);
+    if (!hooks_clear()) {
+      fprintf(stderr, "hooks teardown selftest: round %d: poll teardown left "
+                      "a hook set\n", round);
+      failures++;
+    }
+    if (round < 2 && eval_i64("closed") != 1) {
+      fprintf(stderr, "hooks teardown selftest: round %d: close hook ran %lld "
+                      "times at teardown, want 1\n", round,
+              (long long)eval_i64("closed"));
+      failures++;
+    }
+    if (cfd >= 0)
+      close(cfd);
+    ray_runtime_destroy(rt);
+  }
+
+  /* A runtime destroyed with a hook still set and no teardown step: the next
+   * one starts clean, and nothing releases the dead heap's object. */
+  ray_runtime_t *rt = ray_runtime_create(0, NULL);
+  q_env_register();
+  eval_setup("(.q.on 'sync (fn [r] r))", NULL);
+  ray_runtime_destroy(rt);
+  rt = ray_runtime_create(0, NULL);
+  q_env_register();
+  if (!hooks_clear()) {
+    fprintf(stderr, "hooks teardown selftest: a hook outlived its runtime\n");
+    failures++;
+  }
+  q_hook_set(Q_HOOK_SYNC, NULL); /* would release the dead pointer */
+  eval_setup("(.q.on 'sync (fn [r] r))", NULL);
+  q_hooks_release();
+  if (!hooks_clear())
+    failures++;
+  ray_runtime_destroy(rt);
+  printf("hooks teardown selftest: %s\n", failures ? "FAIL" : "ok");
+  return failures ? 1 : 0;
+}
+
+/* ---- a handler that closes its own connection ---------------------------- */
+
+/* A q sync frame carrying the char vector `src`. */
+static size_t str_frame(uint8_t *out, const char *src) {
+  uint32_t n = (uint32_t)strlen(src);
+  uint32_t total = 8 + 6 + n;
+  uint8_t hdr[8] = {1, 1, 0, 0};
+  memcpy(hdr + 4, &total, 4);
+  memcpy(out, hdr, 8);
+  out[8] = 10; /* char vector */
+  out[9] = 0;
+  memcpy(out + 10, &n, 4);
+  memcpy(out + 14, src, n);
+  return total;
+}
+
+/* Everything readable on `fd` now. */
+static ssize_t drain_now(int fd, uint8_t *buf, size_t cap) {
+  ssize_t got = 0;
+  for (;;) {
+    ssize_t n = recv(fd, buf + got, cap - (size_t)got, MSG_DONTWAIT);
+    if (n <= 0)
+      return got ? got : (n == 0 ? 0 : -1);
+    got += n;
+  }
+}
+
+/* A q server for one connection: answers the login, then copies every byte
+ * it receives to `report`. `lfd` is already listening. */
+static pid_t recording_peer(int lfd, int report) {
+  pid_t pid = fork();
+  if (pid == 0) {
+    int fd = accept(lfd, NULL, NULL);
+    uint8_t buf[4096];
+    int logged_in = 0;
+    ssize_t n;
+    while (fd >= 0 && (n = recv(fd, buf, sizeof buf, 0)) > 0) {
+      if (!logged_in) {
+        for (ssize_t i = 0; i < n; i++)
+          if (buf[i] == 0) {
+            const uint8_t cap = 3;
+            if (send(fd, &cap, 1, 0) != 1)
+              _exit(1);
+            logged_in = 1;
+            if (n > i + 1 && write(report, buf + i + 1, (size_t)(n - i - 1)) < 0)
+              _exit(1);
+            break;
+          }
+        continue;
+      }
+      if (write(report, buf, (size_t)n) < 0)
+        break;
+    }
+    _exit(0);
+  }
+  return pid;
+}
+
+/* A sync hook that closes its own connection with `.q.close (.q.handle)` and
+ * then opens another (`.q.connect`): the poll gives the new connection the
+ * slot the old one just left, before the hook returns. The reply to the
+ * request belongs to the closed connection, so it must go nowhere; sent to the
+ * slot's new occupant it would be a stray RESPONSE on a connection the hook
+ * opened (or, had the send failed, would have dropped it). */
+static int run_conn_identity_selftest(void) {
+  int failures = 0;
+  signal(SIGPIPE, SIG_IGN);
+  ray_runtime_t *rt = ray_runtime_create(0, NULL);
+  if (rt == NULL)
+    return 1;
+  q_env_register();
+  ray_poll_t *poll = ray_poll_create();
+  if (poll == NULL)
+    return 1;
+  ray_runtime_set_poll(poll);
+  int port = free_tcp_port();
+  if (q_serve(poll, port) < 0) {
+    fprintf(stderr, "conn identity selftest: cannot listen\n");
+    return 1;
+  }
+
+  /* the peer the hook will connect to */
+  int peer_port = free_tcp_port();
+  int lfd = socket(AF_INET, SOCK_STREAM, 0);
+  struct sockaddr_in la = {0};
+  la.sin_family = AF_INET;
+  la.sin_port = htons((uint16_t)peer_port);
+  la.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  int pipefd[2];
+  if (lfd < 0 || bind(lfd, (struct sockaddr *)&la, sizeof la) < 0 ||
+      listen(lfd, 4) < 0 || pipe(pipefd) < 0) {
+    fprintf(stderr, "conn identity selftest: cannot set up the peer\n");
+    return 1;
+  }
+  pid_t peer = recording_peer(lfd, pipefd[1]);
+  close(lfd);
+  close(pipefd[1]);
+
+  char hook[320];
+  snprintf(hook, sizeof hook,
+           "(.q.on 'sync (fn [r] (do (set aid (.q.handle)) (.q.close (.q.handle)) "
+           "(set nh (.q.connect \"127.0.0.1\" %d)) r)))", peer_port);
+  eval_setup("(set aid -1)", NULL);
+  eval_setup("(set nh -2)", NULL);
+  eval_setup(hook, NULL);
+
+  const uint8_t login[] = {'u', 3, 0};
+  uint8_t buf[512], frame[128];
+  int a = tcp_connect_local(port);
+  if (a < 0 || send(a, login, sizeof login, 0) != (ssize_t)sizeof login)
+    failures++;
+  pump_poll(poll, 100);
+  if (drain_now(a, buf, sizeof buf) != 1) {
+    fprintf(stderr, "conn identity selftest: no handshake reply\n");
+    failures++;
+  }
+  size_t n = str_frame(frame, "7");
+  if (send(a, frame, n, 0) != (ssize_t)n)
+    failures++;
+  pump_poll(poll, 400);
+
+  int64_t aid = eval_i64("aid"), nh = eval_i64("nh");
+  if (aid < 0 || nh != aid) {
+    fprintf(stderr, "conn identity selftest: the hook's new connection (%lld) "
+                    "did not take the closed one's slot (%lld)\n",
+            (long long)nh, (long long)aid);
+    failures++;
+  }
+  ssize_t got = drain_now(a, buf, sizeof buf);
+  if (got != 0) {
+    fprintf(stderr, "conn identity selftest: the closed connection is not at "
+                    "EOF (%lld)\n", (long long)got);
+    failures++;
+  }
+  /* what the new connection's peer received after the login: nothing */
+  uint8_t seen[512];
+  fcntl(pipefd[0], F_SETFL, O_NONBLOCK);
+  ssize_t leaked = read(pipefd[0], seen, sizeof seen);
+  if (leaked > 0) {
+    fprintf(stderr, "conn identity selftest: the reply to the closed "
+                    "connection went out on its slot's new occupant (%lld "
+                    "bytes)\n", (long long)leaked);
+    failures++;
+  }
+  if (!q_conn_is_handle(poll, nh)) {
+    fprintf(stderr, "conn identity selftest: the new connection was dropped\n");
+    failures++;
+  }
+  q_hook_set(Q_HOOK_SYNC, NULL);
+  close(a);
+  close(pipefd[0]);
+  ray_poll_destroy(poll);
+  ray_runtime_set_poll(NULL);
+  ray_runtime_destroy(rt);
+  if (peer > 0) {
+    kill(peer, SIGKILL);
+    waitpid(peer, NULL, 0);
+  }
+  printf("conn identity selftest: %s\n", failures ? "FAIL" : "ok");
+  return failures ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
+  if (argc >= 2 && strcmp(argv[1], "--conn-identity-selftest") == 0)
+    return run_conn_identity_selftest();
+  if (argc >= 2 && strcmp(argv[1], "--hooks-teardown-selftest") == 0)
+    return run_hooks_teardown_selftest();
   if (argc >= 2 && strcmp(argv[1], "--codec-selftest") == 0)
     return run_codec_selftest();
 

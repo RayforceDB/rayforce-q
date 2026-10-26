@@ -1,0 +1,29 @@
+;; (.q.post h msg): an ASYNC frame on an open connection, no reply awaited.
+;; Here the connection is outbound (driver --poll) and the peer a real q server;
+;; the inbound case (a Rayfall server pushing to a q client) is in run.sh.
+;;
+;; q evaluates the pushed list (`upd;42) as upd[42]. Frames on one connection
+;; stay in order, so the sync read after the post sees its effect.
+
+(set a (.q.connect qhost qport))
+(.q.send a "upd:{postv::x};1") -- 1
+(.q.post a (list 'upd 42)) -- null
+(.q.send a "postv") -- 42
+
+;; a post is not a send: nothing is answered, the next sync still pairs up
+(.q.post a (list 'upd 43))
+(.q.post a (list 'upd 44))
+(.q.send a "postv") -- 44
+
+;; errors: not a handle / wrong type / closed handle
+(.q.post 99999 1) !- handle
+(.q.post "x" 1) !- type
+(.q.close a)
+(.q.post a 1) !- handle
+
+;; .q.on validates its hook name and tolerates clearing what is not set
+(.q.on 'nonsense 0) !- domain
+(.q.on "sync" 0) !- type
+(.q.on 'sync 0) -- null
+(.q.on 'async 0) -- null
+(.q.on 'close 0) -- null
