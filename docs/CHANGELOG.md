@@ -4,6 +4,16 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Changed
+
+- **`-q` listens on loopback by default.** The q listener bound every
+  interface. `rayforce -q [HOST:]PORT` now binds `HOST` (mirroring the core's
+  `--port HOST:PORT`), else `$RAYFORCE_Q_BIND_HOST`, else `127.0.0.1`; pass
+  `0.0.0.0` for the old behaviour. A host that is not an IPv4 address fails
+  instead of widening the bind. **Behaviour change** for deployments that
+  reached `-q` from another machine. In C: `q_serve_at(poll, host, port)`;
+  `q_serve` keeps the wildcard bind for bindings.
+
 ### Fixed
 
 - **An empty request returns `(::)`, not `parse`.** q `h ""` (and a
