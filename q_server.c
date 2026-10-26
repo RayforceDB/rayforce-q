@@ -708,7 +708,11 @@ static int q_send_result(ray_poll_t *poll, ray_selector_t *sel, ray_t *result) {
   if (loaded != NULL)
     ray_error_free(loaded);
   if (enc < 0) {
-    ray_t *e = ray_error(err[0] ? err : "q server: encode failed", NULL);
+    /* The text is the message, not the code: ray_error() keeps only 7 bytes
+     * of a code, so passing it as the code sent a client "q: cann" for
+     * "q: cannot encode ...". Same loading as above so q_encode frames
+     * "category: message". */
+    ray_t *e = ray_error("type", "%s", err[0] ? err : "q server: encode failed");
     int rc = q_encode(e, &buf, &len, err, sizeof err);
     q_release_any(e);
     if (rc < 0)
@@ -1078,16 +1082,23 @@ static void q_on_close(ray_poll_t *poll, ray_selector_t *sel) {
 }
 
 /* Register a Q-protocol listener on `poll`. */
-int64_t q_serve(ray_poll_t *poll, int port) {
+int64_t q_serve_at(ray_poll_t *poll, const char *host, int port) {
   if (poll == NULL)
     return -1;
   if (port < 1 || port > 65535) {
     fprintf(stderr, "q: invalid port %d (expected 1..65535)\n", port);
     return -1;
   }
-  ray_sock_t fd = ray_sock_listen((uint16_t)port);
+  int bound = host != NULL && *host != '\0';
+  /* A NULL or empty host is the wildcard; a host that is not an IPv4 address
+   * fails the bind loudly, never falling back to all interfaces. */
+  ray_sock_t fd = ray_sock_listen_at(bound ? host : NULL, (uint16_t)port);
   if (fd == RAY_INVALID_SOCK) {
-    fprintf(stderr, "q: cannot listen on port %d (in use?)\n", port);
+    if (bound)
+      fprintf(stderr, "q: cannot listen on %s:%d (in use, or not an IPv4 address?)\n",
+              host, port);
+    else
+      fprintf(stderr, "q: cannot listen on port %d (in use?)\n", port);
     return -1;
   }
   ray_sock_set_nonblocking(fd);
@@ -1104,8 +1115,16 @@ int64_t q_serve(ray_poll_t *poll, int port) {
     return -1;
   }
   q_hooks_anchor(poll);
-  fprintf(stderr, "q: listening on %d (Rayfall over the Q wire)\n", port);
+  if (bound)
+    fprintf(stderr, "q: listening on %s:%d (Rayfall over the Q wire)\n", host,
+            port);
+  else
+    fprintf(stderr, "q: listening on %d (Rayfall over the Q wire)\n", port);
   return id;
+}
+
+int64_t q_serve(ray_poll_t *poll, int port) {
+  return q_serve_at(poll, NULL, port);
 }
 
 /* ===================== Outbound connections ===============================

@@ -27,6 +27,16 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
   `q_env_register()` drops what an earlier runtime left: a hook no longer
   outlives its runtime.
 
+### Changed
+
+- **`-q` listens on loopback by default.** The q listener bound every
+  interface. `rayforce -q [HOST:]PORT` now binds `HOST` (mirroring the core's
+  `--port HOST:PORT`), else `$RAYFORCE_Q_BIND_HOST`, else `127.0.0.1`; pass
+  `0.0.0.0` for the old behaviour. A host that is not an IPv4 address fails
+  instead of widening the bind. **Behaviour change** for deployments that
+  reached `-q` from another machine. In C: `q_serve_at(poll, host, port)`;
+  `q_serve` keeps the wildcard bind for bindings.
+
 ### Fixed
 
 - **A frame left half written closes the connection.** With the direct send, a
@@ -56,10 +66,6 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
   `ray_ipc_set_auto_journal_eval`, the eval runs in the core's auto-journal
   scope and a nested `.log.write` is refused, as for a native frame.
 
-- **An empty request returns `(::)`, not `parse`.** q `h ""` (and a
-  whitespace-only string) is the ping/flush kdb tools and feeds use; the
-  server now answers it with the identity instead of a Rayfall parse error.
-
 - **Error text reaches the q client.** A server-side `(raise "custom failure")`
   arrived as `'domain` and `(undefined_fn 1)` as `'name`: only the category was
   encoded. The error frame now reads `category: message` (the message alone
@@ -71,6 +77,10 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
   are weak references, so on v2.11.x an uncaught `raise` is the bare category.
   Built and tested (`make test` with a real q) against v2.11.5 (`5d5f47c2`) and
   the pinned dev core.
+
+- **An empty request returns `(::)`, not `parse`.** q `h ""` (and a
+  whitespace-only string) is the ping/flush kdb tools and feeds use; the
+  server now answers it with the identity instead of a Rayfall parse error.
 
 ## [2.6.0]
 
