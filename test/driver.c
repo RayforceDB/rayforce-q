@@ -1992,7 +1992,211 @@ static int run_conn_identity_selftest(void) {
   return failures ? 1 : 0;
 }
 
+/* ---- partial writes ------------------------------------------------------- */
+
+/* A connected socketpair whose send side holds only a few KiB, so a large
+ * frame leaves a prefix on the wire and the rest has to wait. */
+static int small_buffer_pair(int sv[2]) {
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0)
+    return -1;
+  int small = 4096;
+  setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof small);
+  setsockopt(sv[1], SOL_SOCKET, SO_RCVBUF, &small, sizeof small);
+  return 0;
+}
+
+/* Read the frame the peer is sent, pumping the poll so the queued tail is
+ * flushed as the peer makes room. Returns the bytes read (up to the frame
+ * length its header declares), or -1. */
+static int64_t read_frame_pumping(ray_poll_t *poll, int fd, uint8_t *out,
+                                  int64_t cap, int64_t *declared) {
+  int64_t got = 0;
+  *declared = -1;
+  for (int spins = 0; spins < 2000; spins++) {
+    ray_poll_run_for(poll, 5);
+    int64_t want = *declared >= 0 ? *declared - got : 8 - got;
+    if (want > cap - got)
+      want = cap - got;
+    ssize_t n = recv(fd, out + got, (size_t)want, MSG_DONTWAIT);
+    if (n > 0)
+      got += n;
+    if (got >= 8 && *declared < 0) {
+      uint32_t sz;
+      memcpy(&sz, out + 4, 4);
+      *declared = sz;
+    }
+    if (*declared >= 0 && got >= *declared)
+      return got;
+  }
+  return got;
+}
+
+/* Everything the peer receives until EOF or a quiet spell. */
+static int64_t read_until_eof(ray_poll_t *poll, int fd, int64_t *eof) {
+  int64_t got = 0;
+  uint8_t buf[65536];
+  *eof = 0;
+  for (int spins = 0; spins < 400; spins++) {
+    ray_poll_run_for(poll, 5);
+    for (;;) {
+      ssize_t n = recv(fd, buf, sizeof buf, MSG_DONTWAIT);
+      if (n > 0) {
+        got += n;
+        continue;
+      }
+      if (n == 0)
+        *eof = 1;
+      break;
+    }
+    if (*eof)
+      break;
+  }
+  return got;
+}
+
+#define PARTIAL_BODY (1 << 20)
+
+static ray_t *big_text(void) {
+  char *t = (char *)malloc(PARTIAL_BODY);
+  memset(t, 'x', PARTIAL_BODY);
+  ray_t *s = ray_str(t, PARTIAL_BODY);
+  free(t);
+  return s;
+}
+
+/* A post larger than the socket buffer is written in part and its tail
+ * queued. Whether the tail can be kept decides what the connection is: kept,
+ * it carries the whole frame in order; lost after a prefix went out, it must
+ * be closed (a following frame would be read as the rest of this one); lost
+ * with nothing written, a plain refusal. */
+static int run_partial_send_selftest(void) {
+  int failures = 0;
+  signal(SIGPIPE, SIG_IGN);
+  ray_runtime_t *rt = ray_runtime_create(0, NULL);
+  ray_poll_t *poll = ray_poll_create();
+  if (rt == NULL || poll == NULL)
+    return 1;
+  ray_runtime_set_poll(poll);
+  const int64_t frame_len = PARTIAL_BODY + 14;
+  uint8_t *rx = (uint8_t *)malloc((size_t)(2 * PARTIAL_BODY));
+  ray_t *big = big_text();
+  ray_t *small = ray_str("tiny", 4);
+  int64_t declared = 0;
+
+  /* 1. EAGAIN mid-frame, the tail kept: the frame arrives whole, then the
+   * next one intact behind it. */
+  int sv[2];
+  if (small_buffer_pair(sv) < 0)
+    return 1;
+  int64_t id = q_conn_attach(poll, sv[0]);
+  ray_t *err = q_conn_post(poll, id, big);
+  if (err != NULL) {
+    fprintf(stderr, "partial send selftest: post of a large frame failed\n");
+    failures++;
+    release_any(err);
+  }
+  err = q_conn_post(poll, id, small);
+  if (err != NULL) {
+    failures++;
+    release_any(err);
+  }
+  int64_t got = read_frame_pumping(poll, sv[1], rx, 2 * PARTIAL_BODY, &declared);
+  if (got != frame_len || declared != frame_len || rx[0] != 1 || rx[1] != 0) {
+    fprintf(stderr, "partial send selftest: large frame read %lld of %lld "
+                    "bytes\n", (long long)got, (long long)frame_len);
+    failures++;
+  }
+  uint8_t next[64];
+  got = read_frame_pumping(poll, sv[1], next, sizeof next, &declared);
+  if (got != 18 || declared != 18 || memcmp(next + 14, "tiny", 4) != 0) {
+    fprintf(stderr, "partial send selftest: the frame behind it is %lld bytes\n",
+            (long long)got);
+    failures++;
+  }
+  if (!q_conn_is_handle(poll, id)) {
+    fprintf(stderr, "partial send selftest: a kept tail closed the connection\n");
+    failures++;
+  }
+  q_conn_close(poll, id);
+  close(sv[1]);
+
+  /* 2. the tail cannot be kept after a prefix went out: the connection is
+   * closed, and no later post can go out behind half a frame. */
+  if (small_buffer_pair(sv) < 0)
+    return 1;
+  id = q_conn_attach(poll, sv[0]);
+  q_test_fail_next_tail_alloc();
+  err = q_conn_post(poll, id, big);
+  if (err == NULL || !RAY_IS_ERR(err)) {
+    fprintf(stderr, "partial send selftest: a lost tail was reported as sent\n");
+    failures++;
+  }
+  release_any(err);
+  if (q_conn_is_handle(poll, id)) {
+    fprintf(stderr, "partial send selftest: a connection with half a frame "
+                    "was left open\n");
+    failures++;
+  }
+  err = q_conn_post(poll, id, small);
+  if (err == NULL || !RAY_IS_ERR(err)) {
+    fprintf(stderr, "partial send selftest: a post went out behind half a "
+                    "frame\n");
+    failures++;
+  }
+  release_any(err);
+  int64_t eof = 0;
+  got = read_until_eof(poll, sv[1], &eof);
+  if (!eof || got <= 0 || got >= frame_len) {
+    fprintf(stderr, "partial send selftest: peer saw %lld of %lld bytes, "
+                    "eof=%lld\n", (long long)got, (long long)frame_len,
+            (long long)eof);
+    failures++;
+  }
+  close(sv[1]);
+
+  /* 3. nothing written, the tail cannot be queued: refused, connection and
+   * the earlier frame untouched. */
+  if (small_buffer_pair(sv) < 0)
+    return 1;
+  id = q_conn_attach(poll, sv[0]);
+  err = q_conn_post(poll, id, big); /* partial; its tail is queued */
+  release_any(err);
+  q_test_fail_next_tail_alloc();
+  err = q_conn_post(poll, id, small); /* queue non-empty: nothing is written */
+  if (err == NULL || !RAY_IS_ERR(err)) {
+    fprintf(stderr, "partial send selftest: a refused post was reported as "
+                    "sent\n");
+    failures++;
+  }
+  release_any(err);
+  if (!q_conn_is_handle(poll, id)) {
+    fprintf(stderr, "partial send selftest: a post that wrote nothing closed "
+                    "the connection\n");
+    failures++;
+  }
+  got = read_frame_pumping(poll, sv[1], rx, 2 * PARTIAL_BODY, &declared);
+  if (got != frame_len || declared != frame_len) {
+    fprintf(stderr, "partial send selftest: the earlier frame arrived as "
+                    "%lld of %lld bytes\n", (long long)got,
+            (long long)frame_len);
+    failures++;
+  }
+  q_conn_close(poll, id);
+  close(sv[1]);
+
+  release_any(big);
+  release_any(small);
+  free(rx);
+  ray_poll_destroy(poll);
+  ray_runtime_set_poll(NULL);
+  ray_runtime_destroy(rt);
+  printf("partial send selftest: %s\n", failures ? "FAIL" : "ok");
+  return failures ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
+  if (argc >= 2 && strcmp(argv[1], "--partial-send-selftest") == 0)
+    return run_partial_send_selftest();
   if (argc >= 2 && strcmp(argv[1], "--conn-identity-selftest") == 0)
     return run_conn_identity_selftest();
   if (argc >= 2 && strcmp(argv[1], "--hooks-teardown-selftest") == 0)

@@ -60,6 +60,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 
@@ -597,8 +599,47 @@ static int64_t q_send_fn(int64_t fd, uint8_t *buf, int64_t len) {
 /* Queue a complete encoded frame on the connection's tx list and arm the
  * poll to write it. Takes ownership of `buf` (freed on every path). Used for
  * RESPONSEs and for pushed ASYNC frames alike: nothing here waits on the peer. */
+/* Test seam: make the next unsent-tail allocation in q_queue_frame fail. */
+static int q_test_fail_tail_alloc;
+void q_test_fail_next_tail_alloc(void) { q_test_fail_tail_alloc = 1; }
+
 static int q_queue_frame(ray_poll_t *poll, ray_selector_t *sel, uint8_t *buf,
                          int64_t len) {
+  /* Fast path: nothing is queued ahead of this frame, so write it straight
+   * to the (non-blocking) socket. A small reply almost always fits the send
+   * buffer, which saves the epoll_ctl(MOD) pair, the extra epoll_wait for
+   * EPOLLOUT, the wasted recv the poll loop then tries, and the tx buffer
+   * copy of the queue path. Only an unsent tail (EAGAIN or a short write)
+   * falls through to the queue.
+   *
+   * Once a prefix is on the wire the frame can only be completed, never
+   * withdrawn: the peer would read the next frame's bytes as the rest of this
+   * one. So a failure after `sent > 0` closes the connection (the stream is
+   * unusable); a failure with nothing written is a plain refusal and leaves
+   * the connection as it was. */
+  int64_t sent = 0;
+  int64_t id = sel->id;
+  if (sel->tx.buf == NULL) {
+    while (sent < len) {
+      int64_t n = q_send_fn(sel->fd, buf + sent, len - sent);
+      if (n > 0) {
+        sent += n;
+        continue;
+      }
+      if (n < 0 && errno == EINTR)
+        continue;
+      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        break;
+      free(buf);
+      if (sent > 0)
+        ray_poll_deregister(poll, id);
+      return -1; /* peer gone or hard error: the caller closes the connection */
+    }
+    if (sent == len) {
+      free(buf);
+      return 0;
+    }
+  }
   int64_t queued = 0;
   for (ray_poll_buf_t *p = sel->tx.buf; p != NULL; p = p->next) {
     int64_t pending = p->size - p->offset;
@@ -608,16 +649,24 @@ static int q_queue_frame(ray_poll_t *poll, ray_selector_t *sel, uint8_t *buf,
     }
     queued += pending;
   }
-  if (len > Q_MAX_BODY - queued) {
+  if (len - sent > Q_MAX_BODY - queued) {
     free(buf);
+    if (sent > 0)
+      ray_poll_deregister(poll, id);
     return -1;
   }
-  ray_poll_buf_t *out = ray_poll_buf_new(len);
+  ray_poll_buf_t *out = NULL;
+  if (q_test_fail_tail_alloc)
+    q_test_fail_tail_alloc = 0;
+  else
+    out = ray_poll_buf_new(len - sent);
   if (out == NULL) {
     free(buf);
+    if (sent > 0)
+      ray_poll_deregister(poll, id);
     return -1;
   }
-  memcpy(out->data, buf, (size_t)len);
+  memcpy(out->data, buf + sent, (size_t)(len - sent));
   free(buf);
   if (sel->tx.buf == NULL) {
     sel->tx.buf = out;
@@ -687,6 +736,13 @@ static void q_close_connection_sigpipe(ray_sock_t fd) {
 #endif
 }
 
+/* Replies and pushed frames are small and latency-bound: never hold them back
+ * for Nagle (a pipelined client would otherwise see a delayed-ACK stall). */
+static void q_set_nodelay(ray_sock_t fd) {
+  int yes = 1;
+  setsockopt((int)fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof yes);
+}
+
 static int64_t q_recv_fn(int64_t fd, uint8_t *buf, int64_t len) {
   return ray_sock_recv((ray_sock_t)fd, buf, (size_t)len);
 }
@@ -703,6 +759,7 @@ static ray_t *q_accept(ray_poll_t *poll, ray_selector_t *sel) {
     return NULL;
   ray_sock_set_nonblocking(nfd);
   q_close_connection_sigpipe(nfd);
+  q_set_nodelay(nfd);
 
   q_conn_t *cd = (q_conn_t *)calloc(1, sizeof *cd);
   if (cd == NULL) {
@@ -969,7 +1026,8 @@ static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
      * its slot before the reply is queued: the slot id alone would send this
      * reply to the newcomer, or drop it on a send failure. */
     ray_selector_t *cur = q_conn_selector(poll, id, gen);
-    if (cur && q_send_result(poll, cur, result) < 0)
+    if (cur && q_send_result(poll, cur, result) < 0 &&
+        q_conn_selector(poll, id, gen) != NULL) /* may be closed already */
       ray_poll_deregister(poll, id);
   } else if (result != NULL && RAY_IS_ERR(result)) {
     /* Async has no reply channel, so an error here would vanish silently —
@@ -1205,6 +1263,7 @@ int64_t q_conn_attach(ray_poll_t *poll, int fd) {
   int timeout_ms = q_sock_recv_timeout_ms(fd);
   ray_sock_set_nonblocking((ray_sock_t)fd);
   q_close_connection_sigpipe((ray_sock_t)fd);
+  q_set_nodelay((ray_sock_t)fd);
 
   q_conn_t *cd = (q_conn_t *)calloc(1, sizeof *cd);
   if (cd == NULL)
@@ -1328,10 +1387,15 @@ ray_t *q_conn_post(ray_poll_t *poll, int64_t id, ray_t *msg) {
   if (q_encode(msg, &buf, &len, err, sizeof err) < 0)
     return ray_error("io", "%s", err[0] ? err : "q: encode failed");
   buf[1] = Q_MSG_ASYNC; /* q_encode stamps SYNC */
-  /* Queued, not written: the poll flushes it when the socket is writable, so
-   * a slow subscriber cannot stall the publisher. */
-  if (q_queue_frame(poll, sel, buf, len) < 0)
+  /* Written at once when the socket takes it, else queued for the poll to
+   * flush when it is writable, so a slow subscriber cannot stall the
+   * publisher. */
+  if (q_queue_frame(poll, sel, buf, len) < 0) {
+    if (!q_conn_is_handle(poll, id))
+      return ray_error("io", "q: post failed after part of the frame was "
+                             "sent; connection closed");
     return ray_error("io", "q: post queue full or out of memory");
+  }
   return NULL;
 }
 
