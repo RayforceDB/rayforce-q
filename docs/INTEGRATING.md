@@ -25,6 +25,12 @@ against. Its requirements:
   `core/ipc.h` and `core/sock.h`, for keepalive).
 - A core with `ray_sock_set_keepalive`: v2.11.0 or later (core #589).
   `q.c` uses it and its constants, so an older core fails to compile.
+- `q_server.c` also calls `ray_raise_clear` / `ray_raise_render` (present in core v3.0.1,
+  absent in v2.11.x) to put the text of an uncaught `(raise x)` on the wire. They are
+  declared weak, so v2.11.x still builds and links; there an uncaught `raise`
+  reaches the q client as its bare category (`'domain`), every other error
+  still carries its message. `q.c` and `q_server.c` need `core/runtime.h` on
+  the include path (`ray_error_msg`).
 - No other dependencies. `q.c` defines its own `RAY_ATTR_DICT` and
   `ray_scalar_elem_size` fallbacks, so it needs nothing from your binding.
 - Standard POSIX sockets (`<sys/socket.h>`, `<netdb.h>`).
