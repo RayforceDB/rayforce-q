@@ -346,6 +346,39 @@ WALBASE="$WORK/wal/node"
 HASSCOPE=0
 grep -q RAY_IPC_HAS_SET_AUTO_JOURNAL_EVAL "${CORE_SRC:-/nonexistent}/core/ipc.h" 2>/dev/null && HASSCOPE=1
 mkdir -p "$WORK/wal"
+if [ "$HASSCOPE" != "1" ]; then
+  # A core without ray_ipc_set_auto_journal_eval cannot give the evaluation
+  # the auto-journal scope, so with a journal open every sync request must be
+  # refused before it is appended or evaluated.
+  WALPORT="$(free_port)"
+  "$DRIVER" --serve "$WALPORT" 2>"$WORK/wal_a.err" &
+  WALPID=$!
+  PIDS+=("$WALPID")
+  wait_for_port "$HOST" "$WALPORT" || { echo "WAL server did not come up" >&2; exit 1; }
+  cat > "$WORK/wal_n.q" <<'QEOF'
+port:"I"$getenv`RFPORT
+base:getenv`WALBASE
+h:hopen `$":127.0.0.1:",string port
+names:();oks:()
+T:{[nm;b] names,:enlist nm; oks,:enlist b}
+/ every sync request is refused while the journal is open, so the log file
+/ itself is what shows nothing was appended
+sz:{hcount `$":",base,".log"}
+r:h"(.log.open 'sync \"",base,"\")"
+s0:sz[]
+r:@[h;"(set n 1)";{x}]
+T["refused without the scope API"; r like "domain*"]
+T["refused request not journaled"; s0=sz[]]
+r:hclose h
+bad:names where not oks
+if[count bad; -2 "q WAL (no scope API) FAILED: ",", " sv bad; exit 1]
+-1 "q WAL refused without scope API ok (",(string count names)," assertions)"
+exit 0
+QEOF
+  RFPORT="$WALPORT" WALBASE="$WALBASE" QHOME="${QHOME:-$(q_home_for "$QBIN")}" "$QBIN" "$WORK/wal_n.q" -q < /dev/null
+  kill "$WALPID" 2>/dev/null || true
+  wait "$WALPID" 2>/dev/null || true
+else
 WALPORT="$(free_port)"
 "$DRIVER" --serve "$WALPORT" 2>"$WORK/wal_a.err" &
 WALPID=$!
@@ -430,6 +463,7 @@ QEOF
 RFPORT="$WALPORT2" WALBASE="$WALBASE" HASSCOPE="$HASSCOPE" QHOME="${QHOME:-$(q_home_for "$QBIN")}" "$QBIN" "$WORK/wal_b.q" -q < /dev/null
 kill "$WALPID2" 2>/dev/null || true
 wait "$WALPID2" 2>/dev/null || true
+fi
 
 # ---- Leg 3: client tests against real Q server
 export QHOME="${QHOME:-$(q_home_for "$QBIN")}"

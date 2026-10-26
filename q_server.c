@@ -263,6 +263,15 @@ int q_journal_size_ok(int64_t size) {
 static ray_t *q_journal_request(ray_t *req) {
   if (req == NULL || RAY_IS_ERR(req) || !ray_journal_is_open())
     return NULL;
+#ifndef RAY_IPC_HAS_SET_AUTO_JOURNAL_EVAL
+  /* A journaled request must be evaluated in the core's auto-journal scope,
+   * or a nested `.log.write` appends a synthetic record the replay cannot
+   * reproduce.  This core cannot set that scope, so refuse the request here,
+   * before anything is appended or evaluated, rather than journal it unsafely. */
+  return ray_error("domain", "journaling an inbound q request needs a "
+                             "rayforce core with ray_ipc_set_auto_journal_eval; "
+                             "request refused");
+#endif
   ray_t *form = q_journal_form(req);
   if (form != NULL && RAY_IS_ERR(form))
     return form;
