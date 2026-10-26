@@ -482,6 +482,83 @@ kill "$WALPID2" 2>/dev/null || true
 wait "$WALPID2" 2>/dev/null || true
 fi
 
+# ---- Leg 2b': a sync hook and the WAL together
+# A sync hook replaces the default evaluation, so a journaled request that ran
+# through a hook must replay through it too. With a hook installed the request
+# is journaled as (.q.dispatch_sync (quote <request>)), which applies whatever
+# hook is installed at replay time, or evaluates by default when there is none.
+# Each case compares a live process against fresh processes that replay its log.
+if [ "$HASSCOPE" = "1" ]; then
+echo "real-q WAL + hooks: live vs fresh-process replay ..."
+WHDIR="$WORK/walhook"; mkdir -p "$WHDIR"
+WH_PIDS=()
+wh_start() { # wh_start NAME -> sets WH_PORT_<NAME>
+  local port; port="$(free_port)"
+  "$DRIVER" --serve "$port" 2>"$WHDIR/$1.err" &
+  WH_PIDS+=("$!"); PIDS+=("$!")
+  wait_for_port "$HOST" "$port" || { echo "WAL+hook server $1 did not come up" >&2; exit 1; }
+  eval "WH_PORT_$1=$port"
+}
+for nm in A1 B1 A2 B2 C2; do wh_start "$nm"; done
+cat > "$WHDIR/walhook.q" <<'QEOF'
+op:{hopen `$":127.0.0.1:",getenv x}
+names:();oks:()
+T:{[nm;b] names,:enlist nm; oks,:enlist b}
+/ -- 1. a hook that REPLACES evaluation, installed after the journal opened
+base1:getenv`WH_BASE1
+a:op`WH_PORT_A1
+r:a"(set n 0)"
+r:a"(.log.open 'sync \"",base1,"\")"
+r:a"(.q.on 'sync (fn [r] (set n (+ n 1))))"
+r:a"1"; r:a"1"; r:a"1"
+neg[a]"(.q.on 'sync 0)"          / async: not journaled, not hooked
+T["live: the hook answered each request"; 3~a"n"]
+hclose a
+b:op`WH_PORT_B1
+r:b"(set n 0)"
+r:b"(.log.replay \"",base1,".log\")"
+neg[b]"(.q.on 'sync 0)"
+T["replay: the hooked requests ran the hook"; 3~b"n"]
+hclose b
+/ -- 2. the hook is installed before the journal opens and before the replay
+base2:getenv`WH_BASE2
+hk:"(do (set seen (list)) (set n 0) (.q.on 'sync (fn [r] (do (set seen (concat seen (list r))) (if (== (type r) 'str) (eval (parse r)) r)))) 1)"
+a:op`WH_PORT_A2
+r:a hk
+r:a"(.log.open 'sync \"",base2,"\")"
+r:a"(set n (+ n 1))"
+r:a"(set n (+ n 10))"
+r:a(`ev;1 2)
+na:a"n"                          / a sync read is journaled and hooked too
+s1:a"seen"
+T["live: hook saw every request"; 6=count s1]
+T["live: state"; 11~na]
+hclose a
+rc:"(.log.replay \"",base2,".log\")"
+b:op`WH_PORT_B2
+r:b hk
+r:b rc
+sb:b"seen"
+T["replay with the hook: it saw the same requests"; sb~(enlist rc),(1_ s1),enlist"seen"]
+T["replay with the hook: same state"; 11~b"n"]
+hclose b
+c:op`WH_PORT_C2
+r:c"(do (set seen (list)) (set n 0) 1)"
+r:c rc
+T["replay without the hook: evaluated by default"; 11~c"n"]
+T["replay without the hook: it was never called"; 0=count c"seen"]
+hclose c
+bad:names where not oks
+if[count bad; -2 "q WAL + hooks FAILED: ",", " sv bad; exit 1]
+-1 "q WAL + hooks ok (",(string count names)," assertions)"
+exit 0
+QEOF
+WH_PORT_A1="$WH_PORT_A1" WH_PORT_B1="$WH_PORT_B1" WH_PORT_A2="$WH_PORT_A2" WH_PORT_B2="$WH_PORT_B2" WH_PORT_C2="$WH_PORT_C2" \
+  WH_BASE1="$WHDIR/one" WH_BASE2="$WHDIR/two" \
+  QHOME="${QHOME:-$(q_home_for "$QBIN")}" "$QBIN" "$WHDIR/walhook.q" -q < /dev/null
+for p in "${WH_PIDS[@]}"; do kill "$p" 2>/dev/null || true; wait "$p" 2>/dev/null || true; done
+fi
+
 # ---- Leg 2c: inbound connections -- .q.handle, .q.post, .q.on hooks
 # A kdb-compatible pub/sub server on the embedded runtime: a sync hook answers
 # `(.net.sub;5)` (a reserved-looking name arriving as the head symbol of a q

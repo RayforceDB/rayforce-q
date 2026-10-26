@@ -65,6 +65,8 @@ An empty (or whitespace-only) request answers `(::)`, like kdb's `h ""`. An erro
 
 `.q.on.*` cannot be `set` from Rayfall (dotted names are reserved), hence the verb; semantics mirror the core's `.ipc.on.*`. A char-vector request reaches the sync/async hook as an unparsed string (`(eval (parse r))` reproduces the default), a hook error is encoded to the client (sync) or logged (async, close). `(.q.handle)` is valid inside all three hooks. Hooks are process-global and live as long as the runtime.
 
+**Hooks and the WAL.** With a sync hook installed, a sync request that is journaled is recorded as `(.q.dispatch_sync (quote <request>))`; `.q.dispatch_sync` applies the sync hook installed at that moment, or evaluates by default when there is none. A replay therefore reproduces the live run if the application installs its hooks (`.q.on`) before `.log.replay`, which is the natural order, since it loads its code first; a replay without the hook evaluates the requests by default.
+
 Both `-q` and `--q-serve` require a decimal TCP port in `1..65535`. A
 missing or invalid port prints a diagnostic and exits with status `2`, so a
 service supervisor does not mistake a failed Q listener for a healthy

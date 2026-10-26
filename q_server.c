@@ -76,6 +76,11 @@ extern bool ray_raise_render(char *buf, size_t cap) __attribute__((weak));
 #define Q_HAVE_RAISE(fn) 1
 #endif
 
+static void q_raise_clear(void) {
+  if (Q_HAVE_RAISE(ray_raise_clear))
+    ray_raise_clear();
+}
+
 /* Wire header — must match q.c byte-for-byte */
 typedef struct {
   uint8_t endianness; /* 1 = little-endian                              */
@@ -180,6 +185,8 @@ static void q_mark_literals(ray_t *obj) {
 }
 
 static ray_t *q_journal_form(ray_t *req);
+static ray_t *q_quote_of(ray_t *v, int64_t qid);
+static ray_t *q_dispatch_form(ray_t *req);
 
 /* Turn a decoded request into a result. Borrows `req`.
  *
@@ -197,25 +204,21 @@ static ray_t *q_call_hook(ray_t *hook, ray_t *req) {
   return res;
 }
 
-static ray_t *eval_request(ray_t *req, int msgtype) {
-  if (req == NULL)
-    return NULL; /* empty request -> identity reply */
-  if (RAY_IS_ERR(req))
-    return ray_error("q server: malformed request", NULL);
+/* A hook gets the decoded request exactly as `.ipc.on.sync` does: a char
+ * vector arrives unparsed, a list with its argument lists marked literal. */
+static ray_t *q_hook_apply(ray_t *hook, ray_t *req) {
+  if (req->type == RAY_LIST) {
+    ray_t **elems = (ray_t **)ray_data(req);
+    for (int64_t i = 1; i < ray_len(req); i++)
+      q_mark_literals(elems[i]);
+  }
+  q_raise_clear();
+  return q_call_hook(hook, req);
+}
 
-  /* `.q.on 'sync` / `'async`: the hook gets the decoded request exactly as
-   * `.ipc.on.sync` does (a char vector arrives unparsed, a list with its
-   * argument lists marked literal) and its value is the reply. */
-  ray_t *hook = q_hooks[msgtype == Q_MSG_SYNC ? Q_HOOK_SYNC : Q_HOOK_ASYNC];
-
+/* The default evaluation of a request, no hook involved. */
+static ray_t *q_eval_default(ray_t *req) {
   if (req->type == -RAY_STR) {
-    if (hook != NULL) {
-      ray_raise_clear();
-      ray_t *res = q_call_hook(hook, req);
-      if (res != NULL && ray_is_lazy(res))
-        res = ray_lazy_materialize(res);
-      return res;
-    }
     size_t len = ray_str_len(req);
     /* kdb answers `h ""` with the identity (::); tools and feeds use it as a
      * ping/flush. An empty or whitespace-only request is that, not a parse
@@ -244,25 +247,78 @@ static ray_t *eval_request(ray_t *req, int msgtype) {
    * dispatch and WAL replay run the same expression and cannot disagree
    * (a LIST argument whose head names a callable, such as (`upd;(`in;1 2)),
    * reaches the handler as the list, as it does in kdb+, on both paths). */
-  ray_t *form = hook ? NULL : q_journal_form(req); /* NULL: evaluate as is */
+  ray_t *form = q_journal_form(req); /* NULL: not a call, evaluate as is */
   if (form != NULL && RAY_IS_ERR(form))
     return form;
-  if (Q_HAVE_RAISE(ray_raise_clear))
-    ray_raise_clear(); /* ray_eval_str does this; a raise left over is not ours */
-  ray_t *res;
-  if (hook != NULL) {
-    /* A hook gets the request as data: LIST arguments marked literal. */
-    if (req->type == RAY_LIST) {
-      ray_t **elems = (ray_t **)ray_data(req);
-      for (int64_t i = 1; i < ray_len(req); i++)
-        q_mark_literals(elems[i]);
-    }
-    res = q_call_hook(hook, req);
-  } else {
-    res = ray_eval(form ? form : req);
-  }
+  q_raise_clear(); /* ray_eval_str does this; a raise left over is not ours */
+  ray_t *res = ray_eval(form ? form : req);
   if (form != NULL)
     ray_release(form);
+  return res;
+}
+
+/* `.q.dispatch_sync`: what a sync q request means. With a `.q.on 'sync` hook
+ * installed the hook answers it; otherwise it is evaluated by default. A
+ * sync request that is journaled while a hook is installed is journaled as a
+ * call of this function on the quoted request, so a replay that has
+ * installed the same hook reproduces the live behaviour, and one that has not
+ * falls back to the default evaluation. Borrows `req`. */
+ray_t *q_dispatch_sync(ray_t *req) {
+  if (req == NULL)
+    return NULL;
+  if (RAY_IS_ERR(req))
+    return ray_error("q server: malformed request", NULL);
+  ray_t *hook = q_hooks[Q_HOOK_SYNC];
+  return hook != NULL ? q_hook_apply(hook, req) : q_eval_default(req);
+}
+
+/* (.q.dispatch_sync (quote <req>)): the form a hooked sync request runs and
+ * journals as. Returns an owned list or an error object. */
+static ray_t *q_dispatch_form(ray_t *req) {
+  int64_t qid = ray_sym_intern("quote", 5);
+  ray_t *quoted = q_quote_of(req, qid);
+  if (quoted == NULL || RAY_IS_ERR(quoted))
+    return quoted ? quoted : ray_error("oom", NULL);
+  ray_t *head = ray_sym(ray_sym_intern(".q.dispatch_sync", 16));
+  ray_t *out = ray_list_new(2);
+  if (head == NULL || RAY_IS_ERR(head) || out == NULL || RAY_IS_ERR(out)) {
+    if (head && !RAY_IS_ERR(head))
+      ray_release(head);
+    if (out && !RAY_IS_ERR(out))
+      ray_release(out);
+    ray_release(quoted);
+    return ray_error("oom", NULL);
+  }
+  out = ray_list_append(out, head);
+  ray_release(head);
+  if (out && !RAY_IS_ERR(out))
+    out = ray_list_append(out, quoted);
+  ray_release(quoted);
+  return out;
+}
+
+static ray_t *eval_request(ray_t *req, int msgtype) {
+  if (req == NULL)
+    return NULL; /* empty request -> identity reply */
+  if (RAY_IS_ERR(req))
+    return ray_error("q server: malformed request", NULL);
+
+  ray_t *res;
+  if (msgtype == Q_MSG_SYNC && q_hooks[Q_HOOK_SYNC] != NULL) {
+    /* The same expression the journal records, see q_journal_request. */
+    ray_t *form = q_dispatch_form(req);
+    if (form == NULL || RAY_IS_ERR(form))
+      return form ? form : ray_error("oom", NULL);
+    q_raise_clear();
+    res = ray_eval(form);
+    ray_release(form);
+  } else if (msgtype != Q_MSG_SYNC && q_hooks[Q_HOOK_ASYNC] != NULL) {
+    /* `.q.on 'async`: there is no reply and async frames are not journaled,
+     * so the hook is called directly. */
+    res = q_hook_apply(q_hooks[Q_HOOK_ASYNC], req);
+  } else {
+    res = q_eval_default(req);
+  }
   /* A lazy result is an internal deferred-DAG value that cannot be
    * serialized; force it before it can reach the wire. */
   if (res != NULL && ray_is_lazy(res))
@@ -402,7 +458,11 @@ static ray_t *q_journal_request(ray_t *req) {
                              "rayforce core with ray_ipc_set_auto_journal_eval; "
                              "request refused");
 #endif
-  ray_t *form = q_journal_form(req);
+  /* With a sync hook installed the hook, not the default evaluation, is what
+   * ran the request, so the log records the call of the dispatcher that
+   * applies whatever hook is installed at replay time (see q_dispatch_sync). */
+  ray_t *form = q_hooks[Q_HOOK_SYNC] != NULL ? q_dispatch_form(req)
+                                             : q_journal_form(req);
   if (form != NULL && RAY_IS_ERR(form))
     return form;
   ray_t *obj = form ? form : req;
@@ -829,7 +889,7 @@ static void q_fire_close_hook(int64_t id) {
     return;
   int64_t prev = q_current_handle;
   q_current_handle = id;
-  ray_raise_clear();
+  q_raise_clear();
   ray_t *r = q_call_hook(hook, arg);
   q_current_handle = prev;
   if (r != NULL && RAY_IS_ERR(r))

@@ -17,7 +17,11 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
   async hook has no reply; the close hook gets the handle once per inbound
   connection just before teardown (errors logged and swallowed). A non-lambda
   clears a hook. A char-vector request reaches the hooks unparsed. In C:
-  `q_conn_post`, `q_hook_set`.
+  `q_conn_post`, `q_hook_set`. With a sync hook installed, a journaled sync
+  request is recorded as `(.q.dispatch_sync (quote <request>))`, and
+  `.q.dispatch_sync` applies the hook installed at replay time (default
+  evaluation without one), so install hooks before `.log.replay`; in C:
+  `q_dispatch_sync`.
 
 ### Fixed
 

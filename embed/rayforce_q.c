@@ -267,6 +267,11 @@ static ray_t *qb_on(ray_t *kind, ray_t *fn) {
   return RAY_NULL_OBJ;
 }
 
+/* (.q.dispatch_sync req) -> the reply to a sync q request: the `.q.on 'sync`
+ * hook's value, or the default evaluation without one. The journal records a
+ * hooked request as a call of this, so a replay re-runs the hook. */
+static ray_t *qb_dispatch_sync(ray_t *req) { return q_dispatch_sync(req); }
+
 /* Bind a builtin under its reserved-namespace name (`.q.*`): ray_env_bind
  * builds the namespace dict, ray_env_bind_flat registers the flat name for REPL
  * completion. */
@@ -302,6 +307,10 @@ void q_env_register(void) {
 
   f = ray_fn_binary(".q.on", RAY_FN_RESTRICTED, qb_on);
   q_bind(".q.on", f);
+  ray_release(f);
+
+  f = ray_fn_unary(".q.dispatch_sync", RAY_FN_NONE, qb_dispatch_sync);
+  q_bind(".q.dispatch_sync", f);
   ray_release(f);
 }
 

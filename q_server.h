@@ -119,6 +119,15 @@ int64_t q_conn_current(void);
 enum { Q_HOOK_SYNC = 0, Q_HOOK_ASYNC = 1, Q_HOOK_CLOSE = 2, Q_HOOK_COUNT = 3 };
 int q_hook_set(int which, ray_t *fn);
 
+/* `.q.dispatch_sync`: the sync request `req` (borrowed) answered by the
+ * installed sync hook, or by the default evaluation when there is none. A sync
+ * request received while a WAL is open and a sync hook is installed is
+ * journaled as (.q.dispatch_sync (quote <request>)), so `.log.replay` runs the
+ * request through whichever hook is installed then: install the hooks before
+ * replaying (the application loads its code, `.q.on` included, first), or the
+ * replay evaluates the requests by default. */
+ray_t *q_dispatch_sync(ray_t *req);
+
 /* Close an attached connection and release its state. */
 void q_conn_close(ray_poll_t *poll, int64_t id);
 
