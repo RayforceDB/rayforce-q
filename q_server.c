@@ -107,6 +107,12 @@ typedef struct {
 #define Q_MAX_HANDSHAKE 512             /* credential blob upper bound    */
 #define Q_CONN_MAGIC UINT32_C(0x7150434e)
 
+/* A selector id is a slot the poll hands to the next connection, and a freed
+ * q_conn_t's address can come back from malloc, so neither says that the
+ * connection a handler started on is still the one in the slot. Every
+ * connection takes a generation from this counter when it is created. */
+static uint64_t q_conn_gen_next = 1;
+
 /* Per-connection rx state. `hdr` carries the current frame's header between
  * the header and body reads; `cap` accumulates the last byte seen during the
  * NUL-terminated handshake (the capability byte sits just before the NUL).
@@ -115,6 +121,7 @@ typedef struct {
  * on the connection and the rx machine deposits the RESPONSE frame here. */
 typedef struct {
   uint32_t magic;
+  uint64_t gen; /* never reused: tells this connection from the one that takes its slot */
   q_header_t hdr;
   uint8_t cap;
   int hs_len;
@@ -699,6 +706,7 @@ static ray_t *q_accept(ray_poll_t *poll, ray_selector_t *sel) {
     return NULL;
   }
   cd->magic = Q_CONN_MAGIC;
+  cd->gen = q_conn_gen_next++;
 
   ray_poll_reg_t reg = {0};
   reg.fd = (int64_t)nfd;
@@ -795,6 +803,17 @@ static ray_t *q_read_header(ray_poll_t *poll, ray_selector_t *sel) {
   ray_poll_rx_request(poll, sel,
                       body < Q_RX_CHUNK_SIZE ? body : Q_RX_CHUNK_SIZE);
   return NULL;
+}
+
+/* The selector in slot `id` if it still holds the connection of generation
+ * `gen`, else NULL. */
+static ray_selector_t *q_conn_selector(ray_poll_t *poll, int64_t id,
+                                       uint64_t gen) {
+  ray_selector_t *sel = ray_poll_get(poll, id);
+  if (sel == NULL || sel->close_fn != q_on_close || sel->data == NULL)
+    return NULL;
+  const q_conn_t *cd = (const q_conn_t *)sel->data;
+  return cd->magic == Q_CONN_MAGIC && cd->gen == gen ? sel : NULL;
 }
 
 static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
@@ -913,6 +932,7 @@ static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
   /* Published for the handler's duration only, and restored rather than
    * cleared: a handler that pumps another connection (a .q.send on it)
    * dispatches that connection's frames from inside this one. */
+  uint64_t gen = cd->gen; /* the handler may close this connection */
   int64_t prev_handle = q_current_handle;
   q_current_handle = id; /* inbound and outbound alike */
   ray_t *result = NULL;
@@ -941,7 +961,10 @@ static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
 
   if (hdr.msgtype !=
       Q_MSG_ASYNC) { /* sync expects a response, async does not */
-    ray_selector_t *cur = ray_poll_get(poll, id); /* eval may have closed it */
+    /* eval may have closed this connection, and another peer may have taken
+     * its slot before the reply is queued: the slot id alone would send this
+     * reply to the newcomer, or drop it on a send failure. */
+    ray_selector_t *cur = q_conn_selector(poll, id, gen);
     if (cur && q_send_result(poll, cur, result) < 0)
       ray_poll_deregister(poll, id);
   } else if (result != NULL && RAY_IS_ERR(result)) {
@@ -1041,6 +1064,8 @@ int64_t q_serve(ray_poll_t *poll, int port) {
  * WITHOUT blocking. Returns 0 when the socket is dry, -1 if the selector was
  * deregistered (peer closed or protocol error). Mirrors conn_pump in
  * core/ipc.c. */
+static ray_selector_t *q_conn_selector(ray_poll_t *poll, int64_t id,
+                                       uint64_t gen);
 static int q_conn_pump(ray_poll_t *poll, int64_t id) {
   for (;;) {
     ray_selector_t *sel = ray_poll_get(poll, id);
@@ -1064,12 +1089,13 @@ static int q_conn_pump(ray_poll_t *poll, int64_t id) {
     }
     /* Phase buffer complete — advance the state machine. read_fn may
      * deregister or re-arm the selector; the loop re-validates either way. */
-    void *data = sel->data;
+    q_conn_t *data = (q_conn_t *)sel->data;
+    uint64_t gen = data->gen;
     sel->rx.read_fn(poll, sel);
-    sel = ray_poll_get(poll, id);
-    if (sel == NULL || sel->data != data)
+    sel = q_conn_selector(poll, id, gen);
+    if (sel == NULL)
       return -1;
-    if (((q_conn_t *)data)->sync_ready)
+    if (data->sync_ready)
       return 0;
   }
 }
@@ -1165,6 +1191,7 @@ int64_t q_conn_attach(ray_poll_t *poll, int fd) {
   if (cd == NULL)
     return -1;
   cd->magic = Q_CONN_MAGIC;
+  cd->gen = q_conn_gen_next++;
   cd->outbound = 1;
   cd->established = 1;
   cd->sync_timeout_ms = timeout_ms;
@@ -1221,6 +1248,7 @@ ray_t *q_conn_send(ray_poll_t *poll, int64_t id, ray_t *msg) {
     return ray_error(code, "q: send failed");
   }
 
+  uint64_t gen = cd->gen;
   cd->sync_waiting = 1;
   cd->sync_ready = 0;
   cd->sync_resp = NULL;
@@ -1230,12 +1258,12 @@ ray_t *q_conn_send(ray_poll_t *poll, int64_t id, ray_t *msg) {
   for (;;) {
     /* Process what is already readable, then block for more. The pump can
      * deregister the selector (peer died), which frees cd — so re-resolve and
-     * compare the data pointer before touching it. The compare also guards
-     * against this id being reused by a connection opened inside a dispatched
-     * message handler. */
+     * check the generation before touching it. The check also guards against
+     * this id (and the freed state's address) being reused by a connection
+     * opened inside a dispatched message handler. */
     int rc = q_conn_pump(poll, id);
-    sel = ray_poll_get(poll, id);
-    if (sel == NULL || sel->data != (void *)cd)
+    sel = q_conn_selector(poll, id, gen);
+    if (sel == NULL)
       return ray_error("io", "q: connection closed");
     if (cd->sync_ready) {
       ray_t *result = cd->sync_resp;

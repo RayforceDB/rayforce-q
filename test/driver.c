@@ -21,6 +21,7 @@
  * IN THE SOFTWARE.
  */
 
+#define _DEFAULT_SOURCE /* usleep, kill */
 #include <rayforce.h>
 
 #include "core/poll.h"    /* ray_poll_create / run / destroy        */
@@ -34,6 +35,7 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <signal.h>
@@ -1794,7 +1796,171 @@ static int run_hooks_teardown_selftest(void) {
   return failures ? 1 : 0;
 }
 
+/* ---- a handler that closes its own connection ---------------------------- */
+
+/* A q sync frame carrying the char vector `src`. */
+static size_t str_frame(uint8_t *out, const char *src) {
+  uint32_t n = (uint32_t)strlen(src);
+  uint32_t total = 8 + 6 + n;
+  uint8_t hdr[8] = {1, 1, 0, 0};
+  memcpy(hdr + 4, &total, 4);
+  memcpy(out, hdr, 8);
+  out[8] = 10; /* char vector */
+  out[9] = 0;
+  memcpy(out + 10, &n, 4);
+  memcpy(out + 14, src, n);
+  return total;
+}
+
+/* Everything readable on `fd` now. */
+static ssize_t drain_now(int fd, uint8_t *buf, size_t cap) {
+  ssize_t got = 0;
+  for (;;) {
+    ssize_t n = recv(fd, buf + got, cap - (size_t)got, MSG_DONTWAIT);
+    if (n <= 0)
+      return got ? got : (n == 0 ? 0 : -1);
+    got += n;
+  }
+}
+
+/* A q server for one connection: answers the login, then copies every byte
+ * it receives to `report`. `lfd` is already listening. */
+static pid_t recording_peer(int lfd, int report) {
+  pid_t pid = fork();
+  if (pid == 0) {
+    int fd = accept(lfd, NULL, NULL);
+    uint8_t buf[4096];
+    int logged_in = 0;
+    ssize_t n;
+    while (fd >= 0 && (n = recv(fd, buf, sizeof buf, 0)) > 0) {
+      if (!logged_in) {
+        for (ssize_t i = 0; i < n; i++)
+          if (buf[i] == 0) {
+            const uint8_t cap = 3;
+            if (send(fd, &cap, 1, 0) != 1)
+              _exit(1);
+            logged_in = 1;
+            if (n > i + 1 && write(report, buf + i + 1, (size_t)(n - i - 1)) < 0)
+              _exit(1);
+            break;
+          }
+        continue;
+      }
+      if (write(report, buf, (size_t)n) < 0)
+        break;
+    }
+    _exit(0);
+  }
+  return pid;
+}
+
+/* A sync hook that closes its own connection with `.q.close (.q.handle)` and
+ * then opens another (`.q.connect`): the poll gives the new connection the
+ * slot the old one just left, before the hook returns. The reply to the
+ * request belongs to the closed connection, so it must go nowhere; sent to the
+ * slot's new occupant it would be a stray RESPONSE on a connection the hook
+ * opened (or, had the send failed, would have dropped it). */
+static int run_conn_identity_selftest(void) {
+  int failures = 0;
+  signal(SIGPIPE, SIG_IGN);
+  ray_runtime_t *rt = ray_runtime_create(0, NULL);
+  if (rt == NULL)
+    return 1;
+  q_env_register();
+  ray_poll_t *poll = ray_poll_create();
+  if (poll == NULL)
+    return 1;
+  ray_runtime_set_poll(poll);
+  int port = free_tcp_port();
+  if (q_serve(poll, port) < 0) {
+    fprintf(stderr, "conn identity selftest: cannot listen\n");
+    return 1;
+  }
+
+  /* the peer the hook will connect to */
+  int peer_port = free_tcp_port();
+  int lfd = socket(AF_INET, SOCK_STREAM, 0);
+  struct sockaddr_in la = {0};
+  la.sin_family = AF_INET;
+  la.sin_port = htons((uint16_t)peer_port);
+  la.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  int pipefd[2];
+  if (lfd < 0 || bind(lfd, (struct sockaddr *)&la, sizeof la) < 0 ||
+      listen(lfd, 4) < 0 || pipe(pipefd) < 0) {
+    fprintf(stderr, "conn identity selftest: cannot set up the peer\n");
+    return 1;
+  }
+  pid_t peer = recording_peer(lfd, pipefd[1]);
+  close(lfd);
+  close(pipefd[1]);
+
+  char hook[320];
+  snprintf(hook, sizeof hook,
+           "(.q.on 'sync (fn [r] (do (set aid (.q.handle)) (.q.close (.q.handle)) "
+           "(set nh (.q.connect \"127.0.0.1\" %d)) r)))", peer_port);
+  eval_setup("(set aid -1)", NULL);
+  eval_setup("(set nh -2)", NULL);
+  eval_setup(hook, NULL);
+
+  const uint8_t login[] = {'u', 3, 0};
+  uint8_t buf[512], frame[128];
+  int a = tcp_connect_local(port);
+  if (a < 0 || send(a, login, sizeof login, 0) != (ssize_t)sizeof login)
+    failures++;
+  pump_poll(poll, 100);
+  if (drain_now(a, buf, sizeof buf) != 1) {
+    fprintf(stderr, "conn identity selftest: no handshake reply\n");
+    failures++;
+  }
+  size_t n = str_frame(frame, "7");
+  if (send(a, frame, n, 0) != (ssize_t)n)
+    failures++;
+  pump_poll(poll, 400);
+
+  int64_t aid = eval_i64("aid"), nh = eval_i64("nh");
+  if (aid < 0 || nh != aid) {
+    fprintf(stderr, "conn identity selftest: the hook's new connection (%lld) "
+                    "did not take the closed one's slot (%lld)\n",
+            (long long)nh, (long long)aid);
+    failures++;
+  }
+  ssize_t got = drain_now(a, buf, sizeof buf);
+  if (got != 0) {
+    fprintf(stderr, "conn identity selftest: the closed connection is not at "
+                    "EOF (%lld)\n", (long long)got);
+    failures++;
+  }
+  /* what the new connection's peer received after the login: nothing */
+  uint8_t seen[512];
+  fcntl(pipefd[0], F_SETFL, O_NONBLOCK);
+  ssize_t leaked = read(pipefd[0], seen, sizeof seen);
+  if (leaked > 0) {
+    fprintf(stderr, "conn identity selftest: the reply to the closed "
+                    "connection went out on its slot's new occupant (%lld "
+                    "bytes)\n", (long long)leaked);
+    failures++;
+  }
+  if (!q_conn_is_handle(poll, nh)) {
+    fprintf(stderr, "conn identity selftest: the new connection was dropped\n");
+    failures++;
+  }
+  q_hook_set(Q_HOOK_SYNC, NULL);
+  close(a);
+  close(pipefd[0]);
+  ray_poll_destroy(poll);
+  ray_runtime_set_poll(NULL);
+  ray_runtime_destroy(rt);
+  if (peer > 0) {
+    kill(peer, SIGKILL);
+    waitpid(peer, NULL, 0);
+  }
+  printf("conn identity selftest: %s\n", failures ? "FAIL" : "ok");
+  return failures ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
+  if (argc >= 2 && strcmp(argv[1], "--conn-identity-selftest") == 0)
+    return run_conn_identity_selftest();
   if (argc >= 2 && strcmp(argv[1], "--hooks-teardown-selftest") == 0)
     return run_hooks_teardown_selftest();
   if (argc >= 2 && strcmp(argv[1], "--codec-selftest") == 0)

@@ -97,6 +97,9 @@ echo "running journal bound selftest..."
 echo "running hooks teardown selftest..."
 "$DRIVER" --hooks-teardown-selftest
 
+echo "running connection identity selftest..."
+"$DRIVER" --conn-identity-selftest
+
 echo "running Q CLI argument selftest..."
 "$DRIVER" --q-cli-selftest
 
