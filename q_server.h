@@ -52,6 +52,12 @@
  * poll selector id (>= 0) on success, or -1 on failure */
 int64_t q_serve(ray_poll_t *poll, int port);
 
+/* As q_serve, but bound to one IPv4 address (e.g. "127.0.0.1"). A NULL or
+ * empty host is q_serve's wildcard bind; a host that is not an IPv4 address
+ * fails (-1) rather than widening to all interfaces. Callers exposed to
+ * untrusted networks should pass an explicit address. */
+int64_t q_serve_at(ray_poll_t *poll, const char *host, int port);
+
 /* ===== Outbound connections =====
  *
  * q.c's client is blocking and poll-free by design (bindings without an event

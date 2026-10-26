@@ -28,5 +28,11 @@
 ;; from real q in run.sh; this client keeps only the leading 7 chars as code).
 (.q.send h "(raise \"custom failure\")") !- domain
 (.q.send h "(undefined_fn 1)") !- name
+;; An empty or whitespace-only request is kdb's ping/flush: the identity (::),
+;; not a parse error.
+(.q.send h "") -- null
+(.q.send h "   ") -- null
+(.q.send h "\t\n ") -- null
+(.q.send h "(+ 1 2)") -- 3
 
 (.q.close h)

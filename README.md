@@ -41,10 +41,14 @@ Every `.q.connect` connection has TCP keepalive at the core's 60 s default, so a
 The server is exposed via the `-q PORT` flag — it shares the REPL's event loop, so the REPL stays interactive while it serves Q clients:
 
 ```sh
-./rayforce -q 25565        # serve Rayfall over the Q wire on port 25565
+./rayforce -q 25565        # serve Rayfall over the Q wire on 127.0.0.1:25565 (loopback only)
+./rayforce -q 0.0.0.0:25565   # every interface, explicitly
+RAYFORCE_Q_BIND_HOST=10.0.0.5 ./rayforce -q 25565   # env fallback when -q has no host
 ```
 
-Both `-q` and `--q-serve` require a decimal TCP port in `1..65535`. A
+A Q listener evaluates what it is sent, so it binds **loopback by default**. The address comes from `-q HOST:PORT` (mirroring the core's `--port HOST:PORT`), else `RAYFORCE_Q_BIND_HOST`, else `127.0.0.1`; use `0.0.0.0` for the old all-interfaces behaviour. `HOST` must be an IPv4 address.
+
+Both `-q` and `--q-serve` require a decimal TCP port in `1..65535` (optionally `HOST:PORT`). A
 missing or invalid port prints a diagnostic and exits with status `2`, so a
 service supervisor does not mistake a failed Q listener for a healthy
 process. Arguments after `--` are passed to the Rayfall application and are
@@ -100,7 +104,8 @@ To *be* a Q server (the mirror of the client), bindings additionally compile [`q
 /* Register a non-blocking Q listener on an existing rayforce poll; the server
  * runs on the same event loop as the REPL/IPC (no thread). Returns a poll
  * selector id (>= 0), or -1. */
-int64_t q_serve(ray_poll_t *poll, int port);
+int64_t q_serve(ray_poll_t *poll, int port);                       /* all interfaces */
+int64_t q_serve_at(ray_poll_t *poll, const char *host, int port);  /* one IPv4 address; NULL/"" = q_serve */
 ```
 
 A connected Q client (real Q `hopen`, or `q_connect`) sends a char-vector. The server evaluates it as **Rayfall** against the embedded runtime and returns the result Q-encoded.
