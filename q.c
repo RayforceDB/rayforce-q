@@ -36,6 +36,7 @@
 #endif
 #endif
 
+#include "core/runtime.h" /* ray_error_msg (not public before core v3) */
 #include "core/ipc.h"  /* RAY_IPC_KEEPALIVE_* */
 #include "core/sock.h" /* ray_sock_set_keepalive */
 #include "table/sym.h" /* RAY_SYM_W64 */

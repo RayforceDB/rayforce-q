@@ -37,6 +37,10 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
   `'domain: custom failure`; an error with no message is still the bare
   category. The text of an uncaught `raise` is taken from the pending raised
   value, as the REPL prints it.
+  The core floor stays v2.11.0: `ray_raise_clear`/`ray_raise_render` (v3.0.1, absent in v2.11.x)
+  are weak references, so on v2.11.x an uncaught `raise` is the bare category.
+  Built and tested (`make test` with a real q) against v2.11.5 (`5d5f47c2`) and
+  the pinned dev core.
 
 ## [2.6.0]
 

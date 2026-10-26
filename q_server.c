@@ -60,6 +60,20 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 
+/* ray_raise_clear / ray_raise_render (the pending uncaught-raise slot) exist
+ * in core v3.0.1; v2.11.x has neither. Declaring them weak keeps this file
+ * building and linking against the older cores: the address is NULL there and
+ * the calls below are skipped, so an error frame falls back to the category
+ * plus the last-error message. They live in lang/eval.c beside ray_eval, so a
+ * static libray pulls them in whenever they exist. */
+#if defined(__GNUC__) || defined(__clang__)
+extern void ray_raise_clear(void) __attribute__((weak));
+extern bool ray_raise_render(char *buf, size_t cap) __attribute__((weak));
+#define Q_HAVE_RAISE(fn) ((fn) != NULL)
+#else
+#define Q_HAVE_RAISE(fn) 1
+#endif
+
 /* Wire header — must match q.c byte-for-byte */
 typedef struct {
   uint8_t endianness; /* 1 = little-endian                              */
@@ -174,7 +188,8 @@ static ray_t *eval_request(ray_t *req) {
   ray_t *form = q_journal_form(req); /* NULL: not a call, evaluate as is */
   if (form != NULL && RAY_IS_ERR(form))
     return form;
-  ray_raise_clear(); /* ray_eval_str does this; a raise left over is not ours */
+  if (Q_HAVE_RAISE(ray_raise_clear))
+    ray_raise_clear(); /* ray_eval_str does this; a raise left over is not ours */
   ray_t *res = ray_eval(form ? form : req);
   if (form != NULL)
     ray_release(form);
@@ -346,7 +361,8 @@ static int q_send_result(ray_poll_t *poll, ray_selector_t *sel, ray_t *result) {
   if (result != NULL && RAY_IS_ERR(result)) {
     char raised[256];
     const char *detail = ray_error_msg();
-    if (detail == NULL && ray_raise_render(raised, sizeof raised))
+    if (detail == NULL && Q_HAVE_RAISE(ray_raise_render) &&
+        ray_raise_render(raised, sizeof raised))
       detail = raised;
     if (detail != NULL) {
       char text[256];
