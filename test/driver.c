@@ -680,6 +680,35 @@ static int run_codec_selftest(void) {
     ray_release(rs);
   release_any(r);
 
+  /* Inside a q table, a char vector is a multi-row char column, while a
+   * general list of char vectors is a string column. Both become RAY_STR
+   * columns even though the same char vector is a string atom elsewhere. */
+  uint8_t string_columns[] = {
+      98, 0, 99,                         /* table, attrs, dict marker */
+      11, 0, 2, 0, 0, 0, 'c', 0, 's', 0, /* column names */
+      0, 0, 2, 0, 0, 0,                 /* two columns */
+      10, 0, 2, 0, 0, 0, 'x', 'y',      /* c: "xy" */
+      0, 0, 2, 0, 0, 0,                 /* s: ("a";"bb") */
+      10, 0, 1, 0, 0, 0, 'a',
+      10, 0, 2, 0, 0, 0, 'b', 'b'};
+  r = q_decode(string_columns, (int64_t)sizeof string_columns, 0, err,
+               sizeof err);
+  ray_t *chars = r && !RAY_IS_ERR(r) ? ray_table_get_col_idx(r, 0) : NULL;
+  ray_t *strings = r && !RAY_IS_ERR(r) ? ray_table_get_col_idx(r, 1) : NULL;
+  size_t chars_len = 0, strings_len = 0;
+  const char *chars_1 = chars ? ray_str_vec_get(chars, 1, &chars_len) : NULL;
+  const char *strings_1 = strings ? ray_str_vec_get(strings, 1, &strings_len)
+                                  : NULL;
+  if (r == NULL || RAY_IS_ERR(r) || chars == NULL || strings == NULL ||
+      chars->type != RAY_STR || strings->type != RAY_STR || chars->len != 2 ||
+      strings->len != 2 || chars_1 == NULL || chars_len != 1 ||
+      chars_1[0] != 'y' || strings_1 == NULL || strings_len != 2 ||
+      memcmp(strings_1, "bb", 2) != 0) {
+    fprintf(stderr, "codec selftest: q string table columns decoded wrong\n");
+    failures++;
+  }
+  release_any(r);
+
   /* A table whose one column is a long atom: ray_table_add_col rejects the
    * column and releases the table itself, so the decode must not release it
    * again, only return the error. */

@@ -366,6 +366,9 @@ T["guid atom";   ("G"$"d49f18a4-1969-49e8-9b8a-6bb9a4832eea")~h"(as 'guid \"d49f
 T["guid vec";    (enlist "G"$"d49f18a4-1969-49e8-9b8a-6bb9a4832eea")~h"(as 'GUID (list \"d49f18a4-1969-49e8-9b8a-6bb9a4832eea\"))"]
 / table
 T["table";       ([] a:1 2 3; b:`x`y`z)~h"(table [a b] (list [1 2 3] ['x 'y 'z]))"]
+T["define table count"; 1~h"(do (set qTableCount (fn [t] (list (count t) (type t)))) 1)"]
+T["char table column";  (2;`TABLE)~h(`qTableCount;([] a:1 2; b:"xy"))]
+T["string table column";(2;`TABLE)~h(`qTableCount;([] a:1 2; b:("x";"yy")))]
 / dict
 T["dict";        (`a`b!1 2)~h"(dict ['a 'b] [1 2])"]
 / typed nulls
