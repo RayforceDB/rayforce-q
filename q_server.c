@@ -130,6 +130,7 @@ typedef struct {
   uint8_t sync_waiting; /* a q_conn_send is parked on this connection */
   uint8_t sync_ready;   /* its RESPONSE has been deposited below      */
   uint8_t outbound;     /* q_conn_attach client side; may receive RESPONSE */
+  uint8_t restricted;   /* reject source and restrict peer expressions     */
   uint8_t established;  /* handshake done: frames flow, posts are allowed  */
   uint8_t closing;      /* teardown started: no more posts                 */
   ray_t *sync_resp;
@@ -299,7 +300,14 @@ static ray_t *q_hook_apply(ray_t *hook, ray_t *req) {
       q_mark_literals(elems[i]);
   }
   q_raise_clear();
-  return q_call_hook(hook, req);
+  /* The peer's expression is untrusted; the hook the embedder installed is
+   * not. Let it persist a decoded update even when this connection is
+   * restricted, then restore the enclosing state for nested dispatch. */
+  bool prev_restricted = ray_eval_get_restricted();
+  ray_eval_set_restricted(false);
+  ray_t *res = q_call_hook(hook, req);
+  ray_eval_set_restricted(prev_restricted);
+  return res;
 }
 
 /* The default evaluation of a request, no hook involved. */
@@ -768,6 +776,7 @@ static ray_t *q_accept(ray_poll_t *poll, ray_selector_t *sel) {
   }
   cd->magic = Q_CONN_MAGIC;
   cd->gen = q_conn_gen_next++;
+  cd->restricted = poll->restricted;
 
   ray_poll_reg_t reg = {0};
   reg.fd = (int64_t)nfd;
@@ -996,10 +1005,18 @@ static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
   uint64_t gen = cd->gen; /* the handler may close this connection */
   int64_t prev_handle = q_current_handle;
   q_current_handle = id; /* inbound and outbound alike */
+  bool prev_restricted = ray_eval_get_restricted();
+  ray_eval_set_restricted(cd->restricted != 0);
   ray_t *result = NULL;
   int journaled = req && !RAY_IS_ERR(req) && hdr.msgtype == Q_MSG_SYNC &&
                   ray_journal_is_open();
-  if (req && hdr.msgtype == Q_MSG_SYNC)
+  /* Source text is a much wider authority than a subscriber or restricted
+   * listener needs. Refuse it before hooks and before the WAL: replay must
+   * never turn a request rejected live into executable input. */
+  if (cd->restricted && req && !RAY_IS_ERR(req) && req->type == -RAY_STR)
+    result =
+        ray_error("access", "source text disabled on restricted q connection");
+  if (result == NULL && req && hdr.msgtype == Q_MSG_SYNC)
     result = q_journal_request(req); /* io/limit error => do not evaluate */
   if (result == NULL) {
 #ifdef RAY_IPC_HAS_SET_AUTO_JOURNAL_EVAL
@@ -1016,6 +1033,7 @@ static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
     ray_ipc_set_auto_journal_eval(prev_scope);
 #endif
   }
+  ray_eval_set_restricted(prev_restricted);
   q_current_handle = prev_handle;
   if (req)
     q_release_any(req);
@@ -1271,6 +1289,7 @@ int64_t q_conn_attach(ray_poll_t *poll, int fd) {
   cd->magic = Q_CONN_MAGIC;
   cd->gen = q_conn_gen_next++;
   cd->outbound = 1;
+  cd->restricted = poll->restricted;
   cd->established = 1;
   cd->sync_timeout_ms = timeout_ms;
 

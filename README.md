@@ -136,4 +136,12 @@ int     q_hook_set(int which, ray_t *fn);   /* Q_HOOK_SYNC / _ASYNC / _CLOSE; no
 void    q_hooks_release(void);              /* release every hook; heap still alive */
 ```
 
+For an untrusted Q peer, call `ray_poll_set_restricted(poll, true)` before
+`q_serve` or `q_conn_attach`. Each connection snapshots that setting: pushed
+source strings are rejected, and expression lists cannot call builtins marked
+`RAY_FN_RESTRICTED`. A handler installed locally with `.q.on` remains trusted
+and receives the decoded request as data, so it can validate and persist an
+allowed update. This is an evaluation boundary, not authentication or
+transport encryption.
+
 A connected Q client (real Q `hopen`, or `q_connect`) sends a char-vector. The server evaluates it as **Rayfall** against the embedded runtime and returns the result Q-encoded.

@@ -1,0 +1,30 @@
+;; Restricted attached connections reject peer source and dangerous default
+;; dispatch, while a locally installed hook remains a trusted data boundary.
+
+(set h (.q.connect qhost qport))
+(>= h 0) -- true
+
+;; A source string pushed by the q peer must not be evaluated.
+(set fromstr 0)
+(.q.send h "neg[.z.w] \"(set fromstr 99)\"; 1") -- 1
+fromstr -- 0
+
+;; Nor may a pushed expression reach a restricted builtin.
+(set fromlist 0)
+(.q.send h "neg[.z.w](`set;`fromlist;99); 2") -- 2
+fromlist -- 0
+
+;; The embedder-selected handler receives decoded data and may store it. Its
+;; nested list argument remains data rather than being evaluated as a call.
+(set seen 0)
+(.q.on 'async (fn [r] (set seen r)))
+(.q.send h "neg[.z.w](`upd;(`nested;1 2)); 3") -- 3
+seen -- (list 'upd (list 'nested [1 2]))
+
+;; The restricted scope is restored after both failures and trusted handler
+;; dispatch; otherwise this local mutation would itself fail.
+(set after 1)
+after -- 1
+
+(.q.on 'async 0)
+(.q.close h)
