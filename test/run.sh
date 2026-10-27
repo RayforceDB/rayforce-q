@@ -373,16 +373,17 @@ T["null i64";    0N~h"0Nl"]
 T["null i32";    0Ni~h"0Ni"]
 T["null f64";    0n~h"0Nf"]
 T["null sym";    (`)~h"(as 'sym \"\")"]
-/ the error text reaches q: "category: message", not the bare category.
-/ A core without ray_raise_render (before v3) cannot recover the text of an
-/ uncaught raise; there the category alone is the contract.
+/ Engine errors reach q as "category: message". A user raise reaches it as
+/ the raised text alone, matching kdb+. A core without ray_raise_render
+/ (before v3) cannot recover that text, so there the category is the contract.
 RA:not"0"=first getenv`RAISE_API
-T["raise text";      $[RA;"domain: custom failure"~@[h;"(raise \"custom failure\")";{x}];@[h;"(raise \"custom failure\")";{x like "domain*"}]]]
+T["raise text";      $[RA;"custom failure"~@[h;"(raise \"custom failure\")";{x}];@[h;"(raise \"custom failure\")";{x like "domain*"}]]]
+T["raise symbol";    $[RA;"TIME"~@[h;"(raise 'TIME)";{x}];@[h;"(raise 'TIME)";{x like "domain*"}]]]
 T["name text";       @[h;"(undefined_fn 1)";{(x like "name: *")&0<count x ss "undefined_fn"}]]
 T["builtin text";    @[h;"(+ 1 \"a\")";{x like "type: *"}]]
 T["no message";      "parse"~@[h;"(+ 1 2";{x}]]
 r:h"(do (set boom (fn [x] (raise \"custom failure\"))) 1)"
-T["raise via call";  $[RA;"domain: custom failure"~@[h;(`boom;::);{x}];@[h;(`boom;::);{x like "domain*"}]]]
+T["raise via call";  $[RA;"custom failure"~@[h;(`boom;::);{x}];@[h;(`boom;::);{x like "domain*"}]]]
 / a result with no q value (a lambda): the whole text arrives, not its first 7 characters
 T["encode failure text"; @[h;"(fn [m] m)";{(x like "type: *")&0<count x ss "cannot"}]]
 / an empty or blank request is the identity (::), kdb's ping/flush
@@ -648,7 +649,7 @@ T["close hook fired once"; (enlist(sh;sh))~h2"closed"]
 r:h2"(.q.on 'sync (fn [r] (if (== r \"boom\") (raise \"hook failed\") (eval (parse r)))))"
 / the raised text needs a core with ray_raise_render; before it the category alone arrives
 RA:not"0"=first getenv`RAISE_API
-T["hook error reaches client"; $[RA;"domain: hook failed"~@[h2;"boom";{x}];@[h2;"boom";{x like "domain*"}]]]
+T["hook error reaches client"; $[RA;"hook failed"~@[h2;"boom";{x}];@[h2;"boom";{x like "domain*"}]]]
 r:h2"(do (.q.on 'sync 0) (.q.on 'async 0) (.q.on 'close 0) 1)"
 T["hook cleared"; 3~h2"(+ 1 2)"]
 hclose h2
