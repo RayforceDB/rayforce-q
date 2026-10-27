@@ -684,23 +684,23 @@ static int q_send_result(ray_poll_t *poll, ray_selector_t *sel, ray_t *result) {
   uint8_t *buf = NULL;
   int64_t len = 0;
   char err[128] = {0};
-  /* An error object carries only its category. The explanation is either the
-   * runtime's last-error message or, for an uncaught (raise x), the pending
-   * raised value (as the REPL prints it). Load it into the last-error slot
-   * right before q_encode, which frames it as "category: message" so a q
-   * client sees `'domain: custom failure` rather than a bare `'domain`. */
+  /* An error object carries only its category. An uncaught (raise x) also
+   * leaves the raised value in a separate VM slot; render that value as the
+   * whole Q error text, matching kdb+'s `'<x>` rather than exposing Rayforce's
+   * internal `domain` category. Ordinary engine errors still carry
+   * "category: message" from the runtime's last-error slot. */
   ray_t *loaded = NULL;
   if (result != NULL && RAY_IS_ERR(result)) {
     char raised[256];
-    const char *detail = ray_error_msg();
-    if (detail == NULL && Q_HAVE_RAISE(ray_raise_render) &&
-        ray_raise_render(raised, sizeof raised))
-      detail = raised;
+    int uncaught_raise = Q_HAVE_RAISE(ray_raise_render) &&
+                         ray_raise_render(raised, sizeof raised);
+    const char *detail = uncaught_raise ? raised : ray_error_msg();
     if (detail != NULL) {
       char text[256];
       snprintf(text, sizeof text, "%s", detail);
       const char *code = ray_err_code(result);
-      loaded = ray_error(code ? code : "error", "%s", text);
+      loaded = ray_error(uncaught_raise ? "" : (code ? code : "error"), "%s",
+                         text);
       result = loaded;
     }
   }
