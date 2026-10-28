@@ -145,6 +145,22 @@ const char *keep[] = {"date", "sym", "px"};
 ray_t *result = q_decode_cols(resp, resp_len, compressed, keep, 3, err, sizeof err);
 ```
 
+### Temporal types
+
+| q                        | wire type | Rayforce                                      |
+|--------------------------|-----------|-----------------------------------------------|
+| date                     | `14`      | `DATE`                                        |
+| time                     | `19`      | `TIME`                                        |
+| timestamp                | `12`      | `TIMESTAMP`                                   |
+| timespan                 | `16`      | `TIMESPAN` (i64 nanoseconds; `0Nn` is null)   |
+| minute, second           | `17`, `18`| `TIME`, scaled to milliseconds (decode only)  |
+| month                    | `13`      | `DATE` of the first day (decode only)         |
+| datetime                 | `15`      | `TIMESTAMP` (decode only)                     |
+
+Timespan, timestamp, date and time are copied as they are, so they encode and
+decode in both directions. Minute, second, month and datetime are converted on
+decode, and nothing encodes as them.
+
 ### How large a frame can be
 
 A connection your process opened takes frames up to 2 GiB less the 8-byte
@@ -165,8 +181,7 @@ error, and the connection stays open.
 A frame on an attached connection that does not decode closes the connection
 and logs the reason with the frame's size. That holds for a sync request from
 the peer too, which gets no reply. A frame fails to decode when it is cut
-short, when it holds a q type rayforce-q does not decode, such as a timespan
-or a lambda, or when memory runs out while decoding it. Your subscription sees
+short, when it holds a q type rayforce-q does not decode, such as a lambda, or when memory runs out while decoding it. Your subscription sees
 the connection closed and can reconnect, rather than carry on with a hole
 where that frame was. The failure is permanent for that frame. A subscriber
 that replays from the start meets it again on every reconnect, so back off

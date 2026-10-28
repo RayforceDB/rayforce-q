@@ -100,7 +100,7 @@ ray_t *q_decode(uint8_t *resp, int64_t resp_len, int compressed, char *err,
 /* As q_decode, but a table comes back with only the named columns, in the
  * order named (as q's cols#t). The other columns are skipped by their
  * serialized length: not allocated, not interned, and not checked beyond
- * their length, so a column q_decode rejects (a timespan) can be skipped. For
+ * their length, so a column q_decode rejects can be skipped. For
  * a keyed table the key columns always come back and the names pick among
  * the value columns; naming a key column is allowed and changes nothing. A
  * name the table lacks is a RAY_ERROR naming it. A NULL or repeated name

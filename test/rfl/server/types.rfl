@@ -34,6 +34,14 @@
 (.q.send h "09:30:00.000") -- 09:30:00.000
 (.q.send h "2024.01.15D09:30:00.000000000") -- 2024.01.15D09:30:00.000000000
 
+;; timespan atom / vector / null / table column (wire type 16)
+(.q.send h "0D01:02:03.000000004") -- 0D01:02:03.000000004
+(.q.send h "[0D00:00:01 0D00:00:02]") -- [0D00:00:01.000000000 0D00:00:02.000000000]
+(.q.send h "(- 2024.01.02D10:00:00.000000000 2024.01.02D09:00:00.000000000)") -- 0D01:00:00.000000000
+(nil? (.q.send h "0Nn")) -- true
+(nil? (at (.q.send h "[0D00:00:01 0Nn]") 1)) -- true
+(.q.send h "(table [a b] (list [1 2] [0D00:00:01 0D00:00:02]))") -- (table [a b] (list [1 2] [0D00:00:01 0D00:00:02]))
+
 ;; guid (atom exercises the child-block encode path; vector the contiguous one)
 (.q.send h "(as 'guid \"d49f18a4-1969-49e8-9b8a-6bb9a4832eea\")") -- (as 'guid "d49f18a4-1969-49e8-9b8a-6bb9a4832eea")
 (.q.send h "(as 'GUID (list \"d49f18a4-1969-49e8-9b8a-6bb9a4832eea\"))") -- (as 'GUID (list "d49f18a4-1969-49e8-9b8a-6bb9a4832eea"))

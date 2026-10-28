@@ -398,6 +398,7 @@ static void release_any(ray_t *r) {
 /* ---- q_decode_cols -------------------------------------------------- */
 
 #define TEST_ATTR_DICT 0x02 /* q.c's RAY_ATTR_DICT, marking a keyed table */
+#define TEST_ATTR_HAS_NULLS 0x40 /* the core's RAY_ATTR_HAS_NULLS */
 
 /* q_encode v. Returns the whole message (header + body) to free(), or NULL. */
 static uint8_t *encode_value(ray_t *v, int64_t *len) {
@@ -551,9 +552,8 @@ static int cols_codec_checks(void) {
   release_any(r);
 
   /* ([] a:1 2; n:0D00:00:01 0D00:00:02; qcolsskipped:`qcolsunseen`), by
-   * hand: rayforce cannot encode a timespan. Skipping n works although
-   * q_decode rejects it, and the skipped symbol column's name and values
-   * are never interned. */
+   * hand. Skipping n works without decoding it, and the skipped symbol
+   * column's name and values are never interned. */
   uint8_t span[] = {/* table, attrs, dict; column names `a`n`qcolsskipped */
                     98, 0, 99, 11, 0, 3, 0, 0, 0, 'a', 0, 'n', 0, 'q', 'c', 'o',
                     'l', 's', 's', 'k', 'i', 'p', 'p', 'e', 'd', 0,
@@ -584,11 +584,16 @@ static int cols_codec_checks(void) {
   release_any(r);
   release_any(w);
   r = q_decode_cols(span, (int64_t)sizeof span, 0, n, 1, err, sizeof err);
-  if (r == NULL || !RAY_IS_ERR(r) || strcmp(ray_err_code(r), "q: unsu") != 0) {
-    fprintf(stderr, "cols selftest: a kept timespan was not rejected\n");
+  w = ray_eval_str(
+      "(table ['n] (list (- [2024.01.02D00:00:01.000000000 "
+      "2024.01.02D00:00:02.000000000] 2024.01.02D00:00:00.000000000)))");
+  if (r == NULL || RAY_IS_ERR(r) || w == NULL || !fmt_eq(r, w)) {
+    fprintf(stderr, "cols selftest: a kept timespan was not decoded: %s\n",
+            err);
     failures++;
   }
   release_any(r);
+  release_any(w);
 
   /* Symbols are skipped a word at a time: end a skipped symbol column at
    * every offset within a word, with the next column's bytes after it. */
@@ -755,30 +760,103 @@ static int run_codec_selftest(void) {
     release_any(r);
   }
 
-  /* Q timespans (KN) are durations, not timestamps. Rayforce has no
-   * duration type, so reject them rather than silently changing meaning. */
-  const struct {
-    const char *name;
-    uint8_t body[6];
-    int64_t body_len;
-  } unsupported_temporals[] = {
-      {"timespan atom", {0xF0, 0, 0, 0, 0, 0}, 1},
-      {"timespan vector", {0x10, 0, 0, 0, 0, 0}, 6},
-  };
-  for (size_t i = 0;
-       i < sizeof unsupported_temporals / sizeof unsupported_temporals[0];
-       i++) {
+  /* Q timespans (KN) are i64 nanoseconds, the same payload as rayforce's
+   * TIMESPAN: a raw copy + re-tag, 0Nn (INT64_MIN) being the null. */
+  {
+    /* -16 atom: 0D00:00:01.000000004 = 1000000004 ns */
+    uint8_t span_atom[] = {0xF0, 0x04, 0xCA, 0x9A, 0x3B, 0, 0, 0, 0};
     err[0] = '\0';
-    r = q_decode((uint8_t *)unsupported_temporals[i].body,
-                 unsupported_temporals[i].body_len, 0, err, sizeof err);
-    if (r == NULL || !RAY_IS_ERR(r) ||
-        strcmp(ray_err_code(r), "q: unsu") != 0) {
-      fprintf(stderr, "codec selftest: %s was not rejected: %s\n",
-              unsupported_temporals[i].name,
-              r && RAY_IS_ERR(r) ? ray_err_code(r) : err);
+    r = q_decode(span_atom, (int64_t)sizeof span_atom, 0, err, sizeof err);
+    if (r == NULL || RAY_IS_ERR(r) || r->type != -RAY_TIMESPAN ||
+        r->i64 != 1000000004LL) {
+      fprintf(stderr, "codec selftest: timespan atom decoded wrong: %s\n", err);
       failures++;
     }
     release_any(r);
+
+    /* -16 atom 0Nn -> the null timespan */
+    uint8_t span_null[] = {0xF0, 0, 0, 0, 0, 0, 0, 0, 0x80};
+    r = q_decode(span_null, (int64_t)sizeof span_null, 0, err, sizeof err);
+    if (r == NULL || RAY_IS_ERR(r) || r->type != -RAY_TIMESPAN ||
+        r->i64 != NULL_I64) {
+      fprintf(stderr, "codec selftest: null timespan decoded wrong: %s\n", err);
+      failures++;
+    }
+    release_any(r);
+
+    /* 16 vector: 1s, 0Nn, 2s; the null gate must be set */
+    uint8_t span_vec[] = {0x10, 0, 3, 0, 0, 0,    0x00, 0xCA, 0x9A, 0x3B, 0, 0,
+                          0,    0, 0, 0, 0, 0,    0,    0,    0,    0x80, 0x00,
+                          0x94, 0x35, 0x77, 0, 0, 0, 0};
+    r = q_decode(span_vec, (int64_t)sizeof span_vec, 0, err, sizeof err);
+    if (r == NULL || RAY_IS_ERR(r) || r->type != RAY_TIMESPAN || r->len != 3 ||
+        ((int64_t *)ray_data(r))[0] != 1000000000LL ||
+        ((int64_t *)ray_data(r))[1] != NULL_I64 ||
+        ((int64_t *)ray_data(r))[2] != 2000000000LL ||
+        !(r->attrs & TEST_ATTR_HAS_NULLS)) {
+      fprintf(stderr, "codec selftest: timespan vector decoded wrong: %s\n",
+              err);
+      failures++;
+    }
+    release_any(r);
+
+    /* Encode: type byte 0xF0 / 0x10, and encode -> decode is the identity for
+     * an atom, a vector with a null, and a table column. */
+    static const struct {
+      const char *what, *src;
+      uint8_t wire_type;
+    } spans[] = {
+        {"timespan atom",
+         "(- 2024.01.02D10:00:01.000000004 2024.01.02D09:00:00.000000000)",
+         0xF0},
+        {"timespan vector",
+         "(- [2024.01.02D10:00:00.000000000 2024.01.02D11:00:00.000000000] "
+         "2024.01.02D09:00:00.000000000)",
+         0x10},
+        {"timespan table",
+         "(table ['a 'b] (list [1 2] (- [2024.01.02D10:00:00.000000000 "
+         "2024.01.02D11:00:00.000000000] 2024.01.02D09:00:00.000000000)))",
+         98},
+    };
+    for (size_t i = 0; i < sizeof spans / sizeof spans[0]; i++) {
+      int64_t m_len = 0;
+      uint8_t *m = encode_expr(spans[i].src, &m_len);
+      ray_t *want = ray_eval_str(spans[i].src);
+      err[0] = '\0';
+      r = m ? q_decode(m + 8, m_len - 8, 0, err, sizeof err) : NULL;
+      if (m == NULL || m[8] != spans[i].wire_type || r == NULL ||
+          RAY_IS_ERR(r) || want == NULL || !fmt_eq(r, want)) {
+        fprintf(stderr, "codec selftest: %s did not round-trip: %s\n",
+                spans[i].what, err);
+        failures++;
+      }
+      release_any(r);
+      release_any(want);
+      free(m);
+    }
+
+    /* A vector holding the null encodes it as 0Nn and comes back a null. */
+    ray_t *nv = ray_vec_new(RAY_TIMESPAN, 2);
+    if (nv != NULL && !RAY_IS_ERR(nv)) {
+      int64_t *d = (int64_t *)ray_data(nv);
+      d[0] = 5;
+      d[1] = NULL_I64;
+      nv->len = 2;
+      ray_vec_set_null(nv, 1, true);
+      int64_t m_len = 0;
+      uint8_t *m = encode_value(nv, &m_len);
+      r = m ? q_decode(m + 8, m_len - 8, 0, err, sizeof err) : NULL;
+      if (r == NULL || RAY_IS_ERR(r) || r->type != RAY_TIMESPAN ||
+          ((int64_t *)ray_data(r))[0] != 5 ||
+          ((int64_t *)ray_data(r))[1] != NULL_I64 ||
+          !(r->attrs & TEST_ATTR_HAS_NULLS)) {
+        fprintf(stderr, "codec selftest: timespan null did not round-trip\n");
+        failures++;
+      }
+      release_any(r);
+      free(m);
+      ray_release(nv);
+    }
   }
 
   failures += cols_codec_checks();
@@ -1132,7 +1210,7 @@ static int run_cols_selftest(const char *host, int port) {
     return 1;
   }
 
-  /* Every q type q_decode reads, plus a timespan it rejects, with the
+  /* Every q type q_decode reads, with the
    * attributes an HDB carries. Columns are listed out of table order. */
   static const char *setup =
       "t:([] date:2024.01.15 2024.01.15 2024.01.16; sym:`p#`a`a`b; "
@@ -1149,10 +1227,11 @@ static int run_cols_selftest(const char *host, int port) {
       "kt:`id xkey t; big:1000#t; 1b";
   static const struct {
     const char *what, *full, *proj;
-    const char *names[4];
+    const char *names[5];
     int n;
   } cases[] = {
-      {"q table", "t", "`str`date`px`sym#t", {"str", "date", "px", "sym"}, 4},
+      {"q table", "t", "`str`date`px`sym`span#t",
+       {"str", "date", "px", "sym", "span"}, 5},
       {"q keyed table", "kt", "(key kt)!`px`str#value kt", {"px", "str"}, 2},
   };
 
