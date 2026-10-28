@@ -31,6 +31,13 @@ against. Its requirements:
   reaches the q client as its bare category (`'domain`), every other error
   still carries its message. `q.c` and `q_server.c` need `core/runtime.h` on
   the include path (`ray_error_msg`).
+- q timespan support needs a core whose `rayforce.h` declares `RAY_TIMESPAN`
+  (v3.0.1 is the first release; v2.11.x lacks it). `q.h` detects it with
+  `#ifdef RAY_TIMESPAN` and sets `Q_HAVE_TIMESPAN` to 1 or 0 (define it yourself
+  before including `q.h` to override). With 0, `q.c` compiles without any
+  `RAY_TIMESPAN` reference, so v2.11.0 still builds, and a q timespan atom or
+  vector is refused with `q: unsupported wire type`, as before. The numeric
+  tag is never invented on a core that does not implement the type.
 - No other dependencies. `q.c` defines its own `RAY_ATTR_DICT` and
   `ray_scalar_elem_size` fallbacks, so it needs nothing from your binding.
 - Standard POSIX sockets (`<sys/socket.h>`, `<netdb.h>`).
@@ -145,6 +152,23 @@ const char *keep[] = {"date", "sym", "px"};
 ray_t *result = q_decode_cols(resp, resp_len, compressed, keep, 3, err, sizeof err);
 ```
 
+### Temporal types
+
+| q                        | wire type | Rayforce                                      |
+|--------------------------|-----------|-----------------------------------------------|
+| date                     | `14`      | `DATE`                                        |
+| time                     | `19`      | `TIME`                                        |
+| timestamp                | `12`      | `TIMESTAMP`                                   |
+| timespan                 | `16`      | `TIMESPAN` (i64 nanoseconds; `0Nn` is null); needs a core with `TIMESPAN` (v3.0.1+), else rejected |
+| minute, second           | `17`, `18`| `TIME`, scaled to milliseconds (decode only)  |
+| month                    | `13`      | `DATE` of the first day (decode only)         |
+| datetime                 | `15`      | `TIMESTAMP` (decode only)                     |
+
+Timespan (on a core with `TIMESPAN`; `Q_HAVE_TIMESPAN` is 1), timestamp, date
+and time are copied as they are, so they encode and decode in both directions.
+On an older core a timespan is rejected as an unsupported wire type. Minute, second, month and datetime are converted on
+decode, and nothing encodes as them.
+
 ### How large a frame can be
 
 A connection your process opened takes frames up to 2 GiB less the 8-byte
@@ -165,8 +189,7 @@ error, and the connection stays open.
 A frame on an attached connection that does not decode closes the connection
 and logs the reason with the frame's size. That holds for a sync request from
 the peer too, which gets no reply. A frame fails to decode when it is cut
-short, when it holds a q type rayforce-q does not decode, such as a timespan
-or a lambda, or when memory runs out while decoding it. Your subscription sees
+short, when it holds a q type rayforce-q does not decode, such as a lambda (or a timespan, on a core without `TIMESPAN`), or when memory runs out while decoding it. Your subscription sees
 the connection closed and can reconnect, rather than carry on with a hole
 where that frame was. The failure is permanent for that frame. A subscriber
 that replays from the start meets it again on every reconnect, so back off

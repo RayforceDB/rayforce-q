@@ -85,6 +85,9 @@ static inline size_t ray_scalar_elem_size(int8_t type) {
   case RAY_I64:
   case RAY_F64:
   case RAY_TIMESTAMP:
+#if Q_HAVE_TIMESPAN
+  case RAY_TIMESPAN:
+#endif
     return 8;
   case RAY_GUID:
     return 16;
@@ -333,6 +336,10 @@ static int8_t q_type_of(int8_t ray_type) {
     return (int8_t)(sign * Q_KT);
   case RAY_TIMESTAMP:
     return (int8_t)(sign * Q_KP);
+#if Q_HAVE_TIMESPAN
+  case RAY_TIMESPAN:
+    return (int8_t)(sign * Q_KN);
+#endif
   case RAY_GUID:
     return (int8_t)(sign * Q_UU);
   case RAY_SYM:
@@ -494,6 +501,9 @@ static int64_t q_size_obj(ray_t *obj, int depth) {
       return 1 + 4;
     case RAY_I64:
     case RAY_TIMESTAMP:
+#if Q_HAVE_TIMESPAN
+    case RAY_TIMESPAN:
+#endif
     case RAY_F64:
       return 1 + 8;
     case RAY_GUID:
@@ -662,6 +672,9 @@ static int64_t q_ser_obj(uint8_t *buf, ray_t *obj) {
     }
     case RAY_I64:
     case RAY_TIMESTAMP:
+#if Q_HAVE_TIMESPAN
+    case RAY_TIMESPAN:
+#endif
       memcpy(buf, &obj->i64, 8);
       return buf + 8 - start;
     case RAY_F64:
@@ -911,7 +924,11 @@ static void q_flag_nulls(ray_t *vec) {
     break;
   }
   case RAY_I64:
-  case RAY_TIMESTAMP: {
+  case RAY_TIMESTAMP:
+#if Q_HAVE_TIMESPAN
+  case RAY_TIMESPAN:
+#endif
+  {
     const int64_t *v = (const int64_t *)p;
     for (int64_t i = 0; i < vec->len; i++)
       if (v[i] == NULL_I64) {
@@ -1090,6 +1107,10 @@ static ray_t *q_des_obj(uint8_t **buf, int64_t *len, int depth) {
     return q_des_atom_i(buf, len, RAY_I64, 8);
   case -Q_KP:
     return q_des_atom_i(buf, len, RAY_TIMESTAMP, 8);
+#if Q_HAVE_TIMESPAN
+  case -Q_KN:
+    return q_des_atom_i(buf, len, RAY_TIMESPAN, 8);
+#endif
   case -Q_KD:
     return q_des_atom_i(buf, len, RAY_DATE, 4);
   case -Q_KT:
@@ -1170,6 +1191,10 @@ static ray_t *q_des_obj(uint8_t **buf, int64_t *len, int depth) {
     return q_des_vec_i(buf, len, RAY_I64, 8);
   case Q_KP:
     return q_des_vec_i(buf, len, RAY_TIMESTAMP, 8);
+#if Q_HAVE_TIMESPAN
+  case Q_KN:
+    return q_des_vec_i(buf, len, RAY_TIMESPAN, 8);
+#endif
   case Q_KD:
     return q_des_vec_i(buf, len, RAY_DATE, 4);
   case Q_KT:

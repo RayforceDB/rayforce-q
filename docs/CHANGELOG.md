@@ -6,6 +6,17 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
 
 ### Added
 
+- **q timespan decoded and encoded as `TIMESPAN`.** A q timespan atom (`-16`)
+  or vector (`16`) is i64 nanoseconds, the payload of the core's `TIMESPAN`,
+  so it is copied and re-tagged, and `0Nn` decodes to the null timespan (the
+  vector null gate is set as for the other i64 types). A `TIMESPAN` atom or
+  vector encodes as `-16` / `16`, in tables, dicts and lists too. Before, a
+  frame holding one was refused with `q: unsupported wire type`, and
+  `(- ts1 ts2)` on timestamps, which yields a `TIMESPAN`, could not be sent
+  or returned (`q: cannot serialize message`). This needs a core that declares
+  `RAY_TIMESPAN` (v3.0.1 and later); `q.h` detects it as `Q_HAVE_TIMESPAN`. On
+  v2.11.x the timespan code is compiled out, the v2.11.0 floor stands, and a
+  timespan is still refused with `q: unsupported wire type`.
 - **Inbound q connections: handle, push, hooks.** `(.q.handle)` now also names
   an *inbound* connection while its frame is being handled (it was outbound
   only). `(.q.post h msg)` sends `msg` as a q ASYNC frame on any open q

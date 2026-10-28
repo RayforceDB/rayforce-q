@@ -41,6 +41,18 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Q_HAVE_TIMESPAN: 1 when the core's public header declares RAY_TIMESPAN
+ * (core v3.0.1 and later), else 0. RAY_TIMESPAN is a #define there, so it is
+ * detected directly. On a core without it (v2.11.x) q timespans stay rejected
+ * as an unsupported wire type, and no numeric tag is invented. */
+#ifndef Q_HAVE_TIMESPAN
+#ifdef RAY_TIMESPAN
+#define Q_HAVE_TIMESPAN 1
+#else
+#define Q_HAVE_TIMESPAN 0
+#endif
+#endif
+
 /* q_connect failure codes, returned in place of a connection fd. */
 #define Q_ERR_SOCKET (-1)    /* could not open/connect the TCP socket    */
 #define Q_ERR_HANDSHAKE (-2) /* socket connected but handshake/auth failed */
@@ -100,7 +112,7 @@ ray_t *q_decode(uint8_t *resp, int64_t resp_len, int compressed, char *err,
 /* As q_decode, but a table comes back with only the named columns, in the
  * order named (as q's cols#t). The other columns are skipped by their
  * serialized length: not allocated, not interned, and not checked beyond
- * their length, so a column q_decode rejects (a timespan) can be skipped. For
+ * their length, so a column q_decode rejects can be skipped. For
  * a keyed table the key columns always come back and the names pick among
  * the value columns; naming a key column is allowed and changes nothing. A
  * name the table lacks is a RAY_ERROR naming it. A NULL or repeated name
