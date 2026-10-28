@@ -41,6 +41,18 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Q_HAVE_TIMESPAN: 1 when the core's public header declares RAY_TIMESPAN
+ * (core v3.0.1 and later), else 0. RAY_TIMESPAN is a #define there, so it is
+ * detected directly. On a core without it (v2.11.x) q timespans stay rejected
+ * as an unsupported wire type, and no numeric tag is invented. */
+#ifndef Q_HAVE_TIMESPAN
+#ifdef RAY_TIMESPAN
+#define Q_HAVE_TIMESPAN 1
+#else
+#define Q_HAVE_TIMESPAN 0
+#endif
+#endif
+
 /* q_connect failure codes, returned in place of a connection fd. */
 #define Q_ERR_SOCKET (-1)    /* could not open/connect the TCP socket    */
 #define Q_ERR_HANDSHAKE (-2) /* socket connected but handshake/auth failed */

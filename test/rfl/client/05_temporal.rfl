@@ -57,22 +57,4 @@
 (nil? (.q.send h "0Wm"))                     -- true
 (nil? (at (.q.send h "`month$289 0N 290") 1)) -- true
 
-;; timespan (KN) is i64 nanoseconds, the payload of TIMESPAN: it decodes
-;; as is, and 0Nn is the null timespan.
-(.q.send h "0D01:02:03.000000004")              -- 0D01:02:03.000000004
-(type (.q.send h "0D01:02:03.000000004"))       -- 'timespan
-(.q.send h "-0D00:00:01")                       -- -0D00:00:01.000000000
-(.q.send h "0D00:00:01 0D00:00:02")             -- [0D00:00:01.000000000 0D00:00:02.000000000]
-(type (.q.send h "0D00:00:01 0D00:00:02"))      -- 'TIMESPAN
-(nil? (.q.send h "0Nn"))                        -- true
-(nil? (at (.q.send h "`timespan$1000000000 0N 3000000000") 1)) -- true
-;; decoded vectors carry the null gate, so aggregates skip the null
-(min (.q.send h "`timespan$3000000000 0N 1000000000"))   -- 0D00:00:01.000000000
-(max (.q.send h "`timespan$3000000000 0N 1000000000"))   -- 0D00:00:03.000000000
-;; a timespan column of a table, and a timespan inside a mixed list
-(type (at (.q.send h "([] a:1 2; b:0D00:00:01 0D00:00:02)") 'b)) -- 'TIMESPAN
-(at (.q.send h "(1;0D00:00:05)") 1)            -- 0D00:00:05.000000000
-;; q computes a timespan from two timestamps
-(.q.send h "2024.01.02D10:00:00.000000000-2024.01.02D09:00:00.000000000") -- 0D01:00:00.000000000
-
 (.q.close h)

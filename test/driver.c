@@ -552,8 +552,9 @@ static int cols_codec_checks(void) {
   release_any(r);
 
   /* ([] a:1 2; n:0D00:00:01 0D00:00:02; qcolsskipped:`qcolsunseen`), by
-   * hand. Skipping n works without decoding it, and the skipped symbol
-   * column's name and values are never interned. */
+   * hand. Skipping n works without decoding it (a core without TIMESPAN
+   * could not decode it), and the skipped symbol column's name and values
+   * are never interned. */
   uint8_t span[] = {/* table, attrs, dict; column names `a`n`qcolsskipped */
                     98, 0, 99, 11, 0, 3, 0, 0, 0, 'a', 0, 'n', 0, 'q', 'c', 'o',
                     'l', 's', 's', 'k', 'i', 'p', 'p', 'e', 'd', 0,
@@ -583,6 +584,7 @@ static int cols_codec_checks(void) {
   }
   release_any(r);
   release_any(w);
+#if Q_HAVE_TIMESPAN
   r = q_decode_cols(span, (int64_t)sizeof span, 0, n, 1, err, sizeof err);
   w = ray_eval_str(
       "(table ['n] (list (- [2024.01.02D00:00:01.000000000 "
@@ -594,6 +596,14 @@ static int cols_codec_checks(void) {
   }
   release_any(r);
   release_any(w);
+#else
+  r = q_decode_cols(span, (int64_t)sizeof span, 0, n, 1, err, sizeof err);
+  if (r == NULL || !RAY_IS_ERR(r) || strcmp(ray_err_code(r), "q: unsu") != 0) {
+    fprintf(stderr, "cols selftest: a kept timespan was not rejected\n");
+    failures++;
+  }
+  release_any(r);
+#endif
 
   /* Symbols are skipped a word at a time: end a skipped symbol column at
    * every offset within a word, with the next column's bytes after it. */
@@ -760,6 +770,7 @@ static int run_codec_selftest(void) {
     release_any(r);
   }
 
+#if Q_HAVE_TIMESPAN
   /* Q timespans (KN) are i64 nanoseconds, the same payload as rayforce's
    * TIMESPAN: a raw copy + re-tag, 0Nn (INT64_MIN) being the null. */
   {
@@ -858,6 +869,33 @@ static int run_codec_selftest(void) {
       ray_release(nv);
     }
   }
+#else
+  /* Q timespans (KN) are durations, not timestamps. This core has no
+   * duration type, so reject them rather than silently changing meaning. */
+  const struct {
+    const char *name;
+    uint8_t body[6];
+    int64_t body_len;
+  } unsupported_temporals[] = {
+      {"timespan atom", {0xF0, 0, 0, 0, 0, 0}, 1},
+      {"timespan vector", {0x10, 0, 0, 0, 0, 0}, 6},
+  };
+  for (size_t i = 0;
+       i < sizeof unsupported_temporals / sizeof unsupported_temporals[0];
+       i++) {
+    err[0] = '\0';
+    r = q_decode((uint8_t *)unsupported_temporals[i].body,
+                 unsupported_temporals[i].body_len, 0, err, sizeof err);
+    if (r == NULL || !RAY_IS_ERR(r) ||
+        strcmp(ray_err_code(r), "q: unsu") != 0) {
+      fprintf(stderr, "codec selftest: %s was not rejected: %s\n",
+              unsupported_temporals[i].name,
+              r && RAY_IS_ERR(r) ? ray_err_code(r) : err);
+      failures++;
+    }
+    release_any(r);
+  }
+#endif
 
   failures += cols_codec_checks();
 
@@ -1210,7 +1248,8 @@ static int run_cols_selftest(const char *host, int port) {
     return 1;
   }
 
-  /* Every q type q_decode reads, with the
+  /* Every q type q_decode reads (a timespan too where the core has TIMESPAN;
+   * otherwise it is skipped, not kept), with the
    * attributes an HDB carries. Columns are listed out of table order. */
   static const char *setup =
       "t:([] date:2024.01.15 2024.01.15 2024.01.16; sym:`p#`a`a`b; "
@@ -1230,8 +1269,13 @@ static int run_cols_selftest(const char *host, int port) {
     const char *names[5];
     int n;
   } cases[] = {
+#if Q_HAVE_TIMESPAN
       {"q table", "t", "`str`date`px`sym`span#t",
        {"str", "date", "px", "sym", "span"}, 5},
+#else
+      /* span is in the table but not kept: a core without TIMESPAN skips it */
+      {"q table", "t", "`str`date`px`sym#t", {"str", "date", "px", "sym"}, 4},
+#endif
       {"q keyed table", "kt", "(key kt)!`px`str#value kt", {"px", "str"}, 2},
   };
 
@@ -2274,6 +2318,10 @@ static int run_partial_send_selftest(void) {
 }
 
 int main(int argc, char **argv) {
+  if (argc >= 2 && strcmp(argv[1], "--have-timespan") == 0) {
+    printf("%d\n", Q_HAVE_TIMESPAN);
+    return 0;
+  }
   if (argc >= 2 && strcmp(argv[1], "--partial-send-selftest") == 0)
     return run_partial_send_selftest();
   if (argc >= 2 && strcmp(argv[1], "--conn-identity-selftest") == 0)

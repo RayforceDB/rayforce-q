@@ -35,6 +35,20 @@ s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.clos
 PY
 }
 
+# rfl_files DIR — the .rfl files under DIR, minus the timespan files when the
+# core has no TIMESPAN (the driver reports its compiled-in Q_HAVE_TIMESPAN).
+HAVE_TIMESPAN="$("$DRIVER" --have-timespan)"
+rfl_files() {
+  local f
+  for f in "$1"/*.rfl; do
+    if [[ "$HAVE_TIMESPAN" != "1" && "$f" == *timespan.rfl ]]; then
+      echo "SKIP: ${f#"$RFL_DIR"/} (core has no TIMESPAN)" >&2
+      continue
+    fi
+    printf '%s\n' "$f"
+  done
+}
+
 # wait_for_port HOST PORT — return 0 once a TCP connect succeeds, 1 on timeout.
 wait_for_port() {
   local host="$1" port="$2"
@@ -151,7 +165,9 @@ SERVERPORT="${SERVERPORT:-$(free_port)}"
 PIDS+=("$!")
 wait_for_port "$HOST" "$SERVERPORT" || { echo "driver --serve did not come up on $HOST:$SERVERPORT" >&2; exit 1; }
 echo "server up on $HOST:$SERVERPORT; running server round-trip tests..."
-"$DRIVER" --host "$HOST" --port "$SERVERPORT" "$RFL_DIR"/server/*.rfl
+SERVER_RFL=()
+while IFS= read -r f; do SERVER_RFL+=("$f"); done < <(rfl_files "$RFL_DIR/server")
+"$DRIVER" --host "$HOST" --port "$SERVERPORT" "${SERVER_RFL[@]}"
 
 echo "checking client keepalive socket options..."
 "$DRIVER" --keepalive-selftest "$HOST" "$SERVERPORT"
@@ -686,11 +702,13 @@ for p in "$PORT" "$AUTHPORT"; do
   wait_for_port "$HOST" "$p" || { echo "q server on $HOST:$p did not come up" >&2; exit 1; }
 done
 
+CLIENT_RFL=()
+while IFS= read -r f; do CLIENT_RFL+=("$f"); done < <(rfl_files "$RFL_DIR/client")
 echo "q servers up: open=$HOST:$PORT auth=$HOST:$AUTHPORT; running client tests..."
 "$DRIVER" \
   --host "$HOST" --port "$PORT" \
   --authport "$AUTHPORT" --user "$Q_USER" --pass "$Q_PASS" \
-  "$RFL_DIR"/client/*.rfl
+  "${CLIENT_RFL[@]}"
 
 echo "running q_decode_cols selftest against q..."
 "$DRIVER" --cols-selftest "$HOST" "$PORT"
@@ -703,4 +721,4 @@ echo "running client + push tests with --poll ..."
 "$DRIVER" --poll \
   --host "$HOST" --port "$PORT" \
   --authport "$AUTHPORT" --user "$Q_USER" --pass "$Q_PASS" \
-  "$RFL_DIR"/client/*.rfl "$RFL_DIR"/push/*.rfl
+  "${CLIENT_RFL[@]}" "$RFL_DIR"/push/*.rfl
