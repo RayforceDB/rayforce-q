@@ -403,6 +403,33 @@ else
   exit 0
 fi
 
+# ---- Restricted q listener: source is refused and expression lists use the
+# core's restricted evaluator, while harmless calls still work.
+echo "real-q restricted listener..."
+RESTRICTEDPORT="$(free_port)"
+"$DRIVER" --serve-restricted "$RESTRICTEDPORT" 2>"$WORK/restricted-listener.err" &
+RESTRICTEDPID=$!
+PIDS+=("$RESTRICTEDPID")
+wait_for_port "$HOST" "$RESTRICTEDPORT" || { echo "restricted listener did not come up" >&2; exit 1; }
+cat > "$WORK/restricted.q" <<'QEOF'
+port:"I"$getenv`RFPORT
+h:hopen `$":127.0.0.1:",string port
+names:();oks:()
+T:{[nm;b] names,:enlist nm; oks,:enlist b}
+T["source text refused"; @[h;"(+ 1 2)";{x like "access*"}]]
+T["safe list call allowed"; 3~h(`count;1 2 3)]
+T["restricted builtin refused"; @[h;(`set;`remote;1);{x like "access*"}]]
+T["unregistered target refused"; @[h;(`nosuchhandler;1);{x like "name*"}]]
+hclose h
+bad:names where not oks
+if[count bad; -2 "restricted listener FAILED: ",", " sv bad; exit 1]
+-1 "restricted listener ok (",(string count names)," assertions)"
+exit 0
+QEOF
+RFPORT="$RESTRICTEDPORT" QHOME="${QHOME:-$(q_home_for "$QBIN")}" "$QBIN" "$WORK/restricted.q" -q < /dev/null
+kill "$RESTRICTEDPID" 2>/dev/null || true
+wait "$RESTRICTEDPID" 2>/dev/null || true
+
 # ---- Leg 2b: q-wire frames are journaled like native ones when a WAL is open
 # core/ipc.c logs every inbound native SYNC frame before evaluating it; the q
 # listener has to do the same or a Rayfall service fed over -q journals nothing.
@@ -703,4 +730,10 @@ echo "running client + push tests with --poll ..."
 "$DRIVER" --poll \
   --host "$HOST" --port "$PORT" \
   --authport "$AUTHPORT" --user "$Q_USER" --pass "$Q_PASS" \
-  "$RFL_DIR"/client/*.rfl "$RFL_DIR"/push/*.rfl
+  "$RFL_DIR"/client/*.rfl "$RFL_DIR"/push/0[1-3]_*.rfl
+
+echo "running restricted attached-connection tests..."
+"$DRIVER" --poll --restricted \
+  --host "$HOST" --port "$PORT" \
+  --authport "$AUTHPORT" --user "$Q_USER" --pass "$Q_PASS" \
+  "$RFL_DIR"/push/04_restricted.rfl

@@ -49,7 +49,10 @@
 #include <stdint.h>
 
 /* Register a Q-protocol listener on `poll`, bound to TCP `port`. Returns the
- * poll selector id (>= 0) on success, or -1 on failure */
+ * poll selector id (>= 0) on success, or -1 on failure. If the poll was put in
+ * restricted mode with ray_poll_set_restricted(), each accepted connection
+ * rejects source-text requests and evaluates expression lists with the core's
+ * restricted builtins disabled. */
 int64_t q_serve(ray_poll_t *poll, int port);
 
 /* Whether a serialized request of `size` bytes may be journaled: the core's
@@ -77,7 +80,11 @@ int64_t q_serve_at(ray_poll_t *poll, const char *host, int port);
  * rx machine. Returns a poll selector id (>= 0) — the handle for the calls
  * below — or -1. The fd is owned by the poll from here on; do not q_close it.
  * The socket's recv timeout (what q_connect's timeout_ms set) is read here
- * and becomes q_conn_send's round-trip budget; none = wait indefinitely.
+ * and becomes q_conn_send's round-trip budget; none = wait indefinitely. A
+ * poll put in restricted mode makes peer-pushed source text fail and applies
+ * the core's restricted evaluator to pushed expression lists. A `.q.on` hook
+ * is trusted embedder code and runs outside that evaluator, with the decoded
+ * request passed as data.
  */
 int64_t q_conn_attach(ray_poll_t *poll, int fd);
 

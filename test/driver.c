@@ -57,7 +57,7 @@ typedef struct {
 } test_q_header_t;
 
 /* --serve PORT: build a runtime + poll, start the Q server, run the loop. */
-static int run_server(int port) {
+static int run_server(int port, int restricted) {
   ray_runtime_t *rt = ray_runtime_create(0, NULL);
   if (rt == NULL) {
     fprintf(stderr, "driver: failed to create rayforce runtime\n");
@@ -71,6 +71,7 @@ static int run_server(int port) {
     return 1;
   }
   ray_runtime_set_poll(poll);
+  ray_poll_set_restricted(poll, restricted != 0);
   if (q_serve(poll, port) < 0) {
     fprintf(stderr, "driver: cannot listen on port %d\n", port);
     ray_poll_destroy(poll);
@@ -2226,12 +2227,14 @@ int main(int argc, char **argv) {
 
   /* Server role: `driver --serve PORT`. */
   if (argc >= 3 && strcmp(argv[1], "--serve") == 0)
-    return run_server(atoi(argv[2]));
+    return run_server(atoi(argv[2]), 0);
+  if (argc >= 3 && strcmp(argv[1], "--serve-restricted") == 0)
+    return run_server(atoi(argv[2]), 1);
 
   const char *host = "127.0.0.1";
   const char *port = "0", *authport = "0";
   const char *user = "", *pass = "";
-  int use_poll = 0;
+  int use_poll = 0, restricted = 0;
   int first = 1;
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--poll") == 0) {
@@ -2240,6 +2243,9 @@ int main(int argc, char **argv) {
        * the mode the rayforce binary always runs in, and the only one where
        * a peer can push to us — see test/rfl/push. */
       use_poll = 1;
+      first = i + 1;
+    } else if (strcmp(argv[i], "--restricted") == 0) {
+      restricted = 1;
       first = i + 1;
     } else if (strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
       host = argv[++i];
@@ -2276,6 +2282,7 @@ int main(int argc, char **argv) {
     ray_poll_t *poll = NULL;
     if (use_poll) {
       poll = ray_poll_create();
+      ray_poll_set_restricted(poll, restricted != 0);
       ray_runtime_set_poll(poll);
     }
     q_env_register();
