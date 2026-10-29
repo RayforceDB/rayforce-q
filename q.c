@@ -413,6 +413,50 @@ static ray_t *q_sym_vec_str(ray_t *obj, int64_t i) {
   return ray_sym_domain_str(ray_sym_vec_domain(obj), id);
 }
 
+/* q has no string-vector type. In a table it represents text columns either
+ * as a general list of char vectors or, when every cell is one character, as
+ * one char vector. The ordinary decoder maps a char vector to a RAY_STR atom,
+ * which is right outside a table but is not a valid multi-row column. Convert
+ * both table-only shapes to the native RAY_STR vector. Returns NULL when col
+ * is not one of those shapes, otherwise a newly-owned vector or error. */
+static ray_t *q_table_str_col(ray_t *col) {
+  int64_t n;
+  ray_t **items = NULL;
+  if (col != NULL && col->type == -RAY_STR) {
+    n = (int64_t)ray_str_len(col);
+  } else if (col != NULL && col->type == RAY_LIST && col->len > 0) {
+    n = col->len;
+    items = (ray_t **)ray_data(col);
+    for (int64_t i = 0; i < n; i++)
+      if (items[i] == NULL || items[i]->type != -RAY_STR)
+        return NULL;
+  } else {
+    return NULL;
+  }
+
+  ray_t *out = ray_vec_new(RAY_STR, n);
+  if (out == NULL || RAY_IS_ERR(out))
+    return out ? out : q_des_err("q: string column alloc failed");
+  for (int64_t i = 0; i < n; i++) {
+    const char *s;
+    size_t len;
+    if (items != NULL) {
+      s = ray_str_ptr(items[i]);
+      len = ray_str_len(items[i]);
+    } else {
+      s = ray_str_ptr(col) + i;
+      len = 1;
+    }
+    ray_t *next = ray_str_vec_append(out, s, len);
+    if (next == NULL || RAY_IS_ERR(next)) {
+      ray_release(out);
+      return next ? next : q_des_err("q: string column append failed");
+    }
+    out = next;
+  }
+  return out;
+}
+
 /* Build a v2 table from RAY_SYM-vec of names and RAY_LIST of vectors. */
 static ray_t *q_make_table(ray_t *keys, ray_t *vals) {
   if (keys == NULL || vals == NULL || keys->type != RAY_SYM ||
@@ -423,8 +467,21 @@ static ray_t *q_make_table(ray_t *keys, ray_t *vals) {
       ray_release(vals);
     return q_des_err("q: malformed table — expected (sym-vec, list)");
   }
+  ray_t **cols = (ray_t **)ray_data(vals);
+  for (int64_t i = 0; i < vals->len; i++) {
+    ray_t *str_col = q_table_str_col(cols[i]);
+    if (str_col == NULL)
+      continue;
+    if (RAY_IS_ERR(str_col)) {
+      ray_release(keys);
+      ray_release(vals);
+      return str_col;
+    }
+    ray_release(cols[i]);
+    cols[i] = str_col;
+  }
   ray_t *tbl = q_build_table((const int64_t *)ray_data(keys),
-                             (ray_t *const *)ray_data(vals), keys->len);
+                             (ray_t *const *)cols, keys->len);
   ray_release(keys);
   ray_release(vals);
   return tbl;
