@@ -30,9 +30,11 @@
 (.q.send h "\t\n ") -- null
 (.q.send h "(+ 1 2)") -- 3
 
-;; The category still arrives (the full "category: message" text is asserted
-;; from real q in run.sh; this client keeps only the leading 7 chars as code).
-(.q.send h "(raise \"custom failure\")") !- domain
+;; A current core sends the raised text alone, so this client keeps "custom"
+;; as its seven-byte error code. A core without ray_raise_render falls back to
+;; "domain". The driver detects the API and injects qraiseerror accordingly.
+(.q.send h "(raise \"custom failure\")") !- $qraiseerror
+;; Ordinary engine errors remain categorized.
 (.q.send h "(undefined_fn 1)") !- name
 
 (.q.close h)
