@@ -419,6 +419,7 @@ T:{[nm;b] names,:enlist nm; oks,:enlist b}
 T["source text refused"; @[h;"(+ 1 2)";{x like "access*"}]]
 T["safe list call allowed"; 3~h(`count;1 2 3)]
 T["restricted builtin refused"; @[h;(`set;`remote;1);{x like "access*"}]]
+T["unregistered target refused"; @[h;(`nosuchhandler;1);{x like "name*"}]]
 hclose h
 bad:names where not oks
 if[count bad; -2 "restricted listener FAILED: ",", " sv bad; exit 1]

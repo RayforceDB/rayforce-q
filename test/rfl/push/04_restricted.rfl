@@ -14,6 +14,11 @@ fromstr -- 0
 (.q.send h "neg[.z.w](`set;`fromlist;99); 2") -- 2
 fromlist -- 0
 
+;; An unregistered target is refused rather than treated as data or silently
+;; accepted. The q peer catches our sync error and completes the outer reply,
+;; proving that the attached connection remains in step.
+(.q.send h "@[.z.w;(`nosuchhandler;1);{x}]; 4") -- 4
+
 ;; The embedder-selected handler receives decoded data and may store it. Its
 ;; nested list argument remains data rather than being evaluated as a call.
 (set seen 0)
