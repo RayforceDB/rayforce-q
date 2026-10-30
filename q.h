@@ -83,10 +83,13 @@ int q_close(int fd);
 int q_encode(ray_t *msg, uint8_t **req, int64_t *req_len, char *err,
              size_t errlen);
 
-/* Reply-local q temporal-kind wrappers. The returned value owns references to
- * `kind`/`schema` and `value` and is recognized only by q_encode; callers
- * release it like any other ray_t. Supported kinds are `datetime`, `month`,
- * `minute`, and `second`. A table schema is a SYM->SYM dict. */
+/* Reply-local q temporal-kind wrappers. The returned value is a normal owning
+ * two-item LIST with adapter-private metadata, so it may be inspected/stored
+ * like a LIST but cannot be confused with an untagged application LIST.
+ * q_encode borrows it; the caller releases it like any other ray_t. Supported
+ * kinds are `datetime`, `month`, `minute`, and `second`. A table schema is a
+ * SYM->SYM dict; every schema key must match a column somewhere in the wrapped
+ * table collection. */
 ray_t *q_wrap_as_kind(ray_t *kind, ray_t *value);
 ray_t *q_wrap_with_kinds(ray_t *schema, ray_t *value);
 

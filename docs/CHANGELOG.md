@@ -15,6 +15,9 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
   `q_wrap_as_kind` and `q_wrap_with_kinds`. Wrappers are reply-local and
   adapter-tagged, with no process-global registry or automatic `upd`/dict
   recognition, and unwrapped replies keep the existing `p`/`d`/`t` mapping.
+  They remain normal owning LIST values and are borrowed by `q_encode`.
+  Schema matching is per-table intersection, but every requested column must
+  occur in at least one wrapped table so misspellings fail explicitly.
 
 - **Inbound q connections: handle, push, hooks.** `(.q.handle)` now also names
   an *inbound* connection while its frame is being handled (it was outbound

@@ -402,6 +402,9 @@ kd:h"(table [z m u v] (list [2000.01.01D00:00:00.000000000] [2024.02.01] [09:30:
 T["default kinds unchanged"; "pdtt"~exec t from meta kd]
 T["wrong schema type refused"; @[h;"(.q.with_kinds (dict ['z] ['month]) (table [z] (list [1 2])))";{(x like "type: *")&0<count x ss "incompatible engine type"}]]
 T["schema error names row"; @[h;"(.q.with_kinds (dict ['m] ['month]) (table [m] (list [2024.02.01 2024.02.02])))";{(x like "type: *")&0<count x ss "m row 1"}]]
+T["unknown schema column refused"; @[h;"(.q.with_kinds (dict ['missing] ['datetime]) (table [z] (list [2000.01.01D00:00:00.000000000])))";{(x like "type: *")&0<count x ss "missing was not found"}]]
+hm:h"(.q.with_kinds (dict ['z 'm] ['datetime 'month]) (dict ['a 'b] (list (table [z] (list [2000.01.01D00:00:00.000000000])) (table [m] (list [2024.02.01])))))"
+T["heterogeneous schema intersection"; (-15h=type first (hm`a)`z)&-13h=type first (hm`b)`m]
 / guid (atom child-block path + vector path)
 T["guid atom";   ("G"$"d49f18a4-1969-49e8-9b8a-6bb9a4832eea")~h"(as 'guid \"d49f18a4-1969-49e8-9b8a-6bb9a4832eea\")"]
 T["guid vec";    (enlist "G"$"d49f18a4-1969-49e8-9b8a-6bb9a4832eea")~h"(as 'GUID (list \"d49f18a4-1969-49e8-9b8a-6bb9a4832eea\"))"]

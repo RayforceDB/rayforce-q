@@ -769,6 +769,57 @@ static int q_schema_valid(ray_t *schema) {
   return 1;
 }
 
+static int q_name_equal(ray_t *a, ray_t *b) {
+  return a != NULL && b != NULL && ray_str_len(a) == ray_str_len(b) &&
+         memcmp(ray_str_ptr(a), ray_str_ptr(b), ray_str_len(a)) == 0;
+}
+
+/* A schema is reusable across heterogeneous collections of tables: each
+ * individual table applies the intersection of its columns and the schema.
+ * Still require every requested name to match somewhere in the wrapped value
+ * so a typo cannot silently leave every matching value on its default kind. */
+static int q_schema_name_present(ray_t *obj, ray_t *want, int depth) {
+  if (obj == NULL || depth > Q_MAX_NESTING)
+    return 0;
+  if (obj->type == RAY_TABLE) {
+    int64_t ncols = ray_table_ncols(obj);
+    for (int64_t i = 0; i < ncols; i++) {
+      ray_t *name = ray_sym_str(ray_table_col_name(obj, i));
+      int equal = q_name_equal(name, want);
+      if (name)
+        ray_release(name);
+      if (equal)
+        return 1;
+    }
+    return 0;
+  }
+  if (obj->type == RAY_DICT)
+    return q_schema_name_present(ray_dict_vals(obj), want, depth + 1);
+  if (obj->type == RAY_LIST) {
+    ray_t **items = (ray_t **)ray_data(obj);
+    for (int64_t i = 0; i < obj->len; i++)
+      if (q_schema_name_present(items[i], want, depth + 1))
+        return 1;
+  }
+  return 0;
+}
+
+static int q_schema_names_match(ray_t *schema, ray_t *value) {
+  ray_t *keys = ray_dict_keys(schema);
+  for (int64_t i = 0; i < keys->len; i++) {
+    ray_t *name = q_sym_vec_str(keys, i);
+    if (q_schema_name_present(value, name, 0))
+      continue;
+    size_t n = name ? ray_str_len(name) : 0;
+    if (n > 127)
+      n = 127;
+    q_encode_error("q: wire-kind schema column %.*s was not found",
+                   (int)n, name ? ray_str_ptr(name) : "");
+    return 0;
+  }
+  return 1;
+}
+
 static int q_kind_from_name(ray_t *name) {
   if (name == NULL)
     return 0;
@@ -968,7 +1019,10 @@ static int64_t q_size_obj(ray_t *obj, int depth) {
       return q_size_kind_value(wrap_value, q_kind_from_sym(wrap_spec), NULL);
     if (!q_schema_valid(wrap_spec))
       return Q_SIZE_OVERFLOW;
-    return q_size_schema_value(wrap_spec, wrap_value, depth + 1);
+    int64_t size = q_size_schema_value(wrap_spec, wrap_value, depth + 1);
+    if (size < 0 || !q_schema_names_match(wrap_spec, wrap_value))
+      return Q_SIZE_OVERFLOW;
+    return size;
   }
 
   int8_t t = obj->type;

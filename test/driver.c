@@ -831,6 +831,26 @@ static int run_codec_selftest(void) {
   free(invalid_msg);
   release_any(invalid);
 
+  invalid = ray_eval_str(
+      "(.q.with_kinds (dict ['missing] ['datetime]) "
+      "(table [z] (list [2000.01.01D00:00:00.000000000])))");
+  invalid_msg = NULL;
+  invalid_len = 0;
+  err[0] = '\0';
+  invalid_rc =
+      invalid && !RAY_IS_ERR(invalid)
+          ? q_encode(invalid, &invalid_msg, &invalid_len, err, sizeof err)
+          : 0;
+  if (invalid == NULL || RAY_IS_ERR(invalid) || invalid_rc >= 0 ||
+      strstr(err, "missing was not found") == NULL) {
+    fprintf(stderr,
+            "codec selftest: unknown schema column was not rejected: %s\n",
+            err);
+    failures++;
+  }
+  free(invalid_msg);
+  release_any(invalid);
+
   /* Q timespans (KN) are durations, not timestamps. Rayforce has no
    * duration type, so reject them rather than silently changing meaning. */
   const struct {

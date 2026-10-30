@@ -83,7 +83,14 @@ month requires the first day, and minute/second require an in-range whole
 unit. Typed nulls keep the requested q kind. The wrapper may appear inside a
 larger reply such as ``(list 'upd 'trade wrapped-table)`` and is recognized
 only for that encoding; without one the existing `p`/`d`/`t` mapping is
-unchanged.
+unchanged. Internally it remains a normal owning two-item LIST, so Rayfall may
+inspect or store it; private adapter metadata, not its LIST shape, makes it an
+encoding directive. Encoding borrows the wrapper and does not consume it.
+
+For a collection of heterogeneous tables, each table applies the intersection
+of its columns and the supplied schema. Every schema name must nevertheless
+match at least one table in that collection, so a misspelled column fails the
+encode instead of silently using the default wire kind everywhere.
 
 `.q.on.*` cannot be `set` from Rayfall (dotted names are reserved), hence the verb; semantics mirror the core's `.ipc.on.*`. A char-vector request reaches the sync/async hook as an unparsed string (`(eval (parse r))` reproduces the default), a hook error is encoded to the client (sync) or logged (async, close). `(.q.handle)` is valid inside all three hooks. Hooks are process-global and live as long as the runtime: `ray_poll_destroy` releases them after the open connections' close hooks have run, a runtime destroyed without a poll needs `q_hooks_release()` first, and `q_env_register()` (once per runtime) drops what an earlier runtime left.
 
