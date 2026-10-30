@@ -83,6 +83,13 @@ int q_close(int fd);
 int q_encode(ray_t *msg, uint8_t **req, int64_t *req_len, char *err,
              size_t errlen);
 
+/* Reply-local q temporal-kind wrappers. The returned value owns references to
+ * `kind`/`schema` and `value` and is recognized only by q_encode; callers
+ * release it like any other ray_t. Supported kinds are `datetime`, `month`,
+ * `minute`, and `second`. A table schema is a SYM->SYM dict. */
+ray_t *q_wrap_as_kind(ray_t *kind, ray_t *value);
+ray_t *q_wrap_with_kinds(ray_t *schema, ray_t *value);
+
 /* Send a pre-encoded request on `fd` and read the raw response body. A
  * transport or framing failure shuts down the socket because the request or
  * response boundary may be out of sync; the caller still owns and must close

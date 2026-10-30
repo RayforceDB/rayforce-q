@@ -635,6 +635,7 @@ static int run_codec_selftest(void) {
     fprintf(stderr, "codec selftest: failed to create rayforce runtime\n");
     return 1;
   }
+  q_env_register();
 
   char err[128] = {0};
   uint8_t int_with_tail[] = {250, 42, 0, 0, 0, 0xff};
@@ -754,6 +755,81 @@ static int run_codec_selftest(void) {
     }
     release_any(r);
   }
+
+  /* Reply-local outbound temporal kinds. These checks exercise the public
+   * wrappers without a q executable, so the default CI lane verifies both
+   * the requested wire tag and the fact that ordinary lists are untouched. */
+  struct {
+    const char *name;
+    const char *expr;
+    uint8_t want_q_type;
+  } outbound_temporals[] = {
+      {"datetime wrapper",
+       "(.q.as_kind 'datetime 2026.07.10D09:30:00.123000000)", 0xF1},
+      {"month wrapper", "(.q.as_kind 'month 2024.02.01)", 0xF3},
+      {"minute wrapper", "(.q.as_kind 'minute 09:30:00.000)", 0xEF},
+      {"second wrapper", "(.q.as_kind 'second 09:30:15.000)", 0xEE},
+      {"datetime vector",
+       "(.q.as_kind 'datetime [2000.01.01D00:00:00.000000000 "
+       "2026.07.10D09:30:00.123000000])",
+       15},
+  };
+  for (size_t i = 0;
+       i < sizeof outbound_temporals / sizeof outbound_temporals[0]; i++) {
+    int64_t msg_len = 0;
+    uint8_t *msg = encode_expr(outbound_temporals[i].expr, &msg_len);
+    if (msg == NULL || msg_len <= 8 ||
+        msg[8] != outbound_temporals[i].want_q_type) {
+      fprintf(stderr,
+              "codec selftest: %s encoded type %d, want %d\n",
+              outbound_temporals[i].name,
+              msg && msg_len > 8 ? (int)(int8_t)msg[8] : 0,
+              (int)(int8_t)outbound_temporals[i].want_q_type);
+      failures++;
+    }
+    free(msg);
+  }
+
+  int64_t msg_len = 0;
+  uint8_t *msg = encode_expr(
+      "(list 'datetime 2026.07.10D09:30:00.123000000)", &msg_len);
+  if (msg == NULL || msg_len <= 8 || msg[8] != 0) {
+    fprintf(stderr,
+            "codec selftest: ordinary list was mistaken for a kind wrapper\n");
+    failures++;
+  }
+  free(msg);
+
+  /* A one-column table's first column begins at body offset 17. */
+  msg = encode_expr(
+      "(.q.with_kinds (dict ['z] ['datetime]) "
+      "(table [z] (list [2000.01.01D00:00:00.000000000 "
+      "2026.07.10D09:30:00.123000000])))",
+      &msg_len);
+  if (msg == NULL || msg_len <= 25 || msg[8] != 98 || msg[25] != 15) {
+    fprintf(stderr,
+            "codec selftest: table schema did not encode datetime column\n");
+    failures++;
+  }
+  free(msg);
+
+  ray_t *invalid = ray_eval_str(
+      "(.q.as_kind 'datetime 2026.07.10D09:30:00.123000001)");
+  uint8_t *invalid_msg = NULL;
+  int64_t invalid_len = 0;
+  err[0] = '\0';
+  int invalid_rc =
+      invalid && !RAY_IS_ERR(invalid)
+          ? q_encode(invalid, &invalid_msg, &invalid_len, err, sizeof err)
+          : 0;
+  if (invalid == NULL || RAY_IS_ERR(invalid) || invalid_rc >= 0 ||
+      strstr(err, "millisecond-representable") == NULL) {
+    fprintf(stderr,
+            "codec selftest: sub-ms datetime was not rejected: %s\n", err);
+    failures++;
+  }
+  free(invalid_msg);
+  release_any(invalid);
 
   /* Q timespans (KN) are durations, not timestamps. Rayforce has no
    * duration type, so reject them rather than silently changing meaning. */

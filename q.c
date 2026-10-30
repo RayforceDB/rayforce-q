@@ -50,6 +50,7 @@ _Static_assert(Q_KEEPALIVE_AUTO == RAY_IPC_KEEPALIVE_AUTO &&
 #include <math.h>
 #include <netdb.h>
 #include <poll.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -382,9 +383,98 @@ static size_t q_error_text(ray_t *obj, char *buf, size_t cap) {
   return (size_t)n < cap ? (size_t)n : cap - 1;
 }
 
+enum {
+  Q_WRAP_AS_KIND = 1,
+  Q_WRAP_WITH_KINDS = 2,
+};
+
+/* A wrapper is a normal owning RAY_LIST for core lifecycle purposes, tagged
+ * in its otherwise-unused aux bytes with an address no Rayfall value can
+ * manufacture accidentally. It is therefore not confused with an ordinary
+ * application LIST shape, while old cores can still retain/release it. */
+static const char q_kind_wrapper_magic;
+
+static int q_kind_from_sym(ray_t *kind) {
+  if (kind == NULL || kind->type != -RAY_SYM)
+    return 0;
+  ray_t *name = ray_sym_str(kind->i64);
+  const char *s = name ? ray_str_ptr(name) : NULL;
+  size_t n = name ? ray_str_len(name) : 0;
+  int wire = 0;
+  if (s != NULL) {
+    if (n == 8 && memcmp(s, "datetime", 8) == 0)
+      wire = Q_KZ;
+    else if (n == 5 && memcmp(s, "month", 5) == 0)
+      wire = Q_KM;
+    else if (n == 6 && memcmp(s, "minute", 6) == 0)
+      wire = Q_KU;
+    else if (n == 6 && memcmp(s, "second", 6) == 0)
+      wire = Q_KV;
+  }
+  if (name)
+    ray_release(name);
+  return wire;
+}
+
+static ray_t *q_wrap_value(int mode, ray_t *spec, ray_t *value) {
+  if (spec == NULL || value == NULL)
+    return ray_error("type", "q: wire-kind wrapper arguments cannot be null");
+  ray_t *wrapper = ray_list_new(0);
+  if (wrapper != NULL && !RAY_IS_ERR(wrapper))
+    wrapper = ray_list_append(wrapper, spec);
+  if (wrapper != NULL && !RAY_IS_ERR(wrapper))
+    wrapper = ray_list_append(wrapper, value);
+  if (wrapper == NULL || RAY_IS_ERR(wrapper))
+    return wrapper ? wrapper : ray_error("oom", "q: wire-kind wrapper alloc");
+  wrapper->slice_parent = (ray_t *)(uintptr_t)&q_kind_wrapper_magic;
+  wrapper->slice_offset = mode;
+  return wrapper;
+}
+
+ray_t *q_wrap_as_kind(ray_t *kind, ray_t *value) {
+  if (q_kind_from_sym(kind) == 0)
+    return ray_error("domain", ".q.as_kind: kind must be 'datetime, 'month, "
+                               "'minute or 'second");
+  return q_wrap_value(Q_WRAP_AS_KIND, kind, value);
+}
+
+ray_t *q_wrap_with_kinds(ray_t *schema, ray_t *value) {
+  if (schema == NULL || schema->type != RAY_DICT)
+    return ray_error("type", ".q.with_kinds: schema must be a symbol dict");
+  if (value == NULL || (value->type != RAY_TABLE && value->type != RAY_DICT))
+    return ray_error("type", ".q.with_kinds: value must be a table or dict");
+  return q_wrap_value(Q_WRAP_WITH_KINDS, schema, value);
+}
+
+static int q_unwrap_kind(ray_t *obj, int *mode, ray_t **spec, ray_t **value) {
+  if (obj == NULL || obj->type != RAY_LIST || obj->len != 2 ||
+      obj->slice_parent != (ray_t *)(uintptr_t)&q_kind_wrapper_magic ||
+      (obj->slice_offset != Q_WRAP_AS_KIND &&
+       obj->slice_offset != Q_WRAP_WITH_KINDS))
+    return 0;
+  *mode = (int)obj->slice_offset;
+  ray_t **items = (ray_t **)ray_data(obj);
+  *spec = items[0];
+  *value = items[1];
+  return 1;
+}
+
+static _Thread_local char q_encode_detail[256];
+
+static void q_encode_error(const char *fmt, ...) {
+  if (q_encode_detail[0] != '\0')
+    return;
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(q_encode_detail, sizeof q_encode_detail, fmt, ap);
+  va_end(ap);
+}
+
 static int64_t q_size_obj(ray_t *obj, int depth);
 static int64_t q_ser_obj(uint8_t *buf, ray_t *obj);
 static ray_t *q_des_obj(uint8_t **buf, int64_t *len, int depth);
+static inline int64_t q_kz_days_to_nanos(double days);
+static int32_t q_km_months_to_days(int32_t months, int32_t unused);
 
 /* Resolve element i of a SYM vector to its string atom.  Splayed/mmap SYM
  * vectors carry narrow storage widths (attrs low bits, RAY_SYM_W8..W64)
@@ -470,11 +560,416 @@ static int q_is_keyed_table(ray_t *obj) {
          items[1]->type == RAY_TABLE;
 }
 
+static const char *q_wire_kind_name(int wire) {
+  switch (wire) {
+  case Q_KZ:
+    return "datetime";
+  case Q_KM:
+    return "month";
+  case Q_KU:
+    return "minute";
+  case Q_KV:
+    return "second";
+  default:
+    return "unknown";
+  }
+}
+
+static int q_wire_kind_ray_type(int wire) {
+  switch (wire) {
+  case Q_KZ:
+    return RAY_TIMESTAMP;
+  case Q_KM:
+    return RAY_DATE;
+  case Q_KU:
+  case Q_KV:
+    return RAY_TIME;
+  default:
+    return 0;
+  }
+}
+
+static void q_kind_value_error(const char *column, int64_t row, int wire,
+                               const char *reason) {
+  if (column != NULL)
+    q_encode_error("q: encode %s row %lld as %s: %s", column,
+                   (long long)row, q_wire_kind_name(wire), reason);
+  else if (row >= 0)
+    q_encode_error("q: encode row %lld as %s: %s", (long long)row,
+                   q_wire_kind_name(wire), reason);
+  else
+    q_encode_error("q: encode as %s: %s", q_wire_kind_name(wire), reason);
+}
+
+static int q_timestamp_to_datetime(int64_t ns, double *out) {
+  if (ns == NULL_I64) {
+    *out = NAN;
+    return 1;
+  }
+  if (ns % 1000000LL != 0)
+    return 0;
+  double days = ((double)(ns / 1000000LL)) / 86400000.0;
+  if (q_kz_days_to_nanos(days) != ns)
+    return 0;
+  *out = days;
+  return 1;
+}
+
+static int q_date_to_month(int32_t days, int32_t *out) {
+  if (days == NULL_I32) {
+    *out = NULL_I32;
+    return 1;
+  }
+  /* Howard Hinnant's civil_from_days inverse. `days` uses the 2000 epoch;
+   * 10957 shifts it to days since 1970 before the algorithm's 719468 bias. */
+  int64_t z = (int64_t)days + 10957 + 719468;
+  int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+  unsigned doe = (unsigned)(z - era * 146097); /* [0, 146096] */
+  unsigned yoe =
+      (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  int64_t y = (int64_t)yoe + era * 400;
+  unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  unsigned mp = (5 * doy + 2) / 153;
+  unsigned day = doy - (153 * mp + 2) / 5 + 1;
+  int month = (int)mp + (mp < 10 ? 3 : -9);
+  y += month <= 2;
+  int64_t month_count = (y - 2000) * 12 + month - 1;
+  if (day != 1 || month_count <= INT32_MIN || month_count >= INT32_MAX)
+    return 0;
+  *out = (int32_t)month_count;
+  return 1;
+}
+
+static int q_time_to_scaled(int32_t ms, int wire, int32_t *out) {
+  if (ms == NULL_I32) {
+    *out = NULL_I32;
+    return 1;
+  }
+  int32_t scale = wire == Q_KU ? 60000 : 1000;
+  if (ms < 0 || ms >= 86400000 || ms % scale != 0)
+    return 0;
+  *out = ms / scale;
+  return 1;
+}
+
+static int q_kind_value_valid(ray_t *obj, int wire, const char *column) {
+  int expected = q_wire_kind_ray_type(wire);
+  int actual = obj ? (obj->type < 0 ? -obj->type : obj->type) : 0;
+  if (expected == 0 || actual != expected) {
+    if (column != NULL)
+      q_encode_error("q: encode %s as %s: incompatible engine type", column,
+                     q_wire_kind_name(wire));
+    else
+      q_encode_error("q: encode as %s: incompatible engine type",
+                     q_wire_kind_name(wire));
+    return 0;
+  }
+  int atom = obj->type < 0;
+  int64_t n = atom ? 1 : obj->len;
+  if (n < 0 || (!atom && n > UINT32_MAX)) {
+    q_kind_value_error(column, -1, wire, "invalid vector length");
+    return 0;
+  }
+  for (int64_t i = 0; i < n; i++) {
+    int ok = 0;
+    if (wire == Q_KZ) {
+      const int64_t *v = atom ? &obj->i64 : (const int64_t *)ray_data(obj);
+      double encoded;
+      ok = q_timestamp_to_datetime(v[i], &encoded);
+    } else {
+      const int32_t *v = atom ? &obj->i32 : (const int32_t *)ray_data(obj);
+      int32_t encoded;
+      ok = wire == Q_KM ? q_date_to_month(v[i], &encoded)
+                        : q_time_to_scaled(v[i], wire, &encoded);
+    }
+    if (!ok) {
+      const char *reason =
+          wire == Q_KZ ? "value is not exactly millisecond-representable"
+          : wire == Q_KM ? "date is not the first day of a month"
+          : wire == Q_KU ? "time is not a whole in-range minute"
+                         : "time is not a whole in-range second";
+      q_kind_value_error(column, atom ? -1 : i, wire, reason);
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int64_t q_size_kind_value(ray_t *obj, int wire, const char *column) {
+  if (!q_kind_value_valid(obj, wire, column))
+    return Q_SIZE_OVERFLOW;
+  int width = wire == Q_KZ ? 8 : 4;
+  return obj->type < 0 ? 1 + width : 1 + 1 + 4 + obj->len * width;
+}
+
+static int64_t q_ser_kind_value(uint8_t *buf, ray_t *obj, int wire) {
+  uint8_t *start = buf;
+  int atom = obj->type < 0;
+  *buf++ = (uint8_t)(atom ? -wire : wire);
+  int64_t n = atom ? 1 : obj->len;
+  if (!atom) {
+    *buf++ = 0;
+    uint32_t len32 = (uint32_t)n;
+    memcpy(buf, &len32, 4);
+    buf += 4;
+  }
+  for (int64_t i = 0; i < n; i++) {
+    if (wire == Q_KZ) {
+      const int64_t *v = atom ? &obj->i64 : (const int64_t *)ray_data(obj);
+      double encoded;
+      if (!q_timestamp_to_datetime(v[i], &encoded))
+        return -1;
+      memcpy(buf, &encoded, 8);
+      buf += 8;
+    } else {
+      const int32_t *v = atom ? &obj->i32 : (const int32_t *)ray_data(obj);
+      int32_t encoded;
+      int ok = wire == Q_KM ? q_date_to_month(v[i], &encoded)
+                            : q_time_to_scaled(v[i], wire, &encoded);
+      if (!ok)
+        return -1;
+      memcpy(buf, &encoded, 4);
+      buf += 4;
+    }
+  }
+  return buf - start;
+}
+
+static int q_kind_from_name(ray_t *name);
+
+static int q_schema_wire_at(ray_t *vals, int64_t i) {
+  if (vals->type == RAY_SYM)
+    return q_kind_from_name(q_sym_vec_str(vals, i));
+  if (vals->type == RAY_LIST) {
+    ray_t **items = (ray_t **)ray_data(vals);
+    return q_kind_from_sym(items[i]);
+  }
+  return 0;
+}
+
+static int q_schema_valid(ray_t *schema) {
+  if (schema == NULL || schema->type != RAY_DICT) {
+    q_encode_error("q: wire-kind schema must be a symbol dict");
+    return 0;
+  }
+  ray_t *keys = ray_dict_keys(schema);
+  ray_t *vals = ray_dict_vals(schema);
+  if (keys == NULL || vals == NULL || keys->type != RAY_SYM ||
+      (vals->type != RAY_SYM && vals->type != RAY_LIST) ||
+      keys->len != vals->len) {
+    q_encode_error("q: wire-kind schema must map symbol columns to symbol kinds");
+    return 0;
+  }
+  for (int64_t i = 0; i < vals->len; i++) {
+    if (q_schema_wire_at(vals, i) == 0) {
+      q_encode_error("q: wire-kind schema contains an unsupported kind");
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int q_kind_from_name(ray_t *name) {
+  if (name == NULL)
+    return 0;
+  const char *s = ray_str_ptr(name);
+  size_t n = ray_str_len(name);
+  if (n == 8 && memcmp(s, "datetime", 8) == 0)
+    return Q_KZ;
+  if (n == 5 && memcmp(s, "month", 5) == 0)
+    return Q_KM;
+  if (n == 6 && memcmp(s, "minute", 6) == 0)
+    return Q_KU;
+  if (n == 6 && memcmp(s, "second", 6) == 0)
+    return Q_KV;
+  return 0;
+}
+
+static int q_schema_kind(ray_t *schema, int64_t column_id) {
+  ray_t *column = ray_sym_str(column_id);
+  if (column == NULL)
+    return 0;
+  ray_t *keys = ray_dict_keys(schema);
+  ray_t *vals = ray_dict_vals(schema);
+  const char *want = ray_str_ptr(column);
+  size_t want_n = ray_str_len(column);
+  int wire = 0;
+  for (int64_t i = 0; i < keys->len; i++) {
+    ray_t *key = q_sym_vec_str(keys, i);
+    if (key != NULL && ray_str_len(key) == want_n &&
+        memcmp(ray_str_ptr(key), want, want_n) == 0) {
+      wire = q_schema_wire_at(vals, i);
+      break;
+    }
+  }
+  ray_release(column);
+  return wire;
+}
+
+static void q_column_name(int64_t column_id, char *buf, size_t cap) {
+  ray_t *name = ray_sym_str(column_id);
+  size_t n = name ? ray_str_len(name) : 0;
+  if (n >= cap)
+    n = cap - 1;
+  if (name && n)
+    memcpy(buf, ray_str_ptr(name), n);
+  buf[n] = '\0';
+  if (name)
+    ray_release(name);
+}
+
+static int64_t q_size_schema_value(ray_t *schema, ray_t *obj, int depth);
+static int64_t q_ser_schema_value(uint8_t *buf, ray_t *schema, ray_t *obj);
+
+static int64_t q_size_schema_table(ray_t *schema, ray_t *obj, int depth) {
+  int64_t ncols = ray_table_ncols(obj);
+  if (ncols < 0 || ncols > UINT32_MAX)
+    return Q_SIZE_OVERFLOW;
+  int64_t names = 1 + 1 + 4;
+  int64_t cols = 1 + 1 + 4;
+  for (int64_t i = 0; i < ncols; i++) {
+    int64_t column_id = ray_table_col_name(obj, i);
+    ray_t *name = ray_sym_str(column_id);
+    int64_t name_size = name ? (int64_t)ray_str_len(name) + 1 : 1;
+    if (name)
+      ray_release(name);
+    if (q_add_size(&names, name_size) < 0)
+      return Q_SIZE_OVERFLOW;
+    int wire = q_schema_kind(schema, column_id);
+    ray_t *column = ray_table_get_col_idx(obj, i);
+    int64_t column_size;
+    if (wire != 0) {
+      char label[128];
+      q_column_name(column_id, label, sizeof label);
+      column_size = q_size_kind_value(column, wire, label);
+    } else {
+      column_size = q_size_obj(column, depth + 1);
+    }
+    if (q_add_size(&cols, column_size) < 0)
+      return Q_SIZE_OVERFLOW;
+  }
+  int64_t total = 3;
+  if (q_add_size(&total, names) < 0 || q_add_size(&total, cols) < 0)
+    return Q_SIZE_OVERFLOW;
+  return total;
+}
+
+static int64_t q_size_schema_value(ray_t *schema, ray_t *obj, int depth) {
+  if (depth > Q_MAX_NESTING)
+    return Q_SIZE_OVERFLOW;
+  if (obj == NULL)
+    return Q_SIZE_OVERFLOW;
+  if (obj->type == RAY_TABLE)
+    return q_size_schema_table(schema, obj, depth);
+  if (obj->type == RAY_DICT) {
+    int64_t keys = q_size_obj(ray_dict_keys(obj), depth + 1);
+    int64_t vals =
+        q_size_schema_value(schema, ray_dict_vals(obj), depth + 1);
+    if (keys < 0 || vals < 0 || keys > INT64_MAX - vals - 1)
+      return Q_SIZE_OVERFLOW;
+    return 1 + keys + vals;
+  }
+  if (obj->type == RAY_LIST) {
+    if (obj->len < 0 || obj->len > UINT32_MAX)
+      return Q_SIZE_OVERFLOW;
+    int64_t size = 1 + 1 + 4;
+    ray_t **items = (ray_t **)ray_data(obj);
+    for (int64_t i = 0; i < obj->len; i++)
+      if (q_add_size(&size,
+                     q_size_schema_value(schema, items[i], depth + 1)) < 0)
+        return Q_SIZE_OVERFLOW;
+    return size;
+  }
+  q_encode_error("q: .q.with_kinds value must contain only tables");
+  return Q_SIZE_OVERFLOW;
+}
+
+static int64_t q_ser_schema_table(uint8_t *buf, ray_t *schema, ray_t *obj) {
+  uint8_t *start = buf;
+  int64_t ncols = ray_table_ncols(obj);
+  *buf++ = Q_XT;
+  *buf++ = 0;
+  *buf++ = Q_XD;
+  *buf++ = Q_KS;
+  *buf++ = 0;
+  uint32_t kn = (uint32_t)ncols;
+  memcpy(buf, &kn, 4);
+  buf += 4;
+  for (int64_t i = 0; i < ncols; i++) {
+    ray_t *name = ray_sym_str(ray_table_col_name(obj, i));
+    size_t n = name ? ray_str_len(name) : 0;
+    if (name && n)
+      memcpy(buf, ray_str_ptr(name), n);
+    if (name)
+      ray_release(name);
+    buf[n] = 0;
+    buf += n + 1;
+  }
+  *buf++ = 0;
+  *buf++ = 0;
+  memcpy(buf, &kn, 4);
+  buf += 4;
+  for (int64_t i = 0; i < ncols; i++) {
+    int wire = q_schema_kind(schema, ray_table_col_name(obj, i));
+    ray_t *column = ray_table_get_col_idx(obj, i);
+    int64_t written = wire != 0 ? q_ser_kind_value(buf, column, wire)
+                                : q_ser_obj(buf, column);
+    if (written < 0)
+      return -1;
+    buf += written;
+  }
+  return buf - start;
+}
+
+static int64_t q_ser_schema_value(uint8_t *buf, ray_t *schema, ray_t *obj) {
+  uint8_t *start = buf;
+  if (obj->type == RAY_TABLE)
+    return q_ser_schema_table(buf, schema, obj);
+  if (obj->type == RAY_DICT) {
+    *buf++ = Q_XD;
+    int64_t written = q_ser_obj(buf, ray_dict_keys(obj));
+    if (written < 0)
+      return -1;
+    buf += written;
+    written = q_ser_schema_value(buf, schema, ray_dict_vals(obj));
+    if (written < 0)
+      return -1;
+    return buf + written - start;
+  }
+  if (obj->type == RAY_LIST) {
+    *buf++ = 0;
+    *buf++ = 0;
+    uint32_t len32 = (uint32_t)obj->len;
+    memcpy(buf, &len32, 4);
+    buf += 4;
+    ray_t **items = (ray_t **)ray_data(obj);
+    for (int64_t i = 0; i < obj->len; i++) {
+      int64_t written = q_ser_schema_value(buf, schema, items[i]);
+      if (written < 0)
+        return -1;
+      buf += written;
+    }
+    return buf - start;
+  }
+  return -1;
+}
+
 static int64_t q_size_obj(ray_t *obj, int depth) {
   if (depth > Q_MAX_NESTING)
     return Q_SIZE_OVERFLOW;
   if (obj == NULL || obj == RAY_NULL_OBJ)
     return 1 + 1; /* identity type + primitive code */
+
+  int wrap_mode;
+  ray_t *wrap_spec;
+  ray_t *wrap_value;
+  if (q_unwrap_kind(obj, &wrap_mode, &wrap_spec, &wrap_value)) {
+    if (wrap_mode == Q_WRAP_AS_KIND)
+      return q_size_kind_value(wrap_value, q_kind_from_sym(wrap_spec), NULL);
+    if (!q_schema_valid(wrap_spec))
+      return Q_SIZE_OVERFLOW;
+    return q_size_schema_value(wrap_spec, wrap_value, depth + 1);
+  }
 
   int8_t t = obj->type;
 
@@ -620,6 +1115,15 @@ static int64_t q_ser_obj(uint8_t *buf, ray_t *obj) {
     *buf++ = Q_ID; /* identity / null */
     *buf++ = 0;
     return buf - start;
+  }
+
+  int wrap_mode;
+  ray_t *wrap_spec;
+  ray_t *wrap_value;
+  if (q_unwrap_kind(obj, &wrap_mode, &wrap_spec, &wrap_value)) {
+    if (wrap_mode == Q_WRAP_AS_KIND)
+      return q_ser_kind_value(buf, wrap_value, q_kind_from_sym(wrap_spec));
+    return q_ser_schema_value(buf, wrap_spec, wrap_value);
   }
 
   int8_t t = obj->type;
@@ -1852,9 +2356,11 @@ int q_close(int fd) {
 
 int q_encode(ray_t *msg, uint8_t **req, int64_t *req_len, char *err,
              size_t errlen) {
+  q_encode_detail[0] = '\0';
   int64_t body_size = q_size_obj(msg, 0);
   if (body_size <= 0) {
-    q_set_err(err, errlen, "q: cannot serialize message");
+    q_set_err(err, errlen, q_encode_detail[0] ? q_encode_detail
+                                              : "q: cannot serialize message");
     return -1;
   }
   int64_t total = (int64_t)sizeof(q_header_t) + body_size;
@@ -1870,7 +2376,8 @@ int q_encode(ray_t *msg, uint8_t **req, int64_t *req_len, char *err,
   int64_t written = q_ser_obj(buf + sizeof(q_header_t), msg);
   if (written < 0 || written != body_size) {
     free(buf);
-    q_set_err(err, errlen, "q: serialization failed");
+    q_set_err(err, errlen,
+              q_encode_detail[0] ? q_encode_detail : "q: serialization failed");
     return -1;
   }
   q_header_t header = {

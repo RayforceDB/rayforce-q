@@ -65,6 +65,26 @@ An empty (or whitespace-only) request answers `(::)`, like kdb's `h ""`. An erro
 (.q.post (first subs) (list 'upd (dict ['a 'b] [1 2])))   ;; q client receives (`upd;`a`b!1 2) async
 ```
 
+Rayforce stores q's legacy temporal kinds in the nearest engine type (`z` as
+TIMESTAMP, `m` as DATE, and `u`/`v` as TIME), so replies normally use q
+`p`/`d`/`t`. Reply-local wrappers select the narrower q wire kind explicitly
+without changing the stored value or any unrelated send:
+
+```clojure
+(.q.as_kind 'datetime 2026.07.10D09:30:00.123000000) ; q -15h (`z`)
+(.q.with_kinds
+  (dict ['time 'expiry] ['datetime 'month])
+  trades)                                               ; per-column q kinds
+```
+
+Supported kinds are `'datetime`, `'month`, `'minute`, and `'second`. Values
+must be exactly representable: datetime rejects sub-millisecond timestamps,
+month requires the first day, and minute/second require an in-range whole
+unit. Typed nulls keep the requested q kind. The wrapper may appear inside a
+larger reply such as ``(list 'upd 'trade wrapped-table)`` and is recognized
+only for that encoding; without one the existing `p`/`d`/`t` mapping is
+unchanged.
+
 `.q.on.*` cannot be `set` from Rayfall (dotted names are reserved), hence the verb; semantics mirror the core's `.ipc.on.*`. A char-vector request reaches the sync/async hook as an unparsed string (`(eval (parse r))` reproduces the default), a hook error is encoded to the client (sync) or logged (async, close). `(.q.handle)` is valid inside all three hooks. Hooks are process-global and live as long as the runtime: `ray_poll_destroy` releases them after the open connections' close hooks have run, a runtime destroyed without a poll needs `q_hooks_release()` first, and `q_env_register()` (once per runtime) drops what an earlier runtime left.
 
 **Hooks and the WAL.** With a sync hook installed, a sync request that is journaled is recorded as `(.q.dispatch_sync (quote <request>))`; `.q.dispatch_sync` applies the sync hook installed at that moment, or evaluates by default when there is none. A replay therefore reproduces the live run if the application installs its hooks (`.q.on`) before `.log.replay`, which is the natural order, since it loads its code first; a replay without the hook evaluates the requests by default.

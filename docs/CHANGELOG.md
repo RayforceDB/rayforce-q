@@ -6,6 +6,16 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
 
 ### Added
 
+- **Reply-local q temporal wire kinds.** `(.q.as_kind kind value)` emits a
+  TIMESTAMP/DATE/TIME atom or vector as q `datetime`/`month`/`minute`/`second`,
+  and `(.q.with_kinds schema table)` applies an explicit `column -> kind`
+  symbol dict to a table (including a wrapper nested in a larger reply).
+  Values must be exactly representable and typed nulls keep the requested q
+  type; validation errors identify the column and row. The C equivalents are
+  `q_wrap_as_kind` and `q_wrap_with_kinds`. Wrappers are reply-local and
+  adapter-tagged, with no process-global registry or automatic `upd`/dict
+  recognition, and unwrapped replies keep the existing `p`/`d`/`t` mapping.
+
 - **Inbound q connections: handle, push, hooks.** `(.q.handle)` now also names
   an *inbound* connection while its frame is being handled (it was outbound
   only). `(.q.post h msg)` sends `msg` as a q ASYNC frame on any open q
