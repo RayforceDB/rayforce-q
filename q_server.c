@@ -603,6 +603,8 @@ static int64_t q_send_fn(int64_t fd, uint8_t *buf, int64_t len) {
 static int q_test_fail_tail_alloc;
 void q_test_fail_next_tail_alloc(void) { q_test_fail_tail_alloc = 1; }
 
+enum { Q_QUEUE_CONNECTION_LOST = -2 };
+
 static int q_queue_frame(ray_poll_t *poll, ray_selector_t *sel, uint8_t *buf,
                          int64_t len) {
   /* Fast path: nothing is queued ahead of this frame, so write it straight
@@ -631,9 +633,10 @@ static int q_queue_frame(ray_poll_t *poll, ray_selector_t *sel, uint8_t *buf,
       if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
         break;
       free(buf);
-      if (sent > 0)
-        ray_poll_deregister(poll, id);
-      return -1; /* peer gone or hard error: the caller closes the connection */
+      /* EPIPE/ECONNRESET and other hard send failures mean this socket is no
+       * longer usable even when the kernel accepted none of this frame. */
+      ray_poll_deregister(poll, id);
+      return Q_QUEUE_CONNECTION_LOST;
     }
     if (sent == len) {
       free(buf);
@@ -1390,7 +1393,10 @@ ray_t *q_conn_post(ray_poll_t *poll, int64_t id, ray_t *msg) {
   /* Written at once when the socket takes it, else queued for the poll to
    * flush when it is writable, so a slow subscriber cannot stall the
    * publisher. */
-  if (q_queue_frame(poll, sel, buf, len) < 0) {
+  int queued = q_queue_frame(poll, sel, buf, len);
+  if (queued < 0) {
+    if (queued == Q_QUEUE_CONNECTION_LOST)
+      return ray_error("io", "q: post failed; connection closed");
     if (!q_conn_is_handle(poll, id))
       return ray_error("io", "q: post failed after part of the frame was "
                              "sent; connection closed");

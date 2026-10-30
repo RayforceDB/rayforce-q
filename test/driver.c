@@ -2184,6 +2184,26 @@ static int run_partial_send_selftest(void) {
   q_conn_close(poll, id);
   close(sv[1]);
 
+  /* 4. a hard send error before any byte is written means the peer is gone,
+   * not that the queue is full. The dead handle must not stay registered. */
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0)
+    return 1;
+  id = q_conn_attach(poll, sv[0]);
+  close(sv[1]);
+  err = q_conn_post(poll, id, small);
+  const char *post_msg = ray_error_msg();
+  if (err == NULL || !RAY_IS_ERR(err) || post_msg == NULL ||
+      strstr(post_msg, "post failed; connection closed") == NULL) {
+    fprintf(stderr, "partial send selftest: closed peer got the wrong error\n");
+    failures++;
+  }
+  release_any(err);
+  if (q_conn_is_handle(poll, id)) {
+    fprintf(stderr, "partial send selftest: closed peer left a dead handle\n");
+    failures++;
+    q_conn_close(poll, id);
+  }
+
   release_any(big);
   release_any(small);
   free(rx);
