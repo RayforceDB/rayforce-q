@@ -616,9 +616,9 @@ static int q_queue_frame(ray_poll_t *poll, ray_selector_t *sel, uint8_t *buf,
    *
    * Once a prefix is on the wire the frame can only be completed, never
    * withdrawn: the peer would read the next frame's bytes as the rest of this
-   * one. So a failure after `sent > 0` closes the connection (the stream is
-   * unusable); a failure with nothing written is a plain refusal and leaves
-   * the connection as it was. */
+   * one. So a queue/allocation refusal after `sent > 0` closes the connection
+   * (the stream is unusable); the same refusal with nothing written leaves it
+   * as it was. A hard send error always means the connection is dead. */
   int64_t sent = 0;
   int64_t id = sel->id;
   if (sel->tx.buf == NULL) {
