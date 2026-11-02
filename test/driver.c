@@ -628,6 +628,63 @@ out:
   return failures;
 }
 
+/* Run q_connect against a one-shot peer and compare the exact NUL-terminated
+ * login blob it receives before returning capability 3. */
+static int handshake_bytes_match(const char *user, const char *password,
+                                 const uint8_t *want, size_t want_len) {
+  int listener = socket(AF_INET, SOCK_STREAM, 0);
+  if (listener < 0)
+    return 0;
+  struct sockaddr_in addr = {0};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = 0;
+  if (bind(listener, (struct sockaddr *)&addr, sizeof addr) < 0 ||
+      listen(listener, 1) < 0) {
+    close(listener);
+    return 0;
+  }
+  socklen_t addr_len = sizeof addr;
+  if (getsockname(listener, (struct sockaddr *)&addr, &addr_len) < 0) {
+    close(listener);
+    return 0;
+  }
+  pid_t child = fork();
+  if (child < 0) {
+    close(listener);
+    return 0;
+  }
+  if (child == 0) {
+    alarm(5);
+    int peer = accept(listener, NULL, NULL);
+    uint8_t got[64];
+    size_t n = 0;
+    while (peer >= 0 && n < sizeof got) {
+      ssize_t r = recv(peer, got + n, 1, 0);
+      if (r != 1)
+        break;
+      n++;
+      if (got[n - 1] == 0)
+        break;
+    }
+    uint8_t cap = 3;
+    if (peer >= 0) {
+      send(peer, &cap, 1, 0);
+      close(peer);
+    }
+    close(listener);
+    _exit(n == want_len && memcmp(got, want, want_len) == 0 ? 0 : 1);
+  }
+  close(listener);
+  int fd = q_connect("127.0.0.1", ntohs(addr.sin_port), user, password, 1000);
+  if (fd >= 0)
+    q_close(fd);
+  int status = 0;
+  if (waitpid(child, &status, 0) < 0)
+    return 0;
+  return fd >= 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
 static int run_codec_selftest(void) {
   int failures = 0;
   ray_runtime_t *rt = ray_runtime_create(0, NULL);
@@ -708,6 +765,15 @@ static int run_codec_selftest(void) {
 
   if (q_connect("127.0.0.1", 70000, "", "", 1) != Q_ERR_SOCKET) {
     fprintf(stderr, "codec selftest: client accepted out-of-range port\n");
+    failures++;
+  }
+
+  const uint8_t password_only_login[] = {':', 's', 'e', 'c', 'r', 'e', 't',
+                                         3,   0};
+  if (!handshake_bytes_match("", "secret", password_only_login,
+                             sizeof password_only_login)) {
+    fprintf(stderr,
+            "codec selftest: password with empty user was not sent\n");
     failures++;
   }
 

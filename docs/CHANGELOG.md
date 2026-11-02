@@ -39,6 +39,12 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
 
 ### Fixed
 
+- **A password with an empty username reaches the q handshake.**
+  `q_connect(..., "", "password", ...)` sized space for `:password` but copied
+  it only when the username was non-empty, silently sending the anonymous
+  `03 00` handshake instead. The client now sends the supplied tuple as
+  `:password`, followed by its capability byte and NUL.
+
 - **A frame left half written closes the connection.** With the direct send, a
   reply or `.q.post` larger than the socket buffer is written in part and its
   tail queued. When the tail could not be queued after a prefix had gone out,
