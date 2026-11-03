@@ -26,6 +26,19 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
   (`q_hooks_release()` for a runtime destroyed without a poll), and
   `q_env_register()` drops what an earlier runtime left: a hook no longer
   outlives its runtime.
+- **`.q.readonly`: an allow-list of read-only q requests that are not
+  journaled.** With a WAL open every sync q request is journaled before it is
+  evaluated, polls included (200 one-argument `get_seq` calls added 12 800
+  bytes, and replay re-runs them). The write has to precede the evaluation, so
+  it cannot be skipped afterwards; `(.q.readonly ['get_seq 'app.status])`
+  declares the heads of pure reads up front. A sync request whose head is
+  listed (call list, all-symbol call vector, or a string that is one form
+  headed by the name) is dispatched as before, hooks included, and not written.
+  `(.q.readonly)` returns the list, an empty vector clears it. The embedder
+  promises the heads are reads: a mutation under one is lost on replay, and
+  only the head is examined (a nested call is not). Default empty (unchanged
+  behaviour), process-wide, not persisted: set it at load time. In C:
+  `q_readonly_set`, `q_readonly_get`, `q_readonly_forget`.
 
 ### Changed
 

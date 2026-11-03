@@ -272,6 +272,22 @@ static ray_t *qb_on(ray_t *kind, ray_t *fn) {
  * hooked request as a call of this, so a replay re-runs the hook. */
 static ray_t *qb_dispatch_sync(ray_t *req) { return q_dispatch_sync(req); }
 
+/* (.q.readonly) -> the allow-list of read-only request heads (a symbol vector);
+ * (.q.readonly syms) sets it and returns it, an empty vector clears; see
+ * q_server.h. */
+static ray_t *qb_readonly(ray_t **args, int64_t n) {
+  if (n > 1)
+    return ray_error("arity", ".q.readonly takes zero or one argument");
+  if (n == 1) {
+    ray_t *a = args[0];
+    int ok = a != NULL && !RAY_IS_ERR(a) &&
+             (a->type == RAY_SYM || (a->type >= 0 && ray_len(a) == 0));
+    if (!ok || q_readonly_set(a) != 0)
+      return ray_error("type", ".q.readonly: expected a symbol vector");
+  }
+  return q_readonly_get();
+}
+
 /* Bind a builtin under its reserved-namespace name (`.q.*`): ray_env_bind
  * builds the namespace dict, ray_env_bind_flat registers the flat name for REPL
  * completion. */
@@ -287,6 +303,7 @@ void q_env_register(void) {
 
   /* A runtime that is gone took its hooks' heap with it. */
   q_hooks_forget();
+  q_readonly_forget();
 
   f = ray_fn_vary(".q.connect", RAY_FN_RESTRICTED, qb_connect);
   q_bind(".q.connect", f);
@@ -310,6 +327,10 @@ void q_env_register(void) {
 
   f = ray_fn_binary(".q.on", RAY_FN_RESTRICTED, qb_on);
   q_bind(".q.on", f);
+  ray_release(f);
+
+  f = ray_fn_vary(".q.readonly", RAY_FN_RESTRICTED, qb_readonly);
+  q_bind(".q.readonly", f);
   ray_release(f);
 
   f = ray_fn_unary(".q.dispatch_sync", RAY_FN_NONE, qb_dispatch_sync);

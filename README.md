@@ -69,6 +69,8 @@ An empty (or whitespace-only) request answers `(::)`, like kdb's `h ""`. An erro
 
 **Hooks and the WAL.** With a sync hook installed, a sync request that is journaled is recorded as `(.q.dispatch_sync (quote <request>))`; `.q.dispatch_sync` applies the sync hook installed at that moment, or evaluates by default when there is none. A replay therefore reproduces the live run if the application installs its hooks (`.q.on`) before `.log.replay`, which is the natural order, since it loads its code first; a replay without the hook evaluates the requests by default.
 
+**Read-only requests are not journaled.** `(.q.readonly ['get_seq 'app.status])` declares request heads that are pure reads: a sync request whose head is listed (a call list, an all-symbol call vector, or a string that is one form) is dispatched as usual but not written to the WAL, so polls do not grow the log or replay. The embedder promises the heads are reads (a mutation under one is lost on replay), only the head is examined (nested calls are not), the default is the empty list, and it is process-wide and not persisted, so set it at load time. `(.q.readonly)` returns it; an empty vector clears it. Details in [docs/INTEGRATING.md](docs/INTEGRATING.md).
+
 A Q listener evaluates what it is sent, so it binds **loopback by default**. The address comes from `-q HOST:PORT` (mirroring the core's `--port HOST:PORT`), else `RAYFORCE_Q_BIND_HOST`, else `127.0.0.1`; use `0.0.0.0` for the old all-interfaces behaviour. `HOST` must be an IPv4 address.
 
 Both `-q` and `--q-serve` require a decimal TCP port in `1..65535` (optionally `HOST:PORT`). A
