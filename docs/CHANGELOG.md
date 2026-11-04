@@ -38,7 +38,10 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
   promises the heads are reads: a mutation under one is lost on replay, and
   only the head is examined (a nested call is not). Default empty (unchanged
   behaviour), process-wide, not persisted: set it at load time. In C:
-  `q_readonly_set`, `q_readonly_get`, `q_readonly_forget`.
+  `q_readonly_set`, `q_readonly_get`, `q_readonly_forget`. The names are
+  read through the vector's own symbol domain, so a column loaded from a
+  splayed table (or a slice of one) installs the names it holds. `{` and `}`
+  end a head like `(` does: `(get_seq{})` is recognised.
 
 ### Changed
 

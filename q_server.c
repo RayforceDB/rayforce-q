@@ -472,7 +472,11 @@ int q_readonly_set(ray_t *syms) {
   }
   size_t m = 0;
   for (int64_t i = 0; i < n; i++) {
-    ray_t *str = ray_sym_str(ray_vec_get_sym_id(syms, i)); /* borrowed */
+    /* The code is a position in the vector's own domain (a splayed/mmap
+     * column or a slice of one has a FILE domain), not a runtime intern id:
+     * resolve it through that domain, as q_sym_vec_str does for the codec. */
+    ray_t *str = ray_sym_domain_str(ray_sym_vec_domain(syms),
+                                    ray_vec_get_sym_id(syms, i)); /* borrowed */
     if (str == NULL)
       continue;
     size_t len = ray_str_len(str);
@@ -519,7 +523,7 @@ ray_t *q_readonly_get(void) {
 
 static int q_ro_delim(char c) {
   return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '(' ||
-         c == ')' || c == '[' || c == ']' || c == '"' || c == ';' || c == '\0';
+         c == ')' || c == '[' || c == ']' || c == '{' || c == '}' || c == '"' || c == ';' || c == '\0';
 }
 
 /* Skip blanks and `;` line comments. */

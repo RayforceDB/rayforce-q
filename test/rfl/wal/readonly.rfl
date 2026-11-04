@@ -25,6 +25,9 @@
 (.q.send h "(get_seq 0)") -- 0                            ;; string: one form
 (.q.send h "  (get_seq 0) ; trailing comment") -- 0
 (.q.send h "x") -- 0                                      ;; a bare name
+(.q.send h "(get_seq {})") -- 0                          ;; dictionary literal argument
+(.q.send h "(get_seq{})") -- 0                            ;; ... with no blank before it
+(.q.send h "(get_seq{a:1})") -- 0
 (== (chunks) c1) -- true
 
 ;; ---- everything else is still journaled -----------------------------------
@@ -58,6 +61,32 @@
 (set c4 (chunks))
 (.q.send h (list (quote get_seq) 0)) -- 6
 (== (chunks) (+ c4 2)) -- true          ;; the read and the probe
+
+;; ---- heads resolved through the vector's own domain (FILE-domain SYM) -----
+;; A splayed column read back from disk has its own symbol domain: its codes are
+;; positions in the column's symfile, not runtime intern ids. The server first
+;; interns unrelated names, so that file position 1 ('get_seq) and runtime id 1
+;; are different symbols; the exemption must follow the bytes of the name.
+(.q.send h "(do (.sys.exec \"rm -rf rofd/\") (map (fn [k] (as 'SYMBOL (format \"zz_junk_%\" k))) (til 50)) 1)") -- 1
+(.q.send h "(.db.splayed.set \"rofd/\" (table ['k] (list (as 'SYMBOL (list \"zz_pad\" \"get_seq\" \".log.validate\" \"x\")))))")  ;; the saved table
+(.q.send h "(set fk (at (.db.splayed.get \"rofd/\") 'k))") -- (as 'SYMBOL (list "zz_pad" "get_seq" ".log.validate" "x"))
+(.q.send h "(.q.readonly (take 'sym 0))") -- (take 'sym 0)
+(.q.send h "(.q.readonly fk)") -- ['zz_pad 'get_seq '.log.validate 'x]
+(.q.send h "(.q.readonly)") -- ['zz_pad 'get_seq '.log.validate 'x]
+(set c5 (chunks))
+(.q.send h (list (quote get_seq) 0)) -- 6
+(.q.send h "(get_seq 0)") -- 6
+(== (chunks) c5) -- true                                  ;; not journaled
+(.q.send h "(.q.readonly (take 'sym 0))") -- (take 'sym 0)
+;; a slice of the column: the slice header holds no domain of its own
+(.q.send h "(.q.readonly (drop fk 1))") -- ['get_seq '.log.validate 'x]
+(.q.send h "(.q.readonly (drop (take fk 3) 1))") -- ['get_seq '.log.validate]
+(.q.send h "(.q.readonly)") -- ['get_seq '.log.validate]
+(set c6 (chunks))
+(.q.send h (list (quote get_seq) 0)) -- 6
+(== (chunks) c6) -- true
+(.q.send h "(.q.readonly (take 'sym 0))") -- (take 'sym 0)
+(.q.send h "(do (.sys.exec \"rm -rf rofd/\") 1)") -- 1
 
 ;; ---- argument checking (this process has the builtin too) -----------------
 (.q.readonly 5) !- type
