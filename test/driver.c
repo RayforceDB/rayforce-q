@@ -643,6 +643,63 @@ out:
   return failures;
 }
 
+/* Run q_connect against a one-shot peer and compare the exact NUL-terminated
+ * login blob it receives before returning capability 3. */
+static int handshake_bytes_match(const char *user, const char *password,
+                                 const uint8_t *want, size_t want_len) {
+  int listener = socket(AF_INET, SOCK_STREAM, 0);
+  if (listener < 0)
+    return 0;
+  struct sockaddr_in addr = {0};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = 0;
+  if (bind(listener, (struct sockaddr *)&addr, sizeof addr) < 0 ||
+      listen(listener, 1) < 0) {
+    close(listener);
+    return 0;
+  }
+  socklen_t addr_len = sizeof addr;
+  if (getsockname(listener, (struct sockaddr *)&addr, &addr_len) < 0) {
+    close(listener);
+    return 0;
+  }
+  pid_t child = fork();
+  if (child < 0) {
+    close(listener);
+    return 0;
+  }
+  if (child == 0) {
+    alarm(5);
+    int peer = accept(listener, NULL, NULL);
+    uint8_t got[64];
+    size_t n = 0;
+    while (peer >= 0 && n < sizeof got) {
+      ssize_t r = recv(peer, got + n, 1, 0);
+      if (r != 1)
+        break;
+      n++;
+      if (got[n - 1] == 0)
+        break;
+    }
+    uint8_t cap = 3;
+    if (peer >= 0) {
+      send(peer, &cap, 1, 0);
+      close(peer);
+    }
+    close(listener);
+    _exit(n == want_len && memcmp(got, want, want_len) == 0 ? 0 : 1);
+  }
+  close(listener);
+  int fd = q_connect("127.0.0.1", ntohs(addr.sin_port), user, password, 1000);
+  if (fd >= 0)
+    q_close(fd);
+  int status = 0;
+  if (waitpid(child, &status, 0) < 0)
+    return 0;
+  return fd >= 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
 static int run_codec_selftest(void) {
   int failures = 0;
   ray_runtime_t *rt = ray_runtime_create(0, NULL);
@@ -650,6 +707,7 @@ static int run_codec_selftest(void) {
     fprintf(stderr, "codec selftest: failed to create rayforce runtime\n");
     return 1;
   }
+  q_env_register();
 
   char err[128] = {0};
   uint8_t int_with_tail[] = {250, 42, 0, 0, 0, 0xff};
@@ -726,6 +784,15 @@ static int run_codec_selftest(void) {
     failures++;
   }
 
+  const uint8_t password_only_login[] = {':', 's', 'e', 'c', 'r', 'e', 't',
+                                         3,   0};
+  if (!handshake_bytes_match("", "secret", password_only_login,
+                             sizeof password_only_login)) {
+    fprintf(stderr,
+            "codec selftest: password with empty user was not sent\n");
+    failures++;
+  }
+
   /* Unit-converted temporals, raw wire bytes so no q is needed: the q
    * type byte, then the little-endian payload. */
   struct {
@@ -769,6 +836,101 @@ static int run_codec_selftest(void) {
     }
     release_any(r);
   }
+
+  /* Reply-local outbound temporal kinds. These checks exercise the public
+   * wrappers without a q executable, so the default CI lane verifies both
+   * the requested wire tag and the fact that ordinary lists are untouched. */
+  struct {
+    const char *name;
+    const char *expr;
+    uint8_t want_q_type;
+  } outbound_temporals[] = {
+      {"datetime wrapper",
+       "(.q.as_kind 'datetime 2026.07.10D09:30:00.123000000)", 0xF1},
+      {"month wrapper", "(.q.as_kind 'month 2024.02.01)", 0xF3},
+      {"minute wrapper", "(.q.as_kind 'minute 09:30:00.000)", 0xEF},
+      {"second wrapper", "(.q.as_kind 'second 09:30:15.000)", 0xEE},
+      {"datetime vector",
+       "(.q.as_kind 'datetime [2000.01.01D00:00:00.000000000 "
+       "2026.07.10D09:30:00.123000000])",
+       15},
+  };
+  for (size_t i = 0;
+       i < sizeof outbound_temporals / sizeof outbound_temporals[0]; i++) {
+    int64_t msg_len = 0;
+    uint8_t *msg = encode_expr(outbound_temporals[i].expr, &msg_len);
+    if (msg == NULL || msg_len <= 8 ||
+        msg[8] != outbound_temporals[i].want_q_type) {
+      fprintf(stderr,
+              "codec selftest: %s encoded type %d, want %d\n",
+              outbound_temporals[i].name,
+              msg && msg_len > 8 ? (int)(int8_t)msg[8] : 0,
+              (int)(int8_t)outbound_temporals[i].want_q_type);
+      failures++;
+    }
+    free(msg);
+  }
+
+  int64_t msg_len = 0;
+  uint8_t *msg = encode_expr(
+      "(list 'datetime 2026.07.10D09:30:00.123000000)", &msg_len);
+  if (msg == NULL || msg_len <= 8 || msg[8] != 0) {
+    fprintf(stderr,
+            "codec selftest: ordinary list was mistaken for a kind wrapper\n");
+    failures++;
+  }
+  free(msg);
+
+  /* A one-column table's first column begins at body offset 17. */
+  msg = encode_expr(
+      "(.q.with_kinds (dict ['z] ['datetime]) "
+      "(table [z] (list [2000.01.01D00:00:00.000000000 "
+      "2026.07.10D09:30:00.123000000])))",
+      &msg_len);
+  if (msg == NULL || msg_len <= 25 || msg[8] != 98 || msg[25] != 15) {
+    fprintf(stderr,
+            "codec selftest: table schema did not encode datetime column\n");
+    failures++;
+  }
+  free(msg);
+
+  ray_t *invalid = ray_eval_str(
+      "(.q.as_kind 'datetime 2026.07.10D09:30:00.123000001)");
+  uint8_t *invalid_msg = NULL;
+  int64_t invalid_len = 0;
+  err[0] = '\0';
+  int invalid_rc =
+      invalid && !RAY_IS_ERR(invalid)
+          ? q_encode(invalid, &invalid_msg, &invalid_len, err, sizeof err)
+          : 0;
+  if (invalid == NULL || RAY_IS_ERR(invalid) || invalid_rc >= 0 ||
+      strstr(err, "millisecond-representable") == NULL) {
+    fprintf(stderr,
+            "codec selftest: sub-ms datetime was not rejected: %s\n", err);
+    failures++;
+  }
+  free(invalid_msg);
+  release_any(invalid);
+
+  invalid = ray_eval_str(
+      "(.q.with_kinds (dict ['missing] ['datetime]) "
+      "(table [z] (list [2000.01.01D00:00:00.000000000])))");
+  invalid_msg = NULL;
+  invalid_len = 0;
+  err[0] = '\0';
+  invalid_rc =
+      invalid && !RAY_IS_ERR(invalid)
+          ? q_encode(invalid, &invalid_msg, &invalid_len, err, sizeof err)
+          : 0;
+  if (invalid == NULL || RAY_IS_ERR(invalid) || invalid_rc >= 0 ||
+      strstr(err, "missing was not found") == NULL) {
+    fprintf(stderr,
+            "codec selftest: unknown schema column was not rejected: %s\n",
+            err);
+    failures++;
+  }
+  free(invalid_msg);
+  release_any(invalid);
 
 #if Q_HAVE_TIMESPAN
   /* Q timespans (KN) are i64 nanoseconds, the same payload as rayforce's
@@ -2306,6 +2468,26 @@ static int run_partial_send_selftest(void) {
   }
   q_conn_close(poll, id);
   close(sv[1]);
+
+  /* 4. a hard send error before any byte is written means the peer is gone,
+   * not that the queue is full. The dead handle must not stay registered. */
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0)
+    return 1;
+  id = q_conn_attach(poll, sv[0]);
+  close(sv[1]);
+  err = q_conn_post(poll, id, small);
+  const char *post_msg = ray_error_msg();
+  if (err == NULL || !RAY_IS_ERR(err) || post_msg == NULL ||
+      strstr(post_msg, "post failed; connection closed") == NULL) {
+    fprintf(stderr, "partial send selftest: closed peer got the wrong error\n");
+    failures++;
+  }
+  release_any(err);
+  if (q_conn_is_handle(poll, id)) {
+    fprintf(stderr, "partial send selftest: closed peer left a dead handle\n");
+    failures++;
+    q_conn_close(poll, id);
+  }
 
   release_any(big);
   release_any(small);

@@ -141,6 +141,40 @@ ray_t *result = q_decode(resp, resp_len, compressed, err, sizeof err);
 free(resp);
 ```
 
+### Reply-local q temporal kinds
+
+The engine deliberately merges q datetime/month/minute/second into
+TIMESTAMP/DATE/TIME. `q_encode` therefore uses `p`/`d`/`t` by default. A caller
+that must preserve a q-facing schema can wrap one reply explicitly:
+
+```c
+ray_t *wrapped = q_wrap_as_kind(kind_sym, timestamp);
+/* or: */
+ray_t *wrapped_table = q_wrap_with_kinds(schema_dict, table);
+```
+
+`kind_sym` is `datetime`, `month`, `minute`, or `second`. `schema_dict` maps
+column symbols to those kind symbols. Both functions return an owning
+`ray_t`; release it normally after `q_encode`. The wrapper retains its inputs,
+can be nested inside a larger message, and is identified by adapter-private
+metadata rather than by its LIST shape, so an ordinary application value is
+never treated as an encoding directive. It is still a normal owning two-item
+LIST and may be inspected or stored as one; `q_encode` borrows it and never
+consumes or releases it.
+
+Representability is strict: datetime accepts only millisecond-aligned
+TIMESTAMP values that survive the actual q datetime encode/decode conversion;
+month accepts first-of-month DATE values; minute and second accept only
+in-range TIME values aligned to their unit. Typed nulls are emitted as
+`0Nz`/`0Nm`/`0Nu`/`0Nv`. A mismatch makes `q_encode` fail with the column and
+row in `err`. Calling `q_encode` without a wrapper remains byte-for-byte
+unchanged.
+
+When the wrapped value contains heterogeneous tables, a schema applies only
+to matching columns in each table. Every schema key must match at least one
+column somewhere in the wrapped collection; an unknown or misspelled name is
+an encode error rather than a silent fallback to the default kind.
+
 If the reply is a wide table and you keep only some of its columns, decode
 with `q_decode_cols` instead. It takes the same arguments plus the column
 names, and returns a table of only those columns, in the order given. The
@@ -153,6 +187,9 @@ ray_t *result = q_decode_cols(resp, resp_len, compressed, keep, 3, err, sizeof e
 ```
 
 ### Temporal types
+
+This table describes default, unwrapped mappings. Explicit reply-local overrides
+can select the legacy wire kinds when their values are exactly representable.
 
 | q                        | wire type | Rayforce                                      |
 |--------------------------|-----------|-----------------------------------------------|
@@ -167,7 +204,9 @@ ray_t *result = q_decode_cols(resp, resp_len, compressed, keep, 3, err, sizeof e
 Timespan (on a core with `TIMESPAN`; `Q_HAVE_TIMESPAN` is 1), timestamp, date
 and time are copied as they are, so they encode and decode in both directions.
 On an older core a timespan is rejected as an unsupported wire type. Minute, second, month and datetime are converted on
-decode, and nothing encodes as them.
+decode. Unwrapped values encode using their canonical TIMESTAMP/DATE/TIME wire
+kinds; `.q.as_kind` and `.q.with_kinds` can explicitly request datetime, month,
+minute or second, subject to their representability checks.
 
 ### How large a frame can be
 
