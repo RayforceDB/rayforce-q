@@ -6,6 +6,19 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
 
 ### Added
 
+- **Reply-local q temporal wire kinds.** `(.q.as_kind kind value)` emits a
+  TIMESTAMP/DATE/TIME atom or vector as q `datetime`/`month`/`minute`/`second`,
+  and `(.q.with_kinds schema table)` applies an explicit `column -> kind`
+  symbol dict to a table (including a wrapper nested in a larger reply).
+  Values must be exactly representable and typed nulls keep the requested q
+  type; validation errors identify the column and row. The C equivalents are
+  `q_wrap_as_kind` and `q_wrap_with_kinds`. Wrappers are reply-local and
+  adapter-tagged, with no process-global registry or automatic `upd`/dict
+  recognition, and unwrapped replies keep the existing `p`/`d`/`t` mapping.
+  They remain normal owning LIST values and are borrowed by `q_encode`.
+  Schema matching is per-table intersection, but every requested column must
+  occur in at least one wrapped table so misspellings fail explicitly.
+
 - **Inbound q connections: handle, push, hooks.** `(.q.handle)` now also names
   an *inbound* connection while its frame is being handled (it was outbound
   only). `(.q.post h msg)` sends `msg` as a q ASYNC frame on any open q
@@ -44,6 +57,13 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
   it only when the username was non-empty, silently sending the anonymous
   `03 00` handshake instead. The client now sends the supplied tuple as
   `:password`, followed by its capability byte and NUL.
+
+- **A hard `.q.post` send failure removes the dead handle.** When the peer had
+  already closed and the first direct send failed before writing any bytes,
+  `.q.post` reported a queue or allocation failure and left the unusable
+  connection registered. It now closes the connection and reports that the
+  post failed because the connection was lost; a recoverable zero-byte queue
+  refusal still leaves an otherwise healthy stream open.
 
 - **A frame left half written closes the connection.** With the direct send, a
   reply or `.q.post` larger than the socket buffer is written in part and its
