@@ -126,6 +126,54 @@ static int run_server_args(int argc, char **argv) {
   return 0;
 }
 
+/* q_readonly_get reconstructs symbols by interning the installed names. A
+ * failed intern answers an error, not a vector holding -1, and leaves the
+ * installed list alone. Interning fails while the symbol table is down, which
+ * needs no allocator fault. */
+static int run_readonly_selftest(void) {
+  ray_runtime_t *rt = ray_runtime_create(0, NULL);
+  if (rt == NULL) {
+    fprintf(stderr, "readonly selftest: failed to create runtime\n");
+    return 1;
+  }
+  int failures = 0;
+  ray_t *syms = ray_sym_vec_new(RAY_SYM_W64, 2);
+  int64_t a = ray_sym_intern("get_seq", 7), b = ray_sym_intern("app.status", 10);
+  syms = ray_vec_append(syms, &a);
+  syms = ray_vec_append(syms, &b);
+  if (q_readonly_set(syms) != 0)
+    failures++;
+  ray_release(syms);
+
+  ray_sym_destroy();
+  ray_t *res = q_readonly_get();
+  if (res == NULL || !RAY_IS_ERR(res)) {
+    fprintf(stderr, "readonly selftest: failed intern did not answer an error\n");
+    failures++;
+  }
+  if (res != NULL)
+    ray_release(res);
+  if (ray_sym_init() != RAY_OK) {
+    fprintf(stderr, "readonly selftest: cannot restart the symbol table\n");
+    return 1;
+  }
+
+  res = q_readonly_get();
+  if (res == NULL || RAY_IS_ERR(res) || res->len != 2 ||
+      ray_vec_get_sym_id(res, 0) != ray_sym_intern("get_seq", 7) ||
+      ray_vec_get_sym_id(res, 1) != ray_sym_intern("app.status", 10)) {
+    fprintf(stderr, "readonly selftest: installed list did not survive\n");
+    failures++;
+  }
+  if (res != NULL)
+    ray_release(res);
+
+  q_readonly_forget();
+  ray_runtime_destroy(rt);
+  printf("readonly selftest: %s\n", failures ? "FAIL" : "ok");
+  return failures ? 1 : 0;
+}
+
 static int run_q_cli_selftest(void) {
   ray_runtime_t *rt = ray_runtime_create(0, NULL);
   if (rt == NULL) {
@@ -2201,6 +2249,8 @@ int main(int argc, char **argv) {
     return run_conn_identity_selftest();
   if (argc >= 2 && strcmp(argv[1], "--hooks-teardown-selftest") == 0)
     return run_hooks_teardown_selftest();
+  if (argc >= 2 && strcmp(argv[1], "--readonly-selftest") == 0)
+    return run_readonly_selftest();
   if (argc >= 2 && strcmp(argv[1], "--codec-selftest") == 0)
     return run_codec_selftest();
 

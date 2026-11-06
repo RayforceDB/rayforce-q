@@ -514,9 +514,19 @@ ray_t *q_readonly_get(void) {
     return out ? out : ray_error("oom", NULL);
   for (size_t i = 0; i < q_ro_n; i++) {
     int64_t id = ray_sym_intern(q_ro_names[i], q_ro_lens[i]);
-    out = ray_vec_append(out, &id);
-    if (out == NULL || RAY_IS_ERR(out))
-      return out ? out : ray_error("oom", NULL);
+    /* A name from a FILE-domain column need not be interned here yet, so this
+     * can reserve, and fail. -1 is not a symbol: append would just copy it. */
+    if (id < 0) {
+      ray_release(out);
+      return ray_error("oom", NULL);
+    }
+    /* A failed append leaves the vector alive. */
+    ray_t *next = ray_vec_append(out, &id);
+    if (next == NULL || RAY_IS_ERR(next)) {
+      ray_release(out);
+      return next ? next : ray_error("oom", NULL);
+    }
+    out = next;
   }
   return out;
 }
