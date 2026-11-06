@@ -146,6 +146,31 @@ int q_hook_installed(int which); /* 1 when the hook is set */
 void q_hooks_release(void);      /* release every hook, heap still alive */
 void q_hooks_forget(void);       /* drop the slots, their heap is gone */
 
+/* ===== Read-only allow-list =====
+ *
+ * With a WAL open, every sync q request is journaled before it is evaluated.
+ * A request that only reads (`get_seq`, a status call, a health probe) then
+ * grows the log on every poll and is re-run on replay. The write precedes the
+ * evaluation, so it cannot be dropped afterwards; the embedder declares the
+ * pure reads up front instead.
+ *
+ * q_readonly_set takes a RAY_SYM vector of head symbols (any empty vector or
+ * list, or NULL, clears) and replaces the process-wide list; -1 (nothing
+ * changed) for any other type. A sync request is not journaled when it is a
+ * call list or an all-symbol call vector whose head is in the list, or a
+ * string that is ONE form headed by a listed name; it is dispatched exactly as
+ * before (hooks included). Calls nested inside it are not examined.
+ *
+ * The embedder promises these heads are pure reads: a mutation under a listed
+ * head is not journaled and is lost on replay, by design. The list is empty by
+ * default (today's behaviour), not persisted, and process-wide: set it at load
+ * time, before the listener opens, like the hooks. q_readonly_get returns it
+ * as an owned symbol vector. q_readonly_forget drops it (q_env_register does
+ * this for a new runtime). */
+int q_readonly_set(ray_t *syms);
+ray_t *q_readonly_get(void);
+void q_readonly_forget(void);
+
 /* `.q.dispatch_sync`: the sync request `req` (borrowed) answered by the
  * installed sync hook, or by the default evaluation when there is none. A sync
  * request received while a WAL is open and a sync hook is installed is

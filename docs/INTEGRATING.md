@@ -31,6 +31,13 @@ against. Its requirements:
   reaches the q client as its bare category (`'domain`), every other error
   still carries its message. `q.c` and `q_server.c` need `core/runtime.h` on
   the include path (`ray_error_msg`).
+- q timespan support needs a core whose `rayforce.h` declares `RAY_TIMESPAN`
+  (v3.0.1 is the first release; v2.11.x lacks it). `q.h` detects it with
+  `#ifdef RAY_TIMESPAN` and sets `Q_HAVE_TIMESPAN` to 1 or 0 (define it yourself
+  before including `q.h` to override). With 0, `q.c` compiles without any
+  `RAY_TIMESPAN` reference, so v2.11.0 still builds, and a q timespan atom or
+  vector is refused with `q: unsupported wire type`, as before. The numeric
+  tag is never invented on a core that does not implement the type.
 - No other dependencies. `q.c` defines its own `RAY_ATTR_DICT` and
   `ray_scalar_elem_size` fallbacks, so it needs nothing from your binding.
 - Standard POSIX sockets (`<sys/socket.h>`, `<netdb.h>`).
@@ -134,6 +141,40 @@ ray_t *result = q_decode(resp, resp_len, compressed, err, sizeof err);
 free(resp);
 ```
 
+### Reply-local q temporal kinds
+
+The engine deliberately merges q datetime/month/minute/second into
+TIMESTAMP/DATE/TIME. `q_encode` therefore uses `p`/`d`/`t` by default. A caller
+that must preserve a q-facing schema can wrap one reply explicitly:
+
+```c
+ray_t *wrapped = q_wrap_as_kind(kind_sym, timestamp);
+/* or: */
+ray_t *wrapped_table = q_wrap_with_kinds(schema_dict, table);
+```
+
+`kind_sym` is `datetime`, `month`, `minute`, or `second`. `schema_dict` maps
+column symbols to those kind symbols. Both functions return an owning
+`ray_t`; release it normally after `q_encode`. The wrapper retains its inputs,
+can be nested inside a larger message, and is identified by adapter-private
+metadata rather than by its LIST shape, so an ordinary application value is
+never treated as an encoding directive. It is still a normal owning two-item
+LIST and may be inspected or stored as one; `q_encode` borrows it and never
+consumes or releases it.
+
+Representability is strict: datetime accepts only millisecond-aligned
+TIMESTAMP values that survive the actual q datetime encode/decode conversion;
+month accepts first-of-month DATE values; minute and second accept only
+in-range TIME values aligned to their unit. Typed nulls are emitted as
+`0Nz`/`0Nm`/`0Nu`/`0Nv`. A mismatch makes `q_encode` fail with the column and
+row in `err`. Calling `q_encode` without a wrapper remains byte-for-byte
+unchanged.
+
+When the wrapped value contains heterogeneous tables, a schema applies only
+to matching columns in each table. Every schema key must match at least one
+column somewhere in the wrapped collection; an unknown or misspelled name is
+an encode error rather than a silent fallback to the default kind.
+
 If the reply is a wide table and you keep only some of its columns, decode
 with `q_decode_cols` instead. It takes the same arguments plus the column
 names, and returns a table of only those columns, in the order given. The
@@ -144,6 +185,28 @@ cell or one symbol intern per cell in columns you would drop anyway:
 const char *keep[] = {"date", "sym", "px"};
 ray_t *result = q_decode_cols(resp, resp_len, compressed, keep, 3, err, sizeof err);
 ```
+
+### Temporal types
+
+This table describes default, unwrapped mappings. Explicit reply-local overrides
+can select the legacy wire kinds when their values are exactly representable.
+
+| q                        | wire type | Rayforce                                      |
+|--------------------------|-----------|-----------------------------------------------|
+| date                     | `14`      | `DATE`                                        |
+| time                     | `19`      | `TIME`                                        |
+| timestamp                | `12`      | `TIMESTAMP`                                   |
+| timespan                 | `16`      | `TIMESPAN` (i64 nanoseconds; `0Nn` is null); needs a core with `TIMESPAN` (v3.0.1+), else rejected |
+| minute, second           | `17`, `18`| `TIME`, scaled to milliseconds (decode only)  |
+| month                    | `13`      | `DATE` of the first day (decode only)         |
+| datetime                 | `15`      | `TIMESTAMP` (decode only)                     |
+
+Timespan (on a core with `TIMESPAN`; `Q_HAVE_TIMESPAN` is 1), timestamp, date
+and time are copied as they are, so they encode and decode in both directions.
+On an older core a timespan is rejected as an unsupported wire type. Minute, second, month and datetime are converted on
+decode. Unwrapped values encode using their canonical TIMESTAMP/DATE/TIME wire
+kinds; `.q.as_kind` and `.q.with_kinds` can explicitly request datetime, month,
+minute or second, subject to their representability checks.
 
 ### How large a frame can be
 
@@ -165,8 +228,7 @@ error, and the connection stays open.
 A frame on an attached connection that does not decode closes the connection
 and logs the reason with the frame's size. That holds for a sync request from
 the peer too, which gets no reply. A frame fails to decode when it is cut
-short, when it holds a q type rayforce-q does not decode, such as a timespan
-or a lambda, or when memory runs out while decoding it. Your subscription sees
+short, when it holds a q type rayforce-q does not decode, such as a lambda (or a timespan, on a core without `TIMESPAN`), or when memory runs out while decoding it. Your subscription sees
 the connection closed and can reconnect, rather than carry on with a hole
 where that frame was. The failure is permanent for that frame. A subscriber
 that replays from the start meets it again on every reconnect, so back off
@@ -209,3 +271,34 @@ pull_q:
 	fi
 	cp tmp/rayforce-q/q.* <your-native-src-dir>/   # picked up by your build
 ```
+
+## 4. Serving: inbound requests and the WAL
+
+With a journal open (`.log.open`, `-l`/`-L`), every inbound **sync** q request is written to the WAL before it is evaluated (async frames are not), so a crash mid-handler still leaves the request on disk and `.log.replay` rebuilds the state. A request that only reads pays for that too: a health probe or a `get_seq` poll adds its bytes to the log on every call and is re-evaluated on every replay (measured: 200 polls of a 1-argument read added 12 800 bytes).
+
+### Read-only requests: `.q.readonly`
+
+The write has to precede the evaluation to be crash-safe, so "do not journal this one" cannot be decided afterwards, from the handler or from the result. It has to be known from the request alone. The embedder therefore declares the heads of its pure reads up front:
+
+```
+(.q.readonly ['get_seq 'app.status])   ;; set the process-wide allow-list, returns it
+(.q.readonly)                          ;; the current list (a symbol vector)
+(.q.readonly [])                       ;; clear: back to journaling everything
+```
+
+In C: `q_readonly_set(syms)`, `q_readonly_get()`, `q_readonly_forget()` (see `q_server.h`).
+
+A sync request is **not journaled** when it is
+
+- a call list `` (`get_seq;args...) `` or an all-symbol call vector `` `get_seq`a `` whose head symbol is in the list, or
+- a string that is exactly one form headed by a listed name: `"(get_seq 1)"`, `"get_seq"`, with only blanks and `;` comments around it. A string holding a second form (`"(get_seq 1) (set x 1)"`), an unbalanced form, or a char literal the scanner cannot read past is journaled as before, since a string may carry any number of forms and all of them run.
+
+Such a request is dispatched exactly as today, `.q.on 'sync` hook included; only the journal write is skipped. Every other request, and every async frame, is unchanged.
+
+The contract:
+
+- The embedder promises the listed heads are **pure reads**. A mutation under a listed head is not journaled and is **lost on replay, by design**; nothing checks the promise.
+- Only the **head** is examined. A request with a listed head and nested calls, for example `"(get_seq (bump 0))"`, is not journaled and the nested `bump` still runs, unrecorded. List only heads whose arguments are data.
+- Nothing is persisted. The list is process-wide and lives as long as the runtime (`q_env_register()` drops what an earlier runtime left). Set it at load time, before the listener opens, like the hooks; it takes effect for the requests that arrive after the call. `.q.readonly` is a restricted builtin, so a restricted (remote) evaluation cannot change it.
+- The default is the empty list: every sync request is journaled, as before.
+- Replay is unaffected: unlisted requests, hooked ones included, are recorded and replayed as they were; the unrecorded reads have nothing to replay. `.q.dispatch_sync` is not involved.

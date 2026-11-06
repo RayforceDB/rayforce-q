@@ -420,6 +420,227 @@ static ray_t *eval_request(ray_t *req, int msgtype) {
   return res;
 }
 
+/* ---- Read-only allow-list (`.q.readonly`) --------------------------------
+ *
+ * Every sync q request is journaled before it is evaluated (below), because
+ * the write has to precede the effect to survive a crash. That is also why
+ * "do not journal this one" cannot be decided afterwards, by the handler or by
+ * the result: it has to be known from the request alone, before the write.
+ * The embedder therefore declares, up front, the head symbols of requests that
+ * are pure reads (`get_seq`, a status call, a health probe); a sync request
+ * whose head is one of them is dispatched exactly as before and not written.
+ *
+ * The names are kept as C strings, not symbol ids, so a request string can be
+ * compared without interning anything a client sends. The list is process
+ * global, empty by default (everything is journaled, as before), and not
+ * persisted. */
+static char **q_ro_names;
+static size_t *q_ro_lens;
+static size_t q_ro_n;
+
+static void q_readonly_free(void) {
+  for (size_t i = 0; i < q_ro_n; i++)
+    free(q_ro_names[i]);
+  free(q_ro_names);
+  free(q_ro_lens);
+  q_ro_names = NULL;
+  q_ro_lens = NULL;
+  q_ro_n = 0;
+}
+
+void q_readonly_forget(void) { q_readonly_free(); }
+
+static int q_readonly_has(const char *s, size_t n) {
+  for (size_t i = 0; i < q_ro_n; i++)
+    if (q_ro_lens[i] == n && memcmp(q_ro_names[i], s, n) == 0)
+      return 1;
+  return 0;
+}
+
+/* `syms`: a RAY_SYM vector, any empty vector or list, or NULL (clear). Returns 0, or -1
+ * (nothing changed) for another type or on out-of-memory. */
+int q_readonly_set(ray_t *syms) {
+  int64_t n = 0;
+  if (syms != NULL && !RAY_IS_ERR(syms)) {
+    if (syms->type == RAY_SYM)
+      n = ray_len(syms);
+    else if (syms->type >= 0 && ray_len(syms) == 0)
+      n = 0; /* any empty vector or list clears */
+    else
+      return -1;
+  } else if (syms != NULL) {
+    return -1;
+  }
+  char **names = n ? (char **)calloc((size_t)n, sizeof(char *)) : NULL;
+  size_t *lens = n ? (size_t *)calloc((size_t)n, sizeof(size_t)) : NULL;
+  if (n && (names == NULL || lens == NULL)) {
+    free(names);
+    free(lens);
+    return -1;
+  }
+  size_t m = 0;
+  for (int64_t i = 0; i < n; i++) {
+    /* The code is a position in the vector's own domain (a splayed/mmap
+     * column or a slice of one has a FILE domain), not a runtime intern id:
+     * resolve it through that domain, as q_sym_vec_str does for the codec. */
+    ray_t *str = ray_sym_domain_str(ray_sym_vec_domain(syms),
+                                    ray_vec_get_sym_id(syms, i)); /* borrowed */
+    if (str == NULL)
+      continue;
+    size_t len = ray_str_len(str);
+    const char *p = ray_str_ptr(str);
+    int dup = 0;
+    for (size_t k = 0; k < m; k++)
+      if (lens[k] == len && memcmp(names[k], p, len) == 0)
+        dup = 1;
+    if (dup)
+      continue;
+    char *c = (char *)malloc(len + 1);
+    if (c == NULL) {
+      for (size_t k = 0; k < m; k++)
+        free(names[k]);
+      free(names);
+      free(lens);
+      return -1;
+    }
+    memcpy(c, p, len);
+    c[len] = '\0';
+    names[m] = c;
+    lens[m++] = len;
+  }
+  q_readonly_free();
+  q_ro_names = names;
+  q_ro_lens = lens;
+  q_ro_n = m;
+  return 0;
+}
+
+/* The allow-list as an owned symbol vector (empty when unset). */
+ray_t *q_readonly_get(void) {
+  ray_t *out = ray_sym_vec_new(RAY_SYM_W64, (int64_t)q_ro_n);
+  if (out == NULL || RAY_IS_ERR(out))
+    return out ? out : ray_error("oom", NULL);
+  for (size_t i = 0; i < q_ro_n; i++) {
+    int64_t id = ray_sym_intern(q_ro_names[i], q_ro_lens[i]);
+    /* A name from a FILE-domain column need not be interned here yet, so this
+     * can reserve, and fail. -1 is not a symbol: append would just copy it. */
+    if (id < 0) {
+      ray_release(out);
+      return ray_error("oom", NULL);
+    }
+    /* A failed append leaves the vector alive. */
+    ray_t *next = ray_vec_append(out, &id);
+    if (next == NULL || RAY_IS_ERR(next)) {
+      ray_release(out);
+      return next ? next : ray_error("oom", NULL);
+    }
+    out = next;
+  }
+  return out;
+}
+
+static int q_ro_delim(char c) {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '(' ||
+         c == ')' || c == '[' || c == ']' || c == '{' || c == '}' || c == '"' || c == ';' || c == '\0';
+}
+
+/* Skip blanks and `;` line comments. */
+static size_t q_ro_skip(const char *s, size_t i, size_t n) {
+  for (;;) {
+    while (i < n && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r'))
+      i++;
+    if (i < n && s[i] == ';') {
+      while (i < n && s[i] != '\n')
+        i++;
+      continue;
+    }
+    return i;
+  }
+}
+
+/* A string request is a pure read of an allow-listed head only when it is ONE
+ * form: a bare name, or a single balanced parenthesised form that starts with
+ * the name, with nothing but blanks and comments after it. A string holds any
+ * number of forms and ray_eval_str runs all of them, so `(get_seq 1) (set x 1)`
+ * must not pass on its first token. Anything this scanner is not sure about
+ * (an unbalanced form, a char literal that could hide a delimiter) is
+ * journaled. */
+static int q_ro_string(const char *s, size_t n) {
+  size_t i = q_ro_skip(s, 0, n);
+  size_t end;
+  size_t h; /* head token start */
+  if (i >= n)
+    return 0;
+  if (s[i] == '(') {
+    int depth = 0;
+    size_t j = i;
+    for (; j < n; j++) {
+      char c = s[j];
+      if (c == '"') { /* string literal, with \-escapes */
+        for (j++; j < n && s[j] != '"'; j++)
+          if (s[j] == '\\')
+            j++;
+        if (j >= n)
+          return 0;
+      } else if (c == ';') {
+        while (j < n && s[j] != '\n')
+          j++;
+      } else if (c == '\'') {
+        /* 'X' and '\X' are char literals: X may be a delimiter. */
+        if (j + 1 < n && s[j + 1] == '\\')
+          return 0;
+        if (j + 2 < n && s[j + 2] == '\'' && q_ro_delim(s[j + 1]))
+          return 0;
+      } else if (c == '(') {
+        depth++;
+      } else if (c == ')') {
+        if (--depth == 0)
+          break;
+      }
+    }
+    if (j >= n)
+      return 0; /* unbalanced */
+    end = j + 1;
+    h = q_ro_skip(s, i + 1, n);
+  } else {
+    h = i;
+    end = i;
+    while (end < n && !q_ro_delim(s[end]))
+      end++;
+  }
+  size_t t = h;
+  while (t < n && !q_ro_delim(s[t]))
+    t++;
+  if (t == h)
+    return 0;
+  if (s[h] == '\'')
+    return 0; /* a quoted list or char literal is not a call */
+  size_t tail = q_ro_skip(s, end, n);
+  if (tail != n)
+    return 0; /* a second form follows */
+  return q_readonly_has(s + h, t - h);
+}
+
+/* 1 when `req` (borrowed, as decoded) is a sync request the embedder declared
+ * read-only: a call list, or an all-symbol call vector, whose head symbol is
+ * in the list, or a single-form string headed by one. Calls nested inside the
+ * request are not looked at. */
+static int q_readonly_request(ray_t *req) {
+  if (q_ro_n == 0 || req == NULL || RAY_IS_ERR(req))
+    return 0;
+  ray_t *str = NULL;
+  if (req->type == RAY_LIST && ray_len(req) >= 1) {
+    ray_t *h = ((ray_t **)ray_data(req))[0];
+    if (h != NULL && !RAY_IS_ERR(h) && h->type == -RAY_SYM)
+      str = ray_sym_str(h->i64);
+  } else if (req->type == RAY_SYM && ray_len(req) >= 2) {
+    str = ray_sym_str(ray_vec_get_sym_id(req, 0));
+  } else if (req->type == -RAY_STR) {
+    return q_ro_string(ray_str_ptr(req), ray_str_len(req));
+  }
+  return str != NULL && q_readonly_has(ray_str_ptr(str), ray_str_len(str));
+}
+
 /* ---- WAL auto-journal ---------------------------------------------------
  *
  * core/ipc.c eval_payload_core logs every inbound native SYNC frame to the
@@ -543,6 +764,11 @@ int q_journal_size_ok(int64_t size) {
 static ray_t *q_journal_request(ray_t *req) {
   if (req == NULL || RAY_IS_ERR(req) || !ray_journal_is_open())
     return NULL;
+  /* The allow-list is consulted here, before anything is written: the write
+   * precedes the evaluation, so this is the only point at which a read can
+   * still be left out of the log. */
+  if (q_readonly_request(req))
+    return NULL;
 #ifndef RAY_IPC_HAS_SET_AUTO_JOURNAL_EVAL
   /* A journaled request must be evaluated in the core's auto-journal scope,
    * or a nested `.log.write` appends a synthetic record the replay cannot
@@ -611,6 +837,8 @@ static int64_t q_send_fn(int64_t fd, uint8_t *buf, int64_t len) {
 static int q_test_fail_tail_alloc;
 void q_test_fail_next_tail_alloc(void) { q_test_fail_tail_alloc = 1; }
 
+enum { Q_QUEUE_CONNECTION_LOST = -2 };
+
 static int q_queue_frame(ray_poll_t *poll, ray_selector_t *sel, uint8_t *buf,
                          int64_t len) {
   /* Fast path: nothing is queued ahead of this frame, so write it straight
@@ -622,9 +850,9 @@ static int q_queue_frame(ray_poll_t *poll, ray_selector_t *sel, uint8_t *buf,
    *
    * Once a prefix is on the wire the frame can only be completed, never
    * withdrawn: the peer would read the next frame's bytes as the rest of this
-   * one. So a failure after `sent > 0` closes the connection (the stream is
-   * unusable); a failure with nothing written is a plain refusal and leaves
-   * the connection as it was. */
+   * one. So a queue/allocation refusal after `sent > 0` closes the connection
+   * (the stream is unusable); the same refusal with nothing written leaves it
+   * as it was. A hard send error always means the connection is dead. */
   int64_t sent = 0;
   int64_t id = sel->id;
   if (sel->tx.buf == NULL) {
@@ -639,9 +867,10 @@ static int q_queue_frame(ray_poll_t *poll, ray_selector_t *sel, uint8_t *buf,
       if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
         break;
       free(buf);
-      if (sent > 0)
-        ray_poll_deregister(poll, id);
-      return -1; /* peer gone or hard error: the caller closes the connection */
+      /* EPIPE/ECONNRESET and other hard send failures mean this socket is no
+       * longer usable even when the kernel accepted none of this frame. */
+      ray_poll_deregister(poll, id);
+      return Q_QUEUE_CONNECTION_LOST;
     }
     if (sent == len) {
       free(buf);
@@ -1009,7 +1238,7 @@ static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
   ray_eval_set_restricted(cd->restricted != 0);
   ray_t *result = NULL;
   int journaled = req && !RAY_IS_ERR(req) && hdr.msgtype == Q_MSG_SYNC &&
-                  ray_journal_is_open();
+                  ray_journal_is_open() && !q_readonly_request(req);
   /* Source text is a much wider authority than a subscriber or restricted
    * listener needs. Refuse it before hooks and before the WAL: replay must
    * never turn a request rejected live into executable input. */
@@ -1409,7 +1638,10 @@ ray_t *q_conn_post(ray_poll_t *poll, int64_t id, ray_t *msg) {
   /* Written at once when the socket takes it, else queued for the poll to
    * flush when it is writable, so a slow subscriber cannot stall the
    * publisher. */
-  if (q_queue_frame(poll, sel, buf, len) < 0) {
+  int queued = q_queue_frame(poll, sel, buf, len);
+  if (queued < 0) {
+    if (queued == Q_QUEUE_CONNECTION_LOST)
+      return ray_error("io", "q: post failed; connection closed");
     if (!q_conn_is_handle(poll, id))
       return ray_error("io", "q: post failed after part of the frame was "
                              "sent; connection closed");
