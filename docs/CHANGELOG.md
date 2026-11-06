@@ -39,6 +39,13 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
 
 ### Fixed
 
+- **A hard `.q.post` send failure removes the dead handle.** When the peer had
+  already closed and the first direct send failed before writing any bytes,
+  `.q.post` reported a queue or allocation failure and left the unusable
+  connection registered. It now closes the connection and reports that the
+  post failed because the connection was lost; a recoverable zero-byte queue
+  refusal still leaves an otherwise healthy stream open.
+
 - **A frame left half written closes the connection.** With the direct send, a
   reply or `.q.post` larger than the socket buffer is written in part and its
   tail queued. When the tail could not be queued after a prefix had gone out,
