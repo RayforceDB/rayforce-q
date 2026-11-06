@@ -272,6 +272,16 @@ static ray_t *qb_on(ray_t *kind, ray_t *fn) {
  * hooked request as a call of this, so a replay re-runs the hook. */
 static ray_t *qb_dispatch_sync(ray_t *req) { return q_dispatch_sync(req); }
 
+/* (.q.as_kind 'datetime value) -> a reply-local q wire-kind wrapper. */
+static ray_t *qb_as_kind(ray_t *kind, ray_t *value) {
+  return q_wrap_as_kind(kind, value);
+}
+
+/* (.q.with_kinds schema table) -> a reply-local per-column wrapper. */
+static ray_t *qb_with_kinds(ray_t *schema, ray_t *value) {
+  return q_wrap_with_kinds(schema, value);
+}
+
 /* Bind a builtin under its reserved-namespace name (`.q.*`): ray_env_bind
  * builds the namespace dict, ray_env_bind_flat registers the flat name for REPL
  * completion. */
@@ -314,6 +324,14 @@ void q_env_register(void) {
 
   f = ray_fn_unary(".q.dispatch_sync", RAY_FN_NONE, qb_dispatch_sync);
   q_bind(".q.dispatch_sync", f);
+  ray_release(f);
+
+  f = ray_fn_binary(".q.as_kind", RAY_FN_NONE, qb_as_kind);
+  q_bind(".q.as_kind", f);
+  ray_release(f);
+
+  f = ray_fn_binary(".q.with_kinds", RAY_FN_NONE, qb_with_kinds);
+  q_bind(".q.with_kinds", f);
   ray_release(f);
 }
 
