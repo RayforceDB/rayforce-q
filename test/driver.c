@@ -48,6 +48,16 @@
 void q_env_register(void);
 int64_t q_serve_from_args(ray_poll_t *poll, int argc, char **argv);
 
+/* q_server.c supports cores both with and without the pending-raise renderer.
+ * Detect the same optional API here so the q-free error oracle can assert the
+ * new text while retaining the old-core category fallback. */
+#if defined(__GNUC__) || defined(__clang__)
+extern bool ray_raise_render(char *buf, size_t cap) __attribute__((weak));
+#define TEST_HAVE_RAISE_RENDER() (ray_raise_render != NULL)
+#else
+#define TEST_HAVE_RAISE_RENDER() 1
+#endif
+
 typedef struct {
   uint8_t endianness;
   uint8_t msgtype;
@@ -313,6 +323,29 @@ static int run_rfl_file(const char *path) {
       assert_count++;
       *er = '\0';
       char *expr = start, *substr = er + 4;
+      char expected[128];
+      if (substr[0] == '$') {
+        ray_t *want = ray_eval_str(substr + 1);
+        if (want == NULL || RAY_IS_ERR(want) || want->type != -RAY_STR) {
+          fprintf(stderr, "  %s:%d: invalid dynamic error expectation %s\n",
+                  path, line_no, substr);
+          if (want != NULL) {
+            if (RAY_IS_ERR(want))
+              ray_error_free(want);
+            else
+              ray_release(want);
+          }
+          failed = 1;
+          goto next;
+        }
+        size_t want_len = ray_str_len(want);
+        if (want_len >= sizeof expected)
+          want_len = sizeof expected - 1;
+        memcpy(expected, ray_str_ptr(want), want_len);
+        expected[want_len] = '\0';
+        ray_release(want);
+        substr = expected;
+      }
       ray_t *ev = ray_eval_str(expr);
       if (!RAY_IS_ERR(ev)) {
         char b[512];
@@ -384,6 +417,8 @@ static void inject_server(const char *host, const char *port,
   eval_setup("(set qauthport %s)", authport);
   eval_setup("(set quser \"%s\")", user);
   eval_setup("(set qpass \"%s\")", pass);
+  eval_setup("(set qraiseerror \"%s\")",
+             TEST_HAVE_RAISE_RENDER() ? "custom" : "domain");
 }
 
 static void release_any(ray_t *r) {
