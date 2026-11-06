@@ -6,6 +6,30 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
 
 ### Added
 
+- **q timespan decoded and encoded as `TIMESPAN`.** A q timespan atom (`-16`)
+  or vector (`16`) is i64 nanoseconds, the payload of the core's `TIMESPAN`,
+  so it is copied and re-tagged, and `0Nn` decodes to the null timespan (the
+  vector null gate is set as for the other i64 types). A `TIMESPAN` atom or
+  vector encodes as `-16` / `16`, in tables, dicts and lists too. Before, a
+  frame holding one was refused with `q: unsupported wire type`, and
+  `(- ts1 ts2)` on timestamps, which yields a `TIMESPAN`, could not be sent
+  or returned (`q: cannot serialize message`). This needs a core that declares
+  `RAY_TIMESPAN` (v3.0.1 and later); `q.h` detects it as `Q_HAVE_TIMESPAN`. On
+  v2.11.x the timespan code is compiled out, the v2.11.0 floor stands, and a
+  timespan is still refused with `q: unsupported wire type`.
+- **Reply-local q temporal wire kinds.** `(.q.as_kind kind value)` emits a
+  TIMESTAMP/DATE/TIME atom or vector as q `datetime`/`month`/`minute`/`second`,
+  and `(.q.with_kinds schema table)` applies an explicit `column -> kind`
+  symbol dict to a table (including a wrapper nested in a larger reply).
+  Values must be exactly representable and typed nulls keep the requested q
+  type; validation errors identify the column and row. The C equivalents are
+  `q_wrap_as_kind` and `q_wrap_with_kinds`. Wrappers are reply-local and
+  adapter-tagged, with no process-global registry or automatic `upd`/dict
+  recognition, and unwrapped replies keep the existing `p`/`d`/`t` mapping.
+  They remain normal owning LIST values and are borrowed by `q_encode`.
+  Schema matching is per-table intersection, but every requested column must
+  occur in at least one wrapped table so misspellings fail explicitly.
+
 - **Inbound q connections: handle, push, hooks.** `(.q.handle)` now also names
   an *inbound* connection while its frame is being handled (it was outbound
   only). `(.q.post h msg)` sends `msg` as a q ASYNC frame on any open q
@@ -26,6 +50,22 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
   (`q_hooks_release()` for a runtime destroyed without a poll), and
   `q_env_register()` drops what an earlier runtime left: a hook no longer
   outlives its runtime.
+- **`.q.readonly`: an allow-list of read-only q requests that are not
+  journaled.** With a WAL open every sync q request is journaled before it is
+  evaluated, polls included (200 one-argument `get_seq` calls added 12 800
+  bytes, and replay re-runs them). The write has to precede the evaluation, so
+  it cannot be skipped afterwards; `(.q.readonly ['get_seq 'app.status])`
+  declares the heads of pure reads up front. A sync request whose head is
+  listed (call list, all-symbol call vector, or a string that is one form
+  headed by the name) is dispatched as before, hooks included, and not written.
+  `(.q.readonly)` returns the list, an empty vector clears it. The embedder
+  promises the heads are reads: a mutation under one is lost on replay, and
+  only the head is examined (a nested call is not). Default empty (unchanged
+  behaviour), process-wide, not persisted: set it at load time. In C:
+  `q_readonly_set`, `q_readonly_get`, `q_readonly_forget`. The names are
+  read through the vector's own symbol domain, so a column loaded from a
+  splayed table (or a slice of one) installs the names it holds. `{` and `}`
+  end a head like `(` does: `(get_seq{})` is recognised.
 
 ### Changed
 
@@ -38,6 +78,19 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
   `q_serve` keeps the wildcard bind for bindings.
 
 ### Fixed
+
+- **A password with an empty username reaches the q handshake.**
+  `q_connect(..., "", "password", ...)` sized space for `:password` but copied
+  it only when the username was non-empty, silently sending the anonymous
+  `03 00` handshake instead. The client now sends the supplied tuple as
+  `:password`, followed by its capability byte and NUL.
+
+- **A hard `.q.post` send failure removes the dead handle.** When the peer had
+  already closed and the first direct send failed before writing any bytes,
+  `.q.post` reported a queue or allocation failure and left the unusable
+  connection registered. It now closes the connection and reports that the
+  post failed because the connection was lost; a recoverable zero-byte queue
+  refusal still leaves an otherwise healthy stream open.
 
 - **A frame left half written closes the connection.** With the direct send, a
   reply or `.q.post` larger than the socket buffer is written in part and its

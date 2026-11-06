@@ -1,0 +1,99 @@
+;; (.q.readonly ...): sync q requests headed by a declared read are not journaled.
+;;
+;; Runs against its own `driver --serve` (run.sh, Leg 1b) whose working
+;; directory is private, so the journal base "ro" is a relative path.
+;; (.log.validate "ro.log") answers the chunk count of the log: every journaled
+;; sync request is one chunk, and the probe itself is listed in the allow-list
+;; below so measuring does not move what is measured.
+
+(set h (.q.connect qhost qport))
+(.q.send h "(do (set x 0) (set get_seq (fn [a] x)) (set bump (fn [a] (set x (+ x 1)))) 1)") -- 1
+(.q.send h "(.log.open 'sync \"ro\")")
+(set chunks (fn [] (first (.q.send h "(.log.validate \"ro.log\")"))))
+
+;; ---- default: empty list, everything is journaled -------------------------
+(.q.send h "(.q.readonly)") -- (take 'sym 0)
+(set c0 (chunks))
+(.q.send h (list (quote get_seq) 0)) -- 0
+(== (chunks) (+ c0 2)) -- true            ;; the read and the probe
+
+;; ---- declared: the reads leave no trace -----------------------------------
+(.q.send h "(.q.readonly ['get_seq '.log.validate 'x 'get_seq])") -- ['get_seq '.log.validate 'x]
+(.q.send h "(.q.readonly)") -- ['get_seq '.log.validate 'x]
+(set c1 (chunks))
+(.q.send h (list (quote get_seq) 0)) -- 0                 ;; call list
+(.q.send h "(get_seq 0)") -- 0                            ;; string: one form
+(.q.send h "  (get_seq 0) ; trailing comment") -- 0
+(.q.send h "x") -- 0                                      ;; a bare name
+(.q.send h "(get_seq {})") -- 0                          ;; dictionary literal argument
+(.q.send h "(get_seq{})") -- 0                            ;; ... with no blank before it
+(.q.send h "(get_seq{a:1})") -- 0
+(== (chunks) c1) -- true
+
+;; ---- everything else is still journaled -----------------------------------
+(set c2 (chunks))
+(.q.send h "(set x 1)") -- 1
+(== (chunks) (+ c2 1)) -- true
+(.q.send h (list (quote bump) 0)) -- 2
+(== (chunks) (+ c2 2)) -- true
+
+;; ---- a string with a second form is not "one read" ------------------------
+(.q.send h "(get_seq 0) (bump 0)") -- 3
+(== (chunks) (+ c2 3)) -- true
+(.q.send h "(get_seq 0) ; (bump 0)") -- 3                 ;; a comment is not a form
+(== (chunks) (+ c2 3)) -- true
+(.q.send h "(get_seq \")\" ) (bump 0)") -- 4              ;; ")" inside a string
+(== (chunks) (+ c2 4)) -- true
+
+;; ---- a head that is not listed, in any position of the request ------------
+(.q.send h "(do (get_seq 0) (bump 0))") -- 5
+(== (chunks) (+ c2 5)) -- true
+
+;; ---- documented edge: a listed head with a nested call is not journaled ---
+;; The nested (bump 0) runs, mutates, and is not in the log.
+(set c3 (chunks))
+(.q.send h "(get_seq (bump 0))") -- 6
+(== (chunks) c3) -- true
+
+;; ---- clearing restores journaling -----------------------------------------
+(.q.send h "(.q.readonly (take 'sym 0))") -- (take 'sym 0)
+(.q.send h "(.q.readonly)") -- (take 'sym 0)
+(set c4 (chunks))
+(.q.send h (list (quote get_seq) 0)) -- 6
+(== (chunks) (+ c4 2)) -- true          ;; the read and the probe
+
+;; ---- heads resolved through the vector's own domain (FILE-domain SYM) -----
+;; A splayed column read back from disk has its own symbol domain: its codes are
+;; positions in the column's symfile, not runtime intern ids. The server first
+;; interns unrelated names, so that file position 1 ('get_seq) and runtime id 1
+;; are different symbols; the exemption must follow the bytes of the name.
+(.q.send h "(do (.sys.exec \"rm -rf rofd/\") (map (fn [k] (as 'SYMBOL (format \"zz_junk_%\" k))) (til 50)) 1)") -- 1
+(.q.send h "(.db.splayed.set \"rofd/\" (table ['k] (list (as 'SYMBOL (list \"zz_pad\" \"get_seq\" \".log.validate\" \"x\")))))")  ;; the saved table
+(.q.send h "(set fk (at (.db.splayed.get \"rofd/\") 'k))") -- (as 'SYMBOL (list "zz_pad" "get_seq" ".log.validate" "x"))
+(.q.send h "(.q.readonly (take 'sym 0))") -- (take 'sym 0)
+(.q.send h "(.q.readonly fk)") -- ['zz_pad 'get_seq '.log.validate 'x]
+(.q.send h "(.q.readonly)") -- ['zz_pad 'get_seq '.log.validate 'x]
+(set c5 (chunks))
+(.q.send h (list (quote get_seq) 0)) -- 6
+(.q.send h "(get_seq 0)") -- 6
+(== (chunks) c5) -- true                                  ;; not journaled
+(.q.send h "(.q.readonly (take 'sym 0))") -- (take 'sym 0)
+;; a slice of the column: the slice header holds no domain of its own
+(.q.send h "(.q.readonly (drop fk 1))") -- ['get_seq '.log.validate 'x]
+(.q.send h "(.q.readonly (drop (take fk 3) 1))") -- ['get_seq '.log.validate]
+(.q.send h "(.q.readonly)") -- ['get_seq '.log.validate]
+(set c6 (chunks))
+(.q.send h (list (quote get_seq) 0)) -- 6
+(== (chunks) c6) -- true
+(.q.send h "(.q.readonly (take 'sym 0))") -- (take 'sym 0)
+(.q.send h "(do (.sys.exec \"rm -rf rofd/\") 1)") -- 1
+
+;; ---- argument checking (this process has the builtin too) -----------------
+(.q.readonly 5) !- type
+(.q.readonly 'a) !- type
+(.q.readonly (list 'a 'b)) !- type
+(.q.readonly ['a] ['b]) !- arity
+(.q.readonly ['b 'a 'b]) -- ['b 'a]
+(.q.readonly []) -- (take 'sym 0)
+(.q.readonly) -- (take 'sym 0)
+(.q.close h)

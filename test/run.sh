@@ -35,6 +35,20 @@ s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.clos
 PY
 }
 
+# rfl_files DIR — the .rfl files under DIR, minus the timespan files when the
+# core has no TIMESPAN (the driver reports its compiled-in Q_HAVE_TIMESPAN).
+HAVE_TIMESPAN="$("$DRIVER" --have-timespan)"
+rfl_files() {
+  local f
+  for f in "$1"/*.rfl; do
+    if [[ "$HAVE_TIMESPAN" != "1" && "$f" == *timespan.rfl ]]; then
+      echo "SKIP: ${f#"$RFL_DIR"/} (core has no TIMESPAN)" >&2
+      continue
+    fi
+    printf '%s\n' "$f"
+  done
+}
+
 # wait_for_port HOST PORT — return 0 once a TCP connect succeeds, 1 on timeout.
 wait_for_port() {
   local host="$1" port="$2"
@@ -97,6 +111,9 @@ echo "running journal bound selftest..."
 echo "running hooks teardown selftest..."
 "$DRIVER" --hooks-teardown-selftest
 
+echo "running read-only allow-list selftest..."
+"$DRIVER" --readonly-selftest
+
 echo "running connection identity selftest..."
 "$DRIVER" --conn-identity-selftest
 
@@ -151,7 +168,9 @@ SERVERPORT="${SERVERPORT:-$(free_port)}"
 PIDS+=("$!")
 wait_for_port "$HOST" "$SERVERPORT" || { echo "driver --serve did not come up on $HOST:$SERVERPORT" >&2; exit 1; }
 echo "server up on $HOST:$SERVERPORT; running server round-trip tests..."
-"$DRIVER" --host "$HOST" --port "$SERVERPORT" "$RFL_DIR"/server/*.rfl
+SERVER_RFL=()
+while IFS= read -r f; do SERVER_RFL+=("$f"); done < <(rfl_files "$RFL_DIR/server")
+"$DRIVER" --host "$HOST" --port "$SERVERPORT" "${SERVER_RFL[@]}"
 
 echo "checking client keepalive socket options..."
 "$DRIVER" --keepalive-selftest "$HOST" "$SERVERPORT"
@@ -322,6 +341,27 @@ print(f"partial-frame memory check ok ({delta_kib} KiB growth)")
 PY
 fi
 
+# ---- Leg 1b: the read-only allow-list (.q.readonly), no q needed
+# A WAL is open on a private server (its own working directory, so the journal
+# base is a relative path); the rfl file counts journal chunks with
+# .log.validate. Needs the core's auto-journal scope, or every sync request is
+# refused once a journal is open.
+if grep -q RAY_IPC_HAS_SET_AUTO_JOURNAL_EVAL "${CORE_SRC:-/nonexistent}/core/ipc.h" 2>/dev/null; then
+  echo "running read-only allow-list tests (WAL open) ..."
+  ROPORT="$(free_port)"
+  mkdir -p "$WORK/readonly"
+  DRIVER_ABS="$(cd "$(dirname "$DRIVER")" && pwd)/$(basename "$DRIVER")"
+  (cd "$WORK/readonly" && exec "$DRIVER_ABS" --serve "$ROPORT" 2>"$WORK/readonly.err") &
+  ROPID=$!
+  PIDS+=("$ROPID")
+  wait_for_port "$HOST" "$ROPORT" || { echo "read-only server did not come up" >&2; exit 1; }
+  "$DRIVER" --host "$HOST" --port "$ROPORT" "$RFL_DIR"/wal/*.rfl
+  kill "$ROPID" 2>/dev/null || true
+  wait "$ROPID" 2>/dev/null || true
+else
+  echo "SKIP: core has no ray_ipc_set_auto_journal_eval - skipping read-only allow-list tests"
+fi
+
 # ---- Leg 2: real-q interop against Rayforce server
 find_q
 if [[ -n "$QBIN" ]]; then
@@ -361,6 +401,50 @@ T["string col";  (enlist "a";"bb";"ccc")~h"(as 'STR [\"a\" \"bb\" \"ccc\"])"]
 T["date";        2024.01.15~h"2024.01.15"]
 T["time";        09:30:00.000~h"09:30:00.000"]
 T["timestamp";   2024.01.15D09:30:00.000000000~h"2024.01.15D09:30:00.000000000"]
+/ explicit reply-local temporal kinds: values keep their engine type internally,
+/ while the wrapper chooses the q wire kind for this reply only
+T["datetime atom kind"; -15h~type h"(.q.as_kind 'datetime 2026.07.10D09:30:00.123000000)"]
+T["datetime atom value"; 2026.07.10T09:30:00.123~h"(.q.as_kind 'datetime 2026.07.10D09:30:00.123000000)"]
+T["datetime negative"; 1999.12.31D23:59:59.999000000~`timestamp$h"(.q.as_kind 'datetime 1999.12.31D23:59:59.999000000)"]
+T["datetime vector kind"; 15h~type h"(.q.as_kind 'datetime [2000.01.01D00:00:00.000000000 2026.07.10D09:30:00.123000000])"]
+T["datetime null kind"; -15h~type h"(.q.as_kind 'datetime 0Np)"]
+T["datetime null value"; null h"(.q.as_kind 'datetime 0Np)"]
+zmax:h"(.q.as_kind 'datetime (as 'timestamp 9223372036853000000))"
+zmin:h"(.q.as_kind 'datetime (as 'timestamp -9223372036853000000))"
+T["datetime max kind"; -15h~type zmax]
+T["datetime max roundtrip"; (`timestamp$9223372036853000000)~`timestamp$zmax]
+T["datetime min kind"; -15h~type zmin]
+T["datetime min roundtrip"; (`timestamp$-9223372036853000000)~`timestamp$zmin]
+T["month atom kind"; -13h~type h"(.q.as_kind 'month 2024.02.01)"]
+T["month atom value"; 2024.02m~h"(.q.as_kind 'month 2024.02.01)"]
+T["month null"; (-13h=type h"(.q.as_kind 'month 0Nd)")&null h"(.q.as_kind 'month 0Nd)"]
+T["minute atom kind"; -17h~type h"(.q.as_kind 'minute 09:30:00.000)"]
+T["minute atom value"; 09:30~h"(.q.as_kind 'minute 09:30:00.000)"]
+T["minute null"; (-17h=type h"(.q.as_kind 'minute 0Nt)")&null h"(.q.as_kind 'minute 0Nt)"]
+T["second atom kind"; -18h~type h"(.q.as_kind 'second 09:30:15.000)"]
+T["second atom value"; 09:30:15~h"(.q.as_kind 'second 09:30:15.000)"]
+T["second null"; (-18h=type h"(.q.as_kind 'second 0Nt)")&null h"(.q.as_kind 'second 0Nt)"]
+T["datetime sub-ms refused"; @[h;"(.q.as_kind 'datetime 2026.07.10D09:30:00.123000001)";{(x like "type: *")&0<count x ss "millisecond-representable"}]]
+T["non-month date refused"; @[h;"(.q.as_kind 'month 2024.02.02)";{(x like "type: *")&0<count x ss "first day"}]]
+T["fractional minute refused"; @[h;"(.q.as_kind 'minute 09:30:01.000)";{(x like "type: *")&0<count x ss "whole in-range minute"}]]
+T["fractional second refused"; @[h;"(.q.as_kind 'second 09:30:15.001)";{(x like "type: *")&0<count x ss "whole in-range second"}]]
+kt:h"(.q.with_kinds (dict ['z 'm 'u 'v] ['datetime 'month 'minute 'second]) (table [z m u v] (list [2000.01.01D00:00:00.000000000 2026.07.10D09:30:00.123000000] [1999.12.01 2024.02.01] [09:30:00.000 10:45:00.000] [09:30:15.000 23:59:59.000])))"
+T["table kind schema"; "zmuv"~exec t from meta kt]
+T["table datetime values"; (2000.01.01T00:00:00.000;2026.07.10T09:30:00.123)~kt`z]
+T["table month values"; 1999.12 2024.02m~kt`m]
+up:h"(list 'upd 'trade (.q.with_kinds (dict ['z] ['datetime]) (table [z] (list [2000.01.01D00:00:00.000000000]))))"
+T["nested table wrapper"; -15h~type first (last up)`z]
+md:h"(.q.with_kinds (dict ['z] ['datetime]) (dict ['a 'b] (list (table [z] (list [2000.01.01D00:00:00.000000000])) (table [z] (list [2026.07.10D09:30:00.123000000])))))"
+T["dict of tables wrapper"; (-15h=type first (md`a)`z)&-15h=type first (md`b)`z]
+plain:h"(list 'datetime 2000.01.01D00:00:00.000000000)"
+T["ordinary list unchanged"; -12h~type last plain]
+kd:h"(table [z m u v] (list [2000.01.01D00:00:00.000000000] [2024.02.01] [09:30:00.000] [09:30:15.000]))"
+T["default kinds unchanged"; "pdtt"~exec t from meta kd]
+T["wrong schema type refused"; @[h;"(.q.with_kinds (dict ['z] ['month]) (table [z] (list [1 2])))";{(x like "type: *")&0<count x ss "incompatible engine type"}]]
+T["schema error names row"; @[h;"(.q.with_kinds (dict ['m] ['month]) (table [m] (list [2024.02.01 2024.02.02])))";{(x like "type: *")&0<count x ss "m row 1"}]]
+T["unknown schema column refused"; @[h;"(.q.with_kinds (dict ['missing] ['datetime]) (table [z] (list [2000.01.01D00:00:00.000000000])))";{(x like "type: *")&0<count x ss "missing was not found"}]]
+hm:h"(.q.with_kinds (dict ['z 'm] ['datetime 'month]) (dict ['a 'b] (list (table [z] (list [2000.01.01D00:00:00.000000000])) (table [m] (list [2024.02.01])))))"
+T["heterogeneous schema intersection"; (-15h=type first (hm`a)`z)&-13h=type first (hm`b)`m]
 / guid (atom child-block path + vector path)
 T["guid atom";   ("G"$"d49f18a4-1969-49e8-9b8a-6bb9a4832eea")~h"(as 'guid \"d49f18a4-1969-49e8-9b8a-6bb9a4832eea\")"]
 T["guid vec";    (enlist "G"$"d49f18a4-1969-49e8-9b8a-6bb9a4832eea")~h"(as 'GUID (list \"d49f18a4-1969-49e8-9b8a-6bb9a4832eea\"))"]
@@ -612,6 +696,72 @@ WH_PORT_A1="$WH_PORT_A1" WH_PORT_B1="$WH_PORT_B1" WH_PORT_A2="$WH_PORT_A2" WH_PO
 for p in "${WH_PIDS[@]}"; do kill "$p" 2>/dev/null || true; wait "$p" 2>/dev/null || true; done
 fi
 
+# ---- Leg 2b'': the read-only allow-list against a real q client
+# 200 polls of a declared read must leave the log's size unchanged, every other
+# request is journaled as before, and a mutation hidden under a declared head is
+# lost on replay (the embedder's promise, documented). The same polls without
+# the allow-list are measured first, for the before/after of the change.
+if [ "$HASSCOPE" = "1" ]; then
+echo "real-q read-only allow-list: journal size with and without .q.readonly ..."
+RODIR="$WORK/roq"; mkdir -p "$RODIR"
+ROQ_PIDS=()
+for nm in A B; do
+  port="$(free_port)"
+  "$DRIVER" --serve "$port" 2>"$RODIR/$nm.err" &
+  ROQ_PIDS+=("$!"); PIDS+=("$!")
+  wait_for_port "$HOST" "$port" || { echo "read-only server $nm did not come up" >&2; exit 1; }
+  eval "ROQ_PORT_$nm=$port"
+done
+cat > "$RODIR/roq.q" <<'QEOF'
+base:getenv`RO_BASE
+names:();oks:()
+T:{[nm;b] names,:enlist nm; oks,:enlist b}
+sz:{hcount `$":",base,".log"}
+a:hopen `$":127.0.0.1:",getenv`RO_PORT_A
+r:a"(do (set n 0) (set get_seq (fn [x] n)) (set bump (fn [x] (set n (+ n 1)))) 1)"
+r:a"(.log.open 'sync \"",base,"\")"
+polls:{do[200; a(`get_seq;0)]}
+s0:sz[]; polls[]; s1:sz[]
+-1 "before: 200 get_seq polls grew the journal ",string[s1-s0]," bytes (",string[s0]," -> ",string[s1],")";
+T["without the list every poll is journaled"; s1>s0]
+r:a"(.q.readonly ['get_seq 'app.status])"
+T["the list reads back"; (`get_seq`app.status)~a"(.q.readonly)"]
+s2:sz[]
+polls[]
+r:a`get_seq`n                        / an all-symbol call vector
+r:a"(get_seq 0)"
+r:a"(get_seq 0) ; a comment"
+s3:sz[]
+-1 "after:  200 get_seq polls grew the journal ",string[s3-s2]," bytes (",string[s2]," -> ",string[s3],")";
+T["declared reads leave the journal untouched (call list, symbol vector, string)"; s3=s2]
+r:a(`bump;0)
+T["other requests are still journaled"; sz[]>s3]
+s4:sz[]
+r:a"(get_seq 0) (get_seq 0)"         / two forms: not one read, journaled
+T["a string with a second form is journaled"; sz[]>s4]
+s4:sz[]
+r:a"(get_seq (bump 0))"              / documented: a nested mutation under a listed head is not journaled
+T["nested mutation under a listed head: not journaled"; sz[]=s4]
+T["live state"; 2~a"n"]
+r:a"(.q.readonly ['get_seq])"; r:a"(.q.readonly (take 'sym 0))"
+s5:sz[]; r:a(`get_seq;0)
+T["cleared: journaled again"; sz[]>s5]
+hclose a
+b:hopen `$":127.0.0.1:",getenv`RO_PORT_B
+r:b"(do (set n 0) (set get_seq (fn [x] n)) (set bump (fn [x] (set n (+ n 1)))) 1)"
+n:b"(.log.replay \"",base,".log\")"
+T["replay: the journaled bump ran, the unjournaled nested one did not"; 1~b"n"]
+hclose b
+bad:names where not oks
+if[count bad; -2 "q read-only allow-list FAILED: ",", " sv bad; exit 1]
+-1 "q read-only allow-list ok (",(string count names)," assertions)"
+exit 0
+QEOF
+RO_PORT_A="$ROQ_PORT_A" RO_PORT_B="$ROQ_PORT_B" RO_BASE="$RODIR/ro" \
+  QHOME="${QHOME:-$(q_home_for "$QBIN")}" "$QBIN" "$RODIR/roq.q" -q < /dev/null
+for p in "${ROQ_PIDS[@]}"; do kill "$p" 2>/dev/null || true; wait "$p" 2>/dev/null || true; done
+fi
+
 # ---- Leg 2c: inbound connections -- .q.handle, .q.post, .q.on hooks
 # A kdb-compatible pub/sub server on the embedded runtime: a sync hook answers
 # `(.net.sub;5)` (a reserved-looking name arriving as the head symbol of a q
@@ -689,11 +839,13 @@ for p in "$PORT" "$AUTHPORT"; do
   wait_for_port "$HOST" "$p" || { echo "q server on $HOST:$p did not come up" >&2; exit 1; }
 done
 
+CLIENT_RFL=()
+while IFS= read -r f; do CLIENT_RFL+=("$f"); done < <(rfl_files "$RFL_DIR/client")
 echo "q servers up: open=$HOST:$PORT auth=$HOST:$AUTHPORT; running client tests..."
 "$DRIVER" \
   --host "$HOST" --port "$PORT" \
   --authport "$AUTHPORT" --user "$Q_USER" --pass "$Q_PASS" \
-  "$RFL_DIR"/client/*.rfl
+  "${CLIENT_RFL[@]}"
 
 echo "running q_decode_cols selftest against q..."
 "$DRIVER" --cols-selftest "$HOST" "$PORT"
@@ -706,4 +858,4 @@ echo "running client + push tests with --poll ..."
 "$DRIVER" --poll \
   --host "$HOST" --port "$PORT" \
   --authport "$AUTHPORT" --user "$Q_USER" --pass "$Q_PASS" \
-  "$RFL_DIR"/client/*.rfl "$RFL_DIR"/push/*.rfl
+  "${CLIENT_RFL[@]}" "$RFL_DIR"/push/*.rfl

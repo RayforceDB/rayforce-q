@@ -126,6 +126,62 @@ static int run_server_args(int argc, char **argv) {
   return 0;
 }
 
+/* q_readonly_get reconstructs symbols by interning the installed names. A
+ * failed intern answers an error, not a vector holding -1, and leaves the
+ * installed list alone. Interning fails while the symbol table is down, which
+ * needs no allocator fault. */
+static int run_readonly_selftest(void) {
+  ray_runtime_t *rt = ray_runtime_create(0, NULL);
+  if (rt == NULL) {
+    fprintf(stderr, "readonly selftest: failed to create runtime\n");
+    return 1;
+  }
+  int failures = 0;
+  ray_t *syms = ray_sym_vec_new(RAY_SYM_W64, 2);
+  int64_t a = ray_sym_intern("get_seq", 7), b = ray_sym_intern("app.status", 10);
+  syms = ray_vec_append(syms, &a);
+  syms = ray_vec_append(syms, &b);
+  if (q_readonly_set(syms) != 0)
+    failures++;
+  ray_release(syms);
+
+  ray_sym_destroy();
+  ray_t *res = q_readonly_get();
+  if (res == NULL || !RAY_IS_ERR(res)) {
+    fprintf(stderr, "readonly selftest: failed intern did not answer an error\n");
+    failures++;
+  }
+  if (res != NULL) {
+    if (RAY_IS_ERR(res))
+      ray_error_free(res);
+    else
+      ray_release(res);
+  }
+  if (ray_sym_init() != RAY_OK) {
+    fprintf(stderr, "readonly selftest: cannot restart the symbol table\n");
+    return 1;
+  }
+
+  res = q_readonly_get();
+  if (res == NULL || RAY_IS_ERR(res) || res->len != 2 ||
+      ray_vec_get_sym_id(res, 0) != ray_sym_intern("get_seq", 7) ||
+      ray_vec_get_sym_id(res, 1) != ray_sym_intern("app.status", 10)) {
+    fprintf(stderr, "readonly selftest: installed list did not survive\n");
+    failures++;
+  }
+  if (res != NULL) {
+    if (RAY_IS_ERR(res))
+      ray_error_free(res);
+    else
+      ray_release(res);
+  }
+
+  q_readonly_forget();
+  ray_runtime_destroy(rt);
+  printf("readonly selftest: %s\n", failures ? "FAIL" : "ok");
+  return failures ? 1 : 0;
+}
+
 static int run_q_cli_selftest(void) {
   ray_runtime_t *rt = ray_runtime_create(0, NULL);
   if (rt == NULL) {
@@ -398,6 +454,7 @@ static void release_any(ray_t *r) {
 /* ---- q_decode_cols -------------------------------------------------- */
 
 #define TEST_ATTR_DICT 0x02 /* q.c's RAY_ATTR_DICT, marking a keyed table */
+#define TEST_ATTR_HAS_NULLS 0x40 /* the core's RAY_ATTR_HAS_NULLS */
 
 /* q_encode v. Returns the whole message (header + body) to free(), or NULL. */
 static uint8_t *encode_value(ray_t *v, int64_t *len) {
@@ -551,8 +608,8 @@ static int cols_codec_checks(void) {
   release_any(r);
 
   /* ([] a:1 2; n:0D00:00:01 0D00:00:02; qcolsskipped:`qcolsunseen`), by
-   * hand: rayforce cannot encode a timespan. Skipping n works although
-   * q_decode rejects it, and the skipped symbol column's name and values
+   * hand. Skipping n works without decoding it (a core without TIMESPAN
+   * could not decode it), and the skipped symbol column's name and values
    * are never interned. */
   uint8_t span[] = {/* table, attrs, dict; column names `a`n`qcolsskipped */
                     98, 0, 99, 11, 0, 3, 0, 0, 0, 'a', 0, 'n', 0, 'q', 'c', 'o',
@@ -583,12 +640,26 @@ static int cols_codec_checks(void) {
   }
   release_any(r);
   release_any(w);
+#if Q_HAVE_TIMESPAN
+  r = q_decode_cols(span, (int64_t)sizeof span, 0, n, 1, err, sizeof err);
+  w = ray_eval_str(
+      "(table ['n] (list (- [2024.01.02D00:00:01.000000000 "
+      "2024.01.02D00:00:02.000000000] 2024.01.02D00:00:00.000000000)))");
+  if (r == NULL || RAY_IS_ERR(r) || w == NULL || !fmt_eq(r, w)) {
+    fprintf(stderr, "cols selftest: a kept timespan was not decoded: %s\n",
+            err);
+    failures++;
+  }
+  release_any(r);
+  release_any(w);
+#else
   r = q_decode_cols(span, (int64_t)sizeof span, 0, n, 1, err, sizeof err);
   if (r == NULL || !RAY_IS_ERR(r) || strcmp(ray_err_code(r), "q: unsu") != 0) {
     fprintf(stderr, "cols selftest: a kept timespan was not rejected\n");
     failures++;
   }
   release_any(r);
+#endif
 
   /* Symbols are skipped a word at a time: end a skipped symbol column at
    * every offset within a word, with the next column's bytes after it. */
@@ -628,6 +699,63 @@ out:
   return failures;
 }
 
+/* Run q_connect against a one-shot peer and compare the exact NUL-terminated
+ * login blob it receives before returning capability 3. */
+static int handshake_bytes_match(const char *user, const char *password,
+                                 const uint8_t *want, size_t want_len) {
+  int listener = socket(AF_INET, SOCK_STREAM, 0);
+  if (listener < 0)
+    return 0;
+  struct sockaddr_in addr = {0};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = 0;
+  if (bind(listener, (struct sockaddr *)&addr, sizeof addr) < 0 ||
+      listen(listener, 1) < 0) {
+    close(listener);
+    return 0;
+  }
+  socklen_t addr_len = sizeof addr;
+  if (getsockname(listener, (struct sockaddr *)&addr, &addr_len) < 0) {
+    close(listener);
+    return 0;
+  }
+  pid_t child = fork();
+  if (child < 0) {
+    close(listener);
+    return 0;
+  }
+  if (child == 0) {
+    alarm(5);
+    int peer = accept(listener, NULL, NULL);
+    uint8_t got[64];
+    size_t n = 0;
+    while (peer >= 0 && n < sizeof got) {
+      ssize_t r = recv(peer, got + n, 1, 0);
+      if (r != 1)
+        break;
+      n++;
+      if (got[n - 1] == 0)
+        break;
+    }
+    uint8_t cap = 3;
+    if (peer >= 0) {
+      send(peer, &cap, 1, 0);
+      close(peer);
+    }
+    close(listener);
+    _exit(n == want_len && memcmp(got, want, want_len) == 0 ? 0 : 1);
+  }
+  close(listener);
+  int fd = q_connect("127.0.0.1", ntohs(addr.sin_port), user, password, 1000);
+  if (fd >= 0)
+    q_close(fd);
+  int status = 0;
+  if (waitpid(child, &status, 0) < 0)
+    return 0;
+  return fd >= 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
 static int run_codec_selftest(void) {
   int failures = 0;
   ray_runtime_t *rt = ray_runtime_create(0, NULL);
@@ -635,6 +763,7 @@ static int run_codec_selftest(void) {
     fprintf(stderr, "codec selftest: failed to create rayforce runtime\n");
     return 1;
   }
+  q_env_register();
 
   char err[128] = {0};
   uint8_t int_with_tail[] = {250, 42, 0, 0, 0, 0xff};
@@ -740,6 +869,15 @@ static int run_codec_selftest(void) {
     failures++;
   }
 
+  const uint8_t password_only_login[] = {':', 's', 'e', 'c', 'r', 'e', 't',
+                                         3,   0};
+  if (!handshake_bytes_match("", "secret", password_only_login,
+                             sizeof password_only_login)) {
+    fprintf(stderr,
+            "codec selftest: password with empty user was not sent\n");
+    failures++;
+  }
+
   /* Unit-converted temporals, raw wire bytes so no q is needed: the q
    * type byte, then the little-endian payload. */
   struct {
@@ -784,7 +922,202 @@ static int run_codec_selftest(void) {
     release_any(r);
   }
 
-  /* Q timespans (KN) are durations, not timestamps. Rayforce has no
+  /* Reply-local outbound temporal kinds. These checks exercise the public
+   * wrappers without a q executable, so the default CI lane verifies both
+   * the requested wire tag and the fact that ordinary lists are untouched. */
+  struct {
+    const char *name;
+    const char *expr;
+    uint8_t want_q_type;
+  } outbound_temporals[] = {
+      {"datetime wrapper",
+       "(.q.as_kind 'datetime 2026.07.10D09:30:00.123000000)", 0xF1},
+      {"month wrapper", "(.q.as_kind 'month 2024.02.01)", 0xF3},
+      {"minute wrapper", "(.q.as_kind 'minute 09:30:00.000)", 0xEF},
+      {"second wrapper", "(.q.as_kind 'second 09:30:15.000)", 0xEE},
+      {"datetime vector",
+       "(.q.as_kind 'datetime [2000.01.01D00:00:00.000000000 "
+       "2026.07.10D09:30:00.123000000])",
+       15},
+  };
+  for (size_t i = 0;
+       i < sizeof outbound_temporals / sizeof outbound_temporals[0]; i++) {
+    int64_t msg_len = 0;
+    uint8_t *msg = encode_expr(outbound_temporals[i].expr, &msg_len);
+    if (msg == NULL || msg_len <= 8 ||
+        msg[8] != outbound_temporals[i].want_q_type) {
+      fprintf(stderr,
+              "codec selftest: %s encoded type %d, want %d\n",
+              outbound_temporals[i].name,
+              msg && msg_len > 8 ? (int)(int8_t)msg[8] : 0,
+              (int)(int8_t)outbound_temporals[i].want_q_type);
+      failures++;
+    }
+    free(msg);
+  }
+
+  int64_t msg_len = 0;
+  uint8_t *msg = encode_expr(
+      "(list 'datetime 2026.07.10D09:30:00.123000000)", &msg_len);
+  if (msg == NULL || msg_len <= 8 || msg[8] != 0) {
+    fprintf(stderr,
+            "codec selftest: ordinary list was mistaken for a kind wrapper\n");
+    failures++;
+  }
+  free(msg);
+
+  /* A one-column table's first column begins at body offset 17. */
+  msg = encode_expr(
+      "(.q.with_kinds (dict ['z] ['datetime]) "
+      "(table [z] (list [2000.01.01D00:00:00.000000000 "
+      "2026.07.10D09:30:00.123000000])))",
+      &msg_len);
+  if (msg == NULL || msg_len <= 25 || msg[8] != 98 || msg[25] != 15) {
+    fprintf(stderr,
+            "codec selftest: table schema did not encode datetime column\n");
+    failures++;
+  }
+  free(msg);
+
+  ray_t *invalid = ray_eval_str(
+      "(.q.as_kind 'datetime 2026.07.10D09:30:00.123000001)");
+  uint8_t *invalid_msg = NULL;
+  int64_t invalid_len = 0;
+  err[0] = '\0';
+  int invalid_rc =
+      invalid && !RAY_IS_ERR(invalid)
+          ? q_encode(invalid, &invalid_msg, &invalid_len, err, sizeof err)
+          : 0;
+  if (invalid == NULL || RAY_IS_ERR(invalid) || invalid_rc >= 0 ||
+      strstr(err, "millisecond-representable") == NULL) {
+    fprintf(stderr,
+            "codec selftest: sub-ms datetime was not rejected: %s\n", err);
+    failures++;
+  }
+  free(invalid_msg);
+  release_any(invalid);
+
+  invalid = ray_eval_str(
+      "(.q.with_kinds (dict ['missing] ['datetime]) "
+      "(table [z] (list [2000.01.01D00:00:00.000000000])))");
+  invalid_msg = NULL;
+  invalid_len = 0;
+  err[0] = '\0';
+  invalid_rc =
+      invalid && !RAY_IS_ERR(invalid)
+          ? q_encode(invalid, &invalid_msg, &invalid_len, err, sizeof err)
+          : 0;
+  if (invalid == NULL || RAY_IS_ERR(invalid) || invalid_rc >= 0 ||
+      strstr(err, "missing was not found") == NULL) {
+    fprintf(stderr,
+            "codec selftest: unknown schema column was not rejected: %s\n",
+            err);
+    failures++;
+  }
+  free(invalid_msg);
+  release_any(invalid);
+
+#if Q_HAVE_TIMESPAN
+  /* Q timespans (KN) are i64 nanoseconds, the same payload as rayforce's
+   * TIMESPAN: a raw copy + re-tag, 0Nn (INT64_MIN) being the null. */
+  {
+    /* -16 atom: 0D00:00:01.000000004 = 1000000004 ns */
+    uint8_t span_atom[] = {0xF0, 0x04, 0xCA, 0x9A, 0x3B, 0, 0, 0, 0};
+    err[0] = '\0';
+    r = q_decode(span_atom, (int64_t)sizeof span_atom, 0, err, sizeof err);
+    if (r == NULL || RAY_IS_ERR(r) || r->type != -RAY_TIMESPAN ||
+        r->i64 != 1000000004LL) {
+      fprintf(stderr, "codec selftest: timespan atom decoded wrong: %s\n", err);
+      failures++;
+    }
+    release_any(r);
+
+    /* -16 atom 0Nn -> the null timespan */
+    uint8_t span_null[] = {0xF0, 0, 0, 0, 0, 0, 0, 0, 0x80};
+    r = q_decode(span_null, (int64_t)sizeof span_null, 0, err, sizeof err);
+    if (r == NULL || RAY_IS_ERR(r) || r->type != -RAY_TIMESPAN ||
+        r->i64 != NULL_I64) {
+      fprintf(stderr, "codec selftest: null timespan decoded wrong: %s\n", err);
+      failures++;
+    }
+    release_any(r);
+
+    /* 16 vector: 1s, 0Nn, 2s; the null gate must be set */
+    uint8_t span_vec[] = {0x10, 0, 3, 0, 0, 0,    0x00, 0xCA, 0x9A, 0x3B, 0, 0,
+                          0,    0, 0, 0, 0, 0,    0,    0,    0,    0x80, 0x00,
+                          0x94, 0x35, 0x77, 0, 0, 0, 0};
+    r = q_decode(span_vec, (int64_t)sizeof span_vec, 0, err, sizeof err);
+    if (r == NULL || RAY_IS_ERR(r) || r->type != RAY_TIMESPAN || r->len != 3 ||
+        ((int64_t *)ray_data(r))[0] != 1000000000LL ||
+        ((int64_t *)ray_data(r))[1] != NULL_I64 ||
+        ((int64_t *)ray_data(r))[2] != 2000000000LL ||
+        !(r->attrs & TEST_ATTR_HAS_NULLS)) {
+      fprintf(stderr, "codec selftest: timespan vector decoded wrong: %s\n",
+              err);
+      failures++;
+    }
+    release_any(r);
+
+    /* Encode: type byte 0xF0 / 0x10, and encode -> decode is the identity for
+     * an atom, a vector with a null, and a table column. */
+    static const struct {
+      const char *what, *src;
+      uint8_t wire_type;
+    } spans[] = {
+        {"timespan atom",
+         "(- 2024.01.02D10:00:01.000000004 2024.01.02D09:00:00.000000000)",
+         0xF0},
+        {"timespan vector",
+         "(- [2024.01.02D10:00:00.000000000 2024.01.02D11:00:00.000000000] "
+         "2024.01.02D09:00:00.000000000)",
+         0x10},
+        {"timespan table",
+         "(table ['a 'b] (list [1 2] (- [2024.01.02D10:00:00.000000000 "
+         "2024.01.02D11:00:00.000000000] 2024.01.02D09:00:00.000000000)))",
+         98},
+    };
+    for (size_t i = 0; i < sizeof spans / sizeof spans[0]; i++) {
+      int64_t m_len = 0;
+      uint8_t *m = encode_expr(spans[i].src, &m_len);
+      ray_t *want = ray_eval_str(spans[i].src);
+      err[0] = '\0';
+      r = m ? q_decode(m + 8, m_len - 8, 0, err, sizeof err) : NULL;
+      if (m == NULL || m[8] != spans[i].wire_type || r == NULL ||
+          RAY_IS_ERR(r) || want == NULL || !fmt_eq(r, want)) {
+        fprintf(stderr, "codec selftest: %s did not round-trip: %s\n",
+                spans[i].what, err);
+        failures++;
+      }
+      release_any(r);
+      release_any(want);
+      free(m);
+    }
+
+    /* A vector holding the null encodes it as 0Nn and comes back a null. */
+    ray_t *nv = ray_vec_new(RAY_TIMESPAN, 2);
+    if (nv != NULL && !RAY_IS_ERR(nv)) {
+      int64_t *d = (int64_t *)ray_data(nv);
+      d[0] = 5;
+      d[1] = NULL_I64;
+      nv->len = 2;
+      ray_vec_set_null(nv, 1, true);
+      int64_t m_len = 0;
+      uint8_t *m = encode_value(nv, &m_len);
+      r = m ? q_decode(m + 8, m_len - 8, 0, err, sizeof err) : NULL;
+      if (r == NULL || RAY_IS_ERR(r) || r->type != RAY_TIMESPAN ||
+          ((int64_t *)ray_data(r))[0] != 5 ||
+          ((int64_t *)ray_data(r))[1] != NULL_I64 ||
+          !(r->attrs & TEST_ATTR_HAS_NULLS)) {
+        fprintf(stderr, "codec selftest: timespan null did not round-trip\n");
+        failures++;
+      }
+      release_any(r);
+      free(m);
+      ray_release(nv);
+    }
+  }
+#else
+  /* Q timespans (KN) are durations, not timestamps. This core has no
    * duration type, so reject them rather than silently changing meaning. */
   const struct {
     const char *name;
@@ -809,6 +1142,7 @@ static int run_codec_selftest(void) {
     }
     release_any(r);
   }
+#endif
 
   failures += cols_codec_checks();
 
@@ -1161,7 +1495,8 @@ static int run_cols_selftest(const char *host, int port) {
     return 1;
   }
 
-  /* Every q type q_decode reads, plus a timespan it rejects, with the
+  /* Every q type q_decode reads (a timespan too where the core has TIMESPAN;
+   * otherwise it is skipped, not kept), with the
    * attributes an HDB carries. Columns are listed out of table order. */
   static const char *setup =
       "t:([] date:2024.01.15 2024.01.15 2024.01.16; sym:`p#`a`a`b; "
@@ -1178,10 +1513,16 @@ static int run_cols_selftest(const char *host, int port) {
       "kt:`id xkey t; big:1000#t; 1b";
   static const struct {
     const char *what, *full, *proj;
-    const char *names[4];
+    const char *names[5];
     int n;
   } cases[] = {
+#if Q_HAVE_TIMESPAN
+      {"q table", "t", "`str`date`px`sym`span#t",
+       {"str", "date", "px", "sym", "span"}, 5},
+#else
+      /* span is in the table but not kept: a core without TIMESPAN skips it */
       {"q table", "t", "`str`date`px`sym#t", {"str", "date", "px", "sym"}, 4},
+#endif
       {"q keyed table", "kt", "(key kt)!`px`str#value kt", {"px", "str"}, 2},
   };
 
@@ -2213,6 +2554,26 @@ static int run_partial_send_selftest(void) {
   q_conn_close(poll, id);
   close(sv[1]);
 
+  /* 4. a hard send error before any byte is written means the peer is gone,
+   * not that the queue is full. The dead handle must not stay registered. */
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0)
+    return 1;
+  id = q_conn_attach(poll, sv[0]);
+  close(sv[1]);
+  err = q_conn_post(poll, id, small);
+  const char *post_msg = ray_error_msg();
+  if (err == NULL || !RAY_IS_ERR(err) || post_msg == NULL ||
+      strstr(post_msg, "post failed; connection closed") == NULL) {
+    fprintf(stderr, "partial send selftest: closed peer got the wrong error\n");
+    failures++;
+  }
+  release_any(err);
+  if (q_conn_is_handle(poll, id)) {
+    fprintf(stderr, "partial send selftest: closed peer left a dead handle\n");
+    failures++;
+    q_conn_close(poll, id);
+  }
+
   release_any(big);
   release_any(small);
   free(rx);
@@ -2224,12 +2585,18 @@ static int run_partial_send_selftest(void) {
 }
 
 int main(int argc, char **argv) {
+  if (argc >= 2 && strcmp(argv[1], "--have-timespan") == 0) {
+    printf("%d\n", Q_HAVE_TIMESPAN);
+    return 0;
+  }
   if (argc >= 2 && strcmp(argv[1], "--partial-send-selftest") == 0)
     return run_partial_send_selftest();
   if (argc >= 2 && strcmp(argv[1], "--conn-identity-selftest") == 0)
     return run_conn_identity_selftest();
   if (argc >= 2 && strcmp(argv[1], "--hooks-teardown-selftest") == 0)
     return run_hooks_teardown_selftest();
+  if (argc >= 2 && strcmp(argv[1], "--readonly-selftest") == 0)
+    return run_readonly_selftest();
   if (argc >= 2 && strcmp(argv[1], "--codec-selftest") == 0)
     return run_codec_selftest();
 
