@@ -2367,11 +2367,11 @@ int q_connect_opts(const char *host, int port, const char *user,
   if (ulen) {
     memcpy(login + off, user, ulen);
     off += ulen;
-    if (plen) {
-      login[off++] = ':';
-      memcpy(login + off, password, plen);
-      off += plen;
-    }
+  }
+  if (plen) {
+    login[off++] = ':';
+    memcpy(login + off, password, plen);
+    off += plen;
   }
   login[off++] = 0x03; /* capability: compression + timestamp + GUID + ... */
   login[off++] = 0x00;

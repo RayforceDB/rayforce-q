@@ -52,6 +52,12 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
 
 ### Fixed
 
+- **A password with an empty username reaches the q handshake.**
+  `q_connect(..., "", "password", ...)` sized space for `:password` but copied
+  it only when the username was non-empty, silently sending the anonymous
+  `03 00` handshake instead. The client now sends the supplied tuple as
+  `:password`, followed by its capability byte and NUL.
+
 - **A hard `.q.post` send failure removes the dead handle.** When the peer had
   already closed and the first direct send failed before writing any bytes,
   `.q.post` reported a queue or allocation failure and left the unusable
