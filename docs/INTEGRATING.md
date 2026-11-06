@@ -271,3 +271,34 @@ pull_q:
 	fi
 	cp tmp/rayforce-q/q.* <your-native-src-dir>/   # picked up by your build
 ```
+
+## 4. Serving: inbound requests and the WAL
+
+With a journal open (`.log.open`, `-l`/`-L`), every inbound **sync** q request is written to the WAL before it is evaluated (async frames are not), so a crash mid-handler still leaves the request on disk and `.log.replay` rebuilds the state. A request that only reads pays for that too: a health probe or a `get_seq` poll adds its bytes to the log on every call and is re-evaluated on every replay (measured: 200 polls of a 1-argument read added 12 800 bytes).
+
+### Read-only requests: `.q.readonly`
+
+The write has to precede the evaluation to be crash-safe, so "do not journal this one" cannot be decided afterwards, from the handler or from the result. It has to be known from the request alone. The embedder therefore declares the heads of its pure reads up front:
+
+```
+(.q.readonly ['get_seq 'app.status])   ;; set the process-wide allow-list, returns it
+(.q.readonly)                          ;; the current list (a symbol vector)
+(.q.readonly [])                       ;; clear: back to journaling everything
+```
+
+In C: `q_readonly_set(syms)`, `q_readonly_get()`, `q_readonly_forget()` (see `q_server.h`).
+
+A sync request is **not journaled** when it is
+
+- a call list `` (`get_seq;args...) `` or an all-symbol call vector `` `get_seq`a `` whose head symbol is in the list, or
+- a string that is exactly one form headed by a listed name: `"(get_seq 1)"`, `"get_seq"`, with only blanks and `;` comments around it. A string holding a second form (`"(get_seq 1) (set x 1)"`), an unbalanced form, or a char literal the scanner cannot read past is journaled as before, since a string may carry any number of forms and all of them run.
+
+Such a request is dispatched exactly as today, `.q.on 'sync` hook included; only the journal write is skipped. Every other request, and every async frame, is unchanged.
+
+The contract:
+
+- The embedder promises the listed heads are **pure reads**. A mutation under a listed head is not journaled and is **lost on replay, by design**; nothing checks the promise.
+- Only the **head** is examined. A request with a listed head and nested calls, for example `"(get_seq (bump 0))"`, is not journaled and the nested `bump` still runs, unrecorded. List only heads whose arguments are data.
+- Nothing is persisted. The list is process-wide and lives as long as the runtime (`q_env_register()` drops what an earlier runtime left). Set it at load time, before the listener opens, like the hooks; it takes effect for the requests that arrive after the call. `.q.readonly` is a restricted builtin, so a restricted (remote) evaluation cannot change it.
+- The default is the empty list: every sync request is journaled, as before.
+- Replay is unaffected: unlisted requests, hooked ones included, are recorded and replayed as they were; the unrecorded reads have nothing to replay. `.q.dispatch_sync` is not involved.

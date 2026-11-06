@@ -111,6 +111,9 @@ echo "running journal bound selftest..."
 echo "running hooks teardown selftest..."
 "$DRIVER" --hooks-teardown-selftest
 
+echo "running read-only allow-list selftest..."
+"$DRIVER" --readonly-selftest
+
 echo "running connection identity selftest..."
 "$DRIVER" --conn-identity-selftest
 
@@ -336,6 +339,27 @@ with socket.create_connection((host, port), 1.0) as s:
 
 print(f"partial-frame memory check ok ({delta_kib} KiB growth)")
 PY
+fi
+
+# ---- Leg 1b: the read-only allow-list (.q.readonly), no q needed
+# A WAL is open on a private server (its own working directory, so the journal
+# base is a relative path); the rfl file counts journal chunks with
+# .log.validate. Needs the core's auto-journal scope, or every sync request is
+# refused once a journal is open.
+if grep -q RAY_IPC_HAS_SET_AUTO_JOURNAL_EVAL "${CORE_SRC:-/nonexistent}/core/ipc.h" 2>/dev/null; then
+  echo "running read-only allow-list tests (WAL open) ..."
+  ROPORT="$(free_port)"
+  mkdir -p "$WORK/readonly"
+  DRIVER_ABS="$(cd "$(dirname "$DRIVER")" && pwd)/$(basename "$DRIVER")"
+  (cd "$WORK/readonly" && exec "$DRIVER_ABS" --serve "$ROPORT" 2>"$WORK/readonly.err") &
+  ROPID=$!
+  PIDS+=("$ROPID")
+  wait_for_port "$HOST" "$ROPORT" || { echo "read-only server did not come up" >&2; exit 1; }
+  "$DRIVER" --host "$HOST" --port "$ROPORT" "$RFL_DIR"/wal/*.rfl
+  kill "$ROPID" 2>/dev/null || true
+  wait "$ROPID" 2>/dev/null || true
+else
+  echo "SKIP: core has no ray_ipc_set_auto_journal_eval - skipping read-only allow-list tests"
 fi
 
 # ---- Leg 2: real-q interop against Rayforce server
@@ -667,6 +691,72 @@ WH_PORT_A1="$WH_PORT_A1" WH_PORT_B1="$WH_PORT_B1" WH_PORT_A2="$WH_PORT_A2" WH_PO
   WH_BASE1="$WHDIR/one" WH_BASE2="$WHDIR/two" \
   QHOME="${QHOME:-$(q_home_for "$QBIN")}" "$QBIN" "$WHDIR/walhook.q" -q < /dev/null
 for p in "${WH_PIDS[@]}"; do kill "$p" 2>/dev/null || true; wait "$p" 2>/dev/null || true; done
+fi
+
+# ---- Leg 2b'': the read-only allow-list against a real q client
+# 200 polls of a declared read must leave the log's size unchanged, every other
+# request is journaled as before, and a mutation hidden under a declared head is
+# lost on replay (the embedder's promise, documented). The same polls without
+# the allow-list are measured first, for the before/after of the change.
+if [ "$HASSCOPE" = "1" ]; then
+echo "real-q read-only allow-list: journal size with and without .q.readonly ..."
+RODIR="$WORK/roq"; mkdir -p "$RODIR"
+ROQ_PIDS=()
+for nm in A B; do
+  port="$(free_port)"
+  "$DRIVER" --serve "$port" 2>"$RODIR/$nm.err" &
+  ROQ_PIDS+=("$!"); PIDS+=("$!")
+  wait_for_port "$HOST" "$port" || { echo "read-only server $nm did not come up" >&2; exit 1; }
+  eval "ROQ_PORT_$nm=$port"
+done
+cat > "$RODIR/roq.q" <<'QEOF'
+base:getenv`RO_BASE
+names:();oks:()
+T:{[nm;b] names,:enlist nm; oks,:enlist b}
+sz:{hcount `$":",base,".log"}
+a:hopen `$":127.0.0.1:",getenv`RO_PORT_A
+r:a"(do (set n 0) (set get_seq (fn [x] n)) (set bump (fn [x] (set n (+ n 1)))) 1)"
+r:a"(.log.open 'sync \"",base,"\")"
+polls:{do[200; a(`get_seq;0)]}
+s0:sz[]; polls[]; s1:sz[]
+-1 "before: 200 get_seq polls grew the journal ",string[s1-s0]," bytes (",string[s0]," -> ",string[s1],")";
+T["without the list every poll is journaled"; s1>s0]
+r:a"(.q.readonly ['get_seq 'app.status])"
+T["the list reads back"; (`get_seq`app.status)~a"(.q.readonly)"]
+s2:sz[]
+polls[]
+r:a`get_seq`n                        / an all-symbol call vector
+r:a"(get_seq 0)"
+r:a"(get_seq 0) ; a comment"
+s3:sz[]
+-1 "after:  200 get_seq polls grew the journal ",string[s3-s2]," bytes (",string[s2]," -> ",string[s3],")";
+T["declared reads leave the journal untouched (call list, symbol vector, string)"; s3=s2]
+r:a(`bump;0)
+T["other requests are still journaled"; sz[]>s3]
+s4:sz[]
+r:a"(get_seq 0) (get_seq 0)"         / two forms: not one read, journaled
+T["a string with a second form is journaled"; sz[]>s4]
+s4:sz[]
+r:a"(get_seq (bump 0))"              / documented: a nested mutation under a listed head is not journaled
+T["nested mutation under a listed head: not journaled"; sz[]=s4]
+T["live state"; 2~a"n"]
+r:a"(.q.readonly ['get_seq])"; r:a"(.q.readonly (take 'sym 0))"
+s5:sz[]; r:a(`get_seq;0)
+T["cleared: journaled again"; sz[]>s5]
+hclose a
+b:hopen `$":127.0.0.1:",getenv`RO_PORT_B
+r:b"(do (set n 0) (set get_seq (fn [x] n)) (set bump (fn [x] (set n (+ n 1)))) 1)"
+n:b"(.log.replay \"",base,".log\")"
+T["replay: the journaled bump ran, the unjournaled nested one did not"; 1~b"n"]
+hclose b
+bad:names where not oks
+if[count bad; -2 "q read-only allow-list FAILED: ",", " sv bad; exit 1]
+-1 "q read-only allow-list ok (",(string count names)," assertions)"
+exit 0
+QEOF
+RO_PORT_A="$ROQ_PORT_A" RO_PORT_B="$ROQ_PORT_B" RO_BASE="$RODIR/ro" \
+  QHOME="${QHOME:-$(q_home_for "$QBIN")}" "$QBIN" "$RODIR/roq.q" -q < /dev/null
+for p in "${ROQ_PIDS[@]}"; do kill "$p" 2>/dev/null || true; wait "$p" 2>/dev/null || true; done
 fi
 
 # ---- Leg 2c: inbound connections -- .q.handle, .q.post, .q.on hooks
