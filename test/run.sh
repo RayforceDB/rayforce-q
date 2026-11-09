@@ -204,6 +204,58 @@ with socket.create_connection((host, port), 1.0) as s:
         raise SystemExit("empty sync frame was answered")
 PY
 
+echo "checking a raised error does not leak into the next request..."
+python3 - "$HOST" "$SERVERPORT" <<'PY'
+import socket
+import struct
+import sys
+
+host, port = sys.argv[1], int(sys.argv[2])
+
+def read_frame(sock):
+    hdr = b''
+    while len(hdr) < 8:
+        chunk = sock.recv(8 - len(hdr))
+        if not chunk:
+            raise SystemExit("raise-scope test: server closed the connection")
+        hdr += chunk
+    body = b''
+    while len(body) < struct.unpack("<I", hdr[4:])[0] - 8:
+        chunk = sock.recv(1)
+        if not chunk:
+            raise SystemExit("raise-scope test: truncated response")
+        body += chunk
+    return body
+
+def chars(text):
+    text = text.encode()
+    return bytes([10, 0]) + struct.pack("<I", len(text)) + text
+
+def sync(body):
+    return struct.pack("<BBBBI", 1, 1, 0, 0, 8 + len(body)) + body
+
+# One connection, sequential: request 1 raises OLD and is answered; request 2
+# then fails while decoding (a complete object followed by a stray byte), before
+# anything is evaluated. Its reply must carry its own error, not request 1's
+# raise.
+with socket.create_connection((host, port), 2.0) as s:
+    s.sendall(bytes([3, 0]))
+    if s.recv(1) != bytes([3]):
+        raise SystemExit("bad Q handshake response")
+    s.sendall(sync(chars('(raise "OLD")')))
+    first = read_frame(s)
+    if first[:1] != b'\x80' or (b'OLD' not in first and b'domain' not in first):
+        raise SystemExit(f"raise-scope test: request 1 was not its raise: {first!r}")
+    s.sendall(sync(bytes([101, 0, 0])))
+    second = read_frame(s)
+    if second[:1] != b'\x80' or b'trailing bytes' not in second or b'OLD' in second:
+        raise SystemExit(f"raise-scope test: request 2 got the wrong error: {second!r}")
+    s.sendall(sync(chars('(+ 1 2)')))
+    third = read_frame(s)
+    if third != bytes([0xf9]) + struct.pack("<q", 3):
+        raise SystemExit(f"raise-scope test: connection unusable afterwards: {third!r}")
+PY
+
 echo "checking unknown Q message type handling..."
 python3 - "$HOST" "$SERVERPORT" <<'PY'
 import socket
