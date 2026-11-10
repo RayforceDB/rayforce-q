@@ -79,6 +79,15 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
 
 ### Fixed
 
+- **A `-q` listener with a startup script no longer ends with the script.**
+  The core's `main()` keeps a process running for its own `-p` listener only,
+  so `rayforce -q 127.0.0.1:PORT script.rfl </dev/null` ran the script and
+  exited 0 unless `-i` was given, taking the listener with it. `make rayforce`
+  now patches the same conditions to count a `-q` listener too (a failed
+  startup script is fatal, a script is followed by the event loop, and with no
+  terminal and no script the process serves without a REPL), and fails the
+  build if the patch no longer applies. `make check-binary` runs
+  `test/binary.sh` against the built binary.
 - **A password with an empty username reaches the q handshake.**
   `q_connect(..., "", "password", ...)` sized space for `:password` but copied
   it only when the username was non-empty, silently sending the anonymous

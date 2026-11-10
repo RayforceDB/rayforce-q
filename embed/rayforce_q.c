@@ -356,6 +356,12 @@ void q_env_register(void) {
   ray_release(f);
 }
 
+/* Whether `-q` started a listener. The core's main() keeps a process alive
+ * for its own `-p` listener only; the patched main() asks this too, so a
+ * process serving Q is not taken for a one-shot script. */
+static int q_listening;
+int q_serve_active(void) { return q_listening; }
+
 /* Folded entry point, called from the rayforce binary's main().
  * Returns the listener id on success, 0 when no Q-server flag is present,
  * or -1 when a Q-server flag is malformed or cannot be started. */
@@ -398,7 +404,9 @@ int64_t q_serve_from_args(ray_poll_t *poll, int argc, char **argv) {
         bind_host = getenv("RAYFORCE_Q_BIND_HOST");
       if (bind_host == NULL || *bind_host == '\0')
         bind_host = "127.0.0.1";
-      return q_serve_at(poll, bind_host, port);
+      int64_t id = q_serve_at(poll, bind_host, port);
+      q_listening = id >= 0;
+      return id;
     }
   }
   return 0;

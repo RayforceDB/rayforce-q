@@ -46,6 +46,8 @@ The server is exposed via the `-q PORT` flag — it shares the REPL's event loop
 RAYFORCE_Q_BIND_HOST=10.0.0.5 ./rayforce -q 25565   # env fallback when -q has no host
 ```
 
+Like `-p`, a `-q` listener keeps the process running after a startup script (`./rayforce -q 25565 init.rfl`); a startup script that fails is fatal (exit 1) unless `-i` is given, and with no script and no terminal the process serves without a REPL.
+
 An empty (or whitespace-only) request answers `(::)`, like kdb's `h ""`. An error's text travels with its category, so q sees `'domain: custom failure`. With a journal open (`.log.open`, `-l`/`-L`) every inbound **sync** q frame is journaled before it is evaluated, exactly as the core does for native IPC, and a failed journal write refuses the request with an `io` error; async frames are not journaled.
 
 **Inbound connections** get the same handle, push and hook verbs as outbound ones, enough for a kdb-compatible pub/sub server:
