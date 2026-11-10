@@ -79,6 +79,18 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
 
 ### Fixed
 
+- **`(.sys.build)` reports the core's version, not `0.0.0`.** The core takes its
+  version from the newest `vX.Y.Z` tag of the checkout it is built in; the
+  shallow clone has no tags and `RAYFORCE_LOCAL_PATH` copies without `.git`, so
+  every `make rayforce` binary said `0.0.0`. `make rayforce` now passes the core
+  its own `RAY_VERSION` override: `RAYFORCE_REF=vX.Y.Z` gives that version, any
+  other ref (a branch or a commit) gives the newest `vX.Y.Z` tag of the core's
+  repository, as the core's own Makefile picks in a full clone, read with
+  `git ls-remote` from `RAYFORCE_GITHUB` (or from `RAYFORCE_LOCAL_PATH` when it
+  is a git checkout). `make rayforce RAY_VERSION=X.Y.Z` sets it explicitly. If no
+  tag can be read (offline, or a local copy without `.git`) the build warns and
+  the version stays `0.0.0`. The tags are read only by `make rayforce`, not by
+  `make test`, `lint` or `clean`. `make check-binary` asserts the version.
 - **A `-q` listener with a startup script no longer ends with the script.**
   The core's `main()` keeps a process running for its own `-p` listener only,
   so `rayforce -q 127.0.0.1:PORT script.rfl </dev/null` ran the script and

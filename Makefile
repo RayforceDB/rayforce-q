@@ -12,6 +12,10 @@
 #   RAYFORCE_GITHUB      core git URL (default: public repo)
 #   RAYFORCE_REF         branch/tag to check out (optional)
 #   RAYFORCE_LOCAL_PATH  rsync this checkout instead of cloning
+#   RAY_VERSION          version `(.sys.build)` reports. Default: RAYFORCE_REF
+#                        when it is a vX.Y.Z tag, else the newest vX.Y.Z tag of
+#                        the core's repository (what the core's own Makefile
+#                        picks in a full clone); 0.0.0 if no tag can be read
 
 UNAME_S := $(shell uname -s)
 ROOT    := $(shell pwd)
@@ -81,7 +85,17 @@ rayforce: pull_core
 		mv $(CORE)/src/app/main.c.q $(CORE)/src/app/main.c
 	@test "$$(grep -c 'q_serve_active())' $(CORE)/src/app/main.c)" -eq 4 || \
 		{ echo "main.c: the -q keep-alive patch did not apply to this core" >&2; exit 1; }
-	@$(MAKE) -C $(CORE) release
+	@ver='$(RAY_VERSION)'; ref='$(RAYFORCE_REF)'; \
+	if [ -z "$$ver" ] && [ -z "$(RAYFORCE_LOCAL_PATH)" ] && printf '%s' "$$ref" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$$'; then \
+		ver=$${ref#v}; \
+	fi; \
+	if [ -z "$$ver" ]; then \
+		ver=$$(git ls-remote --tags --refs "$(or $(RAYFORCE_LOCAL_PATH),$(RAYFORCE_GITHUB))" 'v[0-9]*.[0-9]*.[0-9]*' 2>/dev/null | \
+			sed 's@.*refs/tags/v@@' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$$' | \
+			sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1); \
+	fi; \
+	[ -n "$$ver" ] || echo "warning: no core version tag readable, the binary will report 0.0.0" >&2; \
+	$(MAKE) -C $(CORE) release $${ver:+RAY_VERSION=$$ver}
 	@cp $(CORE)/rayforce ./rayforce
 	@if [ "$(UNAME_S)" = "Darwin" ]; then codesign --force --sign - ./rayforce >/dev/null 2>&1 || true; fi
 	@echo './rayforce is ready'

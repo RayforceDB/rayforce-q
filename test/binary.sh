@@ -82,4 +82,14 @@ echo "listener plus a startup script that fails:"
 check "-p exits non-zero" "$(fails_fast -p "$WORK/bad.rfl")"
 check "-q exits non-zero" "$(fails_fast -q "$WORK/bad.rfl")"
 
+echo "version (needs the core's tags: network when the binary was built):"
+echo '(println (.sys.build))' > "$WORK/b.rfl"
+build="$("$BIN" "$WORK/b.rfl" </dev/null 2>&1)"
+echo "  $build"
+case "$build" in
+  *'version:"0.0.0"'*) check "(.sys.build) reports the core's version" no ;;
+  *'version:"'[0-9]*.[0-9]*.[0-9]*'"'*) check "(.sys.build) reports the core's version" ok ;;
+  *) check "(.sys.build) reports the core's version" no ;;
+esac
+
 exit "$fail"
