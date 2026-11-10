@@ -183,6 +183,8 @@ static int run_readonly_selftest(void) {
   return failures ? 1 : 0;
 }
 
+int q_auth_flag_with_listener(int argc, char **argv);
+
 static int run_q_cli_selftest(void) {
   ray_runtime_t *rt = ray_runtime_create(0, NULL);
   if (rt == NULL) {
@@ -220,6 +222,42 @@ static int run_q_cli_selftest(void) {
   if (q_serve_from_args(poll, 3, empty_port) >= 0)
     failures++;
   if (q_serve_from_args(poll, 3, bad_host) >= 0) /* never widens to wildcard */
+    failures++;
+
+  /* -u/-U next to the q listener warns; `--`, option values and a lone
+   * native listener do not. */
+  char *a_qu[] = {"rayforce", "-q", "25999", "-u", "x"};
+  char *a_uq[] = {"rayforce", "-u", "x", "--q-serve", "25999"};
+  char *a_qU[] = {"rayforce", "-q", "25999", "-U", "x"};
+  char *a_last[] = {"rayforce", "-U", "x", "-q", "25999", "-u", "y"};
+  char *a_q[] = {"rayforce", "-q", "25999"};
+  char *a_pu[] = {"rayforce", "-p", "25999", "-u", "x"};
+  char *a_dd[] = {"rayforce", "app.rfl", "--", "-q", "1", "-u", "x"};
+  char *a_ddq[] = {"rayforce", "-q", "25999", "--", "-u", "x"};
+  char *a_qval[] = {"rayforce", "-q", "-u", "-p", "25999"};
+  char *a_uval[] = {"rayforce", "-u", "-q", "-p", "25999"};
+  char *a_fval[] = {"rayforce", "-f", "-U", "-q", "25999"};
+  if (q_auth_flag_with_listener(5, a_qu) != 'u')
+    failures++;
+  if (q_auth_flag_with_listener(5, a_uq) != 'u')
+    failures++;
+  if (q_auth_flag_with_listener(5, a_qU) != 'U')
+    failures++;
+  if (q_auth_flag_with_listener(7, a_last) != 'u')
+    failures++;
+  if (q_auth_flag_with_listener(3, a_q) != 0)
+    failures++;
+  if (q_auth_flag_with_listener(5, a_pu) != 0)
+    failures++;
+  if (q_auth_flag_with_listener(7, a_dd) != 0)
+    failures++;
+  if (q_auth_flag_with_listener(6, a_ddq) != 0)
+    failures++;
+  if (q_auth_flag_with_listener(5, a_qval) != 0) /* "-u" is -q's value */
+    failures++;
+  if (q_auth_flag_with_listener(5, a_uval) != 0) /* "-q" is -u's value */
+    failures++;
+  if (q_auth_flag_with_listener(5, a_fval) != 0) /* "-U" is -f's value */
     failures++;
 
   ray_poll_destroy(poll);

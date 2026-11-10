@@ -356,6 +356,60 @@ void q_env_register(void) {
   ray_release(f);
 }
 
+/* Which core options take a value, mirrored from the core's main() option
+ * table (src/app/main.c): the value is the next argv word, whatever it
+ * looks like, so a "-u" in value position is data, not the flag. `-q` /
+ * `--q-serve` is rayforce-q's own and takes one too. */
+static int q_opt_takes_value(const char *a) {
+  static const char *const with_value[] = {
+      "-p", "--port",     "-c", "--cores", "-t", "--timeit", "-Q", "--querylog",
+      "-f", "--file",     "-u", "-U",      "-l", "-L",       "-m", "--mem",
+      "-q", "--q-serve",  NULL};
+  for (int k = 0; with_value[k] != NULL; k++)
+    if (strcmp(a, with_value[k]) == 0)
+      return 1;
+  return 0;
+}
+
+/* Whether the command line combines a q listener with a native-IPC
+ * password: 0 when it does not, else 'u' or 'U' for the password flag that
+ * wins (the core keeps the last one). Words after `--` belong to the
+ * script, and an option's value is skipped, so neither can be mistaken for
+ * a flag. Pure: it reads argv and prints nothing, so the password value is
+ * never touched. */
+int q_auth_flag_with_listener(int argc, char **argv) {
+  int listener = 0, flag = 0;
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--") == 0)
+      break;
+    if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--q-serve") == 0)
+      listener = 1;
+    else if (strcmp(argv[i], "-u") == 0)
+      flag = 'u';
+    else if (strcmp(argv[i], "-U") == 0)
+      flag = 'U';
+    if (q_opt_takes_value(argv[i]))
+      i++;
+  }
+  return listener ? flag : 0;
+}
+
+/* One value-free line on stderr: the q listener never checks the -u/-U
+ * password (native IPC, -p, does), but -U still restricts what q requests
+ * may evaluate. */
+static void q_warn_listener_auth(int flag) {
+  if (flag == 'U')
+    fprintf(stderr,
+            "q: warning: -U does not password-protect the q listener: the "
+            "password applies to native IPC (-p) only, any q client can "
+            "connect; -U still restricts what q requests may evaluate\n");
+  else if (flag == 'u')
+    fprintf(stderr,
+            "q: warning: -u does not password-protect the q listener: the "
+            "password applies to native IPC (-p) only, any q client can "
+            "connect\n");
+}
+
 /* Folded entry point, called from the rayforce binary's main().
  * Returns the listener id on success, 0 when no Q-server flag is present,
  * or -1 when a Q-server flag is malformed or cannot be started. */
@@ -398,7 +452,10 @@ int64_t q_serve_from_args(ray_poll_t *poll, int argc, char **argv) {
         bind_host = getenv("RAYFORCE_Q_BIND_HOST");
       if (bind_host == NULL || *bind_host == '\0')
         bind_host = "127.0.0.1";
-      return q_serve_at(poll, bind_host, port);
+      int64_t id = q_serve_at(poll, bind_host, port);
+      if (id >= 0)
+        q_warn_listener_auth(q_auth_flag_with_listener(argc, argv));
+      return id;
     }
   }
   return 0;

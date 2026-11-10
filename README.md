@@ -46,6 +46,8 @@ The server is exposed via the `-q PORT` flag — it shares the REPL's event loop
 RAYFORCE_Q_BIND_HOST=10.0.0.5 ./rayforce -q 25565   # env fallback when -q has no host
 ```
 
+**The q listener does not authenticate.** `-u PW` / `-U PW` set the password of the native IPC listener (`-p`) only; the q handshake accepts any login, so every client that can reach a `-q` port may connect, whatever `-u`/`-U` say. `-U` still does what it says for evaluation: q requests run in the restricted mode. Starting with `-q` and `-u`/`-U` prints a one-line warning on stderr (never the password); mixed `-p` + `-q` deployments are unchanged. Keep the q port on loopback (the default) or behind your own network controls.
+
 An empty (or whitespace-only) request answers `(::)`, like kdb's `h ""`. An error's text travels with its category, so q sees `'domain: custom failure`. With a journal open (`.log.open`, `-l`/`-L`) every inbound **sync** q frame is journaled before it is evaluated, exactly as the core does for native IPC, and a failed journal write refuses the request with an `io` error; async frames are not journaled.
 
 **Inbound connections** get the same handle, push and hook verbs as outbound ones, enough for a kdb-compatible pub/sub server:

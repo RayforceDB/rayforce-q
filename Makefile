@@ -71,9 +71,13 @@ rayforce: pull_core
 	@cp q.c q.h q_server.c q_server.h embed/rayforce_q.c $(CORE)/src/q/
 	@sed -e 's@ray_runtime_t\* rt = ray_runtime_create(argc, argv);@& extern void q_env_register(void); if (rt) q_env_register();@' \
 	     -e 's@        else if (strcmp(argv\[i\], "--") == 0)@        else if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--q-serve") == 0) { if (i + 1 < argc) i++; } &@' \
+	     -e 's@set plain auth password\\n@set plain auth password (native IPC only; not checked by -q)\\n@' \
+	     -e 's@set restricted auth password\\n@set restricted auth password (native IPC only; -q does not check it, but -U still restricts q requests)\\n  -q, --q-serve [HOST:]PORT  serve Rayfall over the q wire (loopback unless HOST given)\\n@' \
 	     -e 's@if (poll) ray_runtime_set_poll(poll);@if (poll) { ray_runtime_set_poll(poll); extern int64_t q_serve_from_args(ray_poll_t*, int, char**); if (q_serve_from_args(poll, argc, argv) < 0) { rc = 2; goto done; } }@' \
 		$(CORE)/src/app/main.c > $(CORE)/src/app/main.c.q && \
 		mv $(CORE)/src/app/main.c.q $(CORE)/src/app/main.c
+	@grep -q 'not checked by -q' $(CORE)/src/app/main.c || \
+		echo "note: core help text changed; the -u/-U help qualification did not apply" >&2
 	@$(MAKE) -C $(CORE) release
 	@cp $(CORE)/rayforce ./rayforce
 	@if [ "$(UNAME_S)" = "Darwin" ]; then codesign --force --sign - ./rayforce >/dev/null 2>&1 || true; fi

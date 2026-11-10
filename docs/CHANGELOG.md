@@ -79,6 +79,17 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
 
 ### Fixed
 
+- **`-u`/`-U` with `-q` now warns that the q listener is not password-protected.**
+  The passwords belong to the native IPC listener (`-p`); the q handshake
+  reads the login but never checks it, so `-q 5000 -u secret` left the port
+  open while the core help said only "set ... auth password". Startup now
+  prints one value-free line on stderr (the password is never printed) saying
+  so, and for `-U` that it still restricts q request evaluation; the help text
+  and README say the flags are native IPC only. The option scan stops at `--`
+  and skips option values, so a script argument or a `-q`/`-f` value spelled
+  `-u` does not trigger it. Authentication and the `-U` restriction are
+  unchanged; password checking on the q handshake needs a core API and is not
+  part of this change.
 - **A password with an empty username reaches the q handshake.**
   `q_connect(..., "", "password", ...)` sized space for `:password` but copied
   it only when the username was non-empty, silently sending the anonymous
