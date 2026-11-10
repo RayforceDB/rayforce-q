@@ -4,12 +4,15 @@
 #   make recheck    # re-run the suite against an already-built core
 #   make rayforce   # build a rayforce binary with the Q IPC client+server in
 #   make lint       # clang-format the sources
+#   make check-core-ref   # RAYFORCE_REF takes a branch, a tag and a commit hash
 #
 #   RAYFORCE_LOCAL_PATH=/path/to/core make test   # use a local core checkout
 #
 # Variables:
 #   RAYFORCE_GITHUB      core git URL (default: public repo)
-#   RAYFORCE_REF         branch/tag to check out (optional)
+#   RAYFORCE_REF         branch, tag or full commit hash (40 hex digits) to
+#                        check out (optional; default: the core's default branch);
+#                        a hash needs a server that serves commits by hash
 #   RAYFORCE_LOCAL_PATH  rsync this checkout instead of cloning
 
 UNAME_S := $(shell uname -s)
@@ -45,9 +48,21 @@ pull_core:
 			"$(RAYFORCE_LOCAL_PATH)/" "$(CORE)/"; \
 	else \
 		echo "⬇️  Cloning rayforce core from $(RAYFORCE_GITHUB)..."; \
-		git clone $(if $(RAYFORCE_REF),--branch $(RAYFORCE_REF)) \
-			--depth 1 $(RAYFORCE_GITHUB) "$(CORE)"; \
+		if printf '%s' "$(RAYFORCE_REF)" | grep -Eq '^([0-9a-f]{40}|[0-9a-f]{64})$$'; then \
+			git init -q "$(CORE)" && \
+			git -C "$(CORE)" fetch -q --depth 1 $(RAYFORCE_GITHUB) "$(RAYFORCE_REF)" && \
+			git -C "$(CORE)" checkout -q FETCH_HEAD; \
+		else \
+			git clone $(if $(RAYFORCE_REF),--branch $(RAYFORCE_REF)) \
+				--depth 1 $(RAYFORCE_GITHUB) "$(CORE)"; \
+		fi; \
 	fi
+
+# RAYFORCE_REF must reach a branch, a tag and a commit hash (needs network)
+check-core-ref:
+	@./test/core_ref.sh
+
+.PHONY: check-core-ref
 
 test: pull_core
 	@echo "🔨 Building librayforce.a..."
