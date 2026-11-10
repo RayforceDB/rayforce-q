@@ -362,9 +362,9 @@ void q_env_register(void) {
  * `--q-serve` is rayforce-q's own and takes one too. */
 static int q_opt_takes_value(const char *a) {
   static const char *const with_value[] = {
-      "-p", "--port",     "-c", "--cores", "-t", "--timeit", "-Q", "--querylog",
-      "-f", "--file",     "-u", "-U",      "-l", "-L",       "-m", "--mem",
-      "-q", "--q-serve",  NULL};
+      "-p",         "--port", "-c",     "--cores",   "-t", "--timeit", "-Q",
+      "--querylog", "-f",     "--file", "-u",        "-U", "-l",       "-L",
+      "-m",         "--mem",  "-q",     "--q-serve", NULL};
   for (int k = 0; with_value[k] != NULL; k++)
     if (strcmp(a, with_value[k]) == 0)
       return 1;
