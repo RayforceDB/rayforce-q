@@ -69,6 +69,14 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
 
 ### Changed
 
+- **`make rayforce` / `make test` accept a core commit in `RAYFORCE_REF`.**
+  `RAYFORCE_REF` was handed to `git clone --branch`, which takes a branch or a
+  tag only. A value of 40 (or 64) hex digits is now fetched at depth 1 and
+  checked out instead, so a build can be pinned to a core commit
+  (`make rayforce RAYFORCE_REF=<full hash>`). A branch or a tag is cloned as
+  before, and so is the unset case (the tip of the core's default branch). The
+  server must allow fetching a commit by hash (GitHub does).
+  `make check-core-ref` checks a branch, a tag and a hash against the network.
 - **`-q` listens on loopback by default.** The q listener bound every
   interface. `rayforce -q [HOST:]PORT` now binds `HOST` (mirroring the core's
   `--port HOST:PORT`), else `$RAYFORCE_Q_BIND_HOST`, else `127.0.0.1`; pass
