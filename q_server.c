@@ -917,27 +917,31 @@ static int q_queue_frame(ray_poll_t *poll, ray_selector_t *sel, uint8_t *buf,
   return 0;
 }
 
-static int q_send_result(ray_poll_t *poll, ray_selector_t *sel, ray_t *result) {
+/* `evaluated`: `result` is what evaluating this request produced. The pending
+ * raise is only that evaluation's; a decode failure, a malformed frame or a
+ * refused journal write never ran it, so those keep their own error text. */
+static int q_send_result(ray_poll_t *poll, ray_selector_t *sel, ray_t *result,
+                         int evaluated) {
   uint8_t *buf = NULL;
   int64_t len = 0;
   char err[128] = {0};
-  /* An error object carries only its category. The explanation is either the
-   * runtime's last-error message or, for an uncaught (raise x), the pending
-   * raised value (as the REPL prints it). Load it into the last-error slot
-   * right before q_encode, which frames it as "category: message" so a q
-   * client sees `'domain: custom failure` rather than a bare `'domain`. */
+  /* An error object carries only its category. An uncaught (raise x) also
+   * leaves the raised value in a separate VM slot; render that value as the
+   * whole Q error text, matching kdb+'s `'<x>` rather than exposing Rayforce's
+   * internal `domain` category. Ordinary engine errors still carry
+   * "category: message" from the runtime's last-error slot. */
   ray_t *loaded = NULL;
   if (result != NULL && RAY_IS_ERR(result)) {
     char raised[256];
-    const char *detail = ray_error_msg();
-    if (detail == NULL && Q_HAVE_RAISE(ray_raise_render) &&
-        ray_raise_render(raised, sizeof raised))
-      detail = raised;
+    int uncaught_raise = evaluated && Q_HAVE_RAISE(ray_raise_render) &&
+                         ray_raise_render(raised, sizeof raised);
+    const char *detail = uncaught_raise ? raised : ray_error_msg();
     if (detail != NULL) {
       char text[256];
       snprintf(text, sizeof text, "%s", detail);
       const char *code = ray_err_code(result);
-      loaded = ray_error(code ? code : "error", "%s", text);
+      loaded = ray_error(uncaught_raise ? "" : (code ? code : "error"), "%s",
+                         text);
       result = loaded;
     }
   }
@@ -1158,6 +1162,14 @@ static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
     return NULL;
   }
 
+  /* The pending raise belongs to one request. A leftover from an earlier one
+   * must not reach this request's reply, so drop it before anything here can
+   * fail. Only the outermost request: a handler that pumps this connection
+   * from inside another evaluation (see q_current_handle) must not lose the
+   * enclosing evaluation's state. */
+  if (q_current_handle < 0)
+    q_raise_clear();
+
   /* q_decode fully materializes the request into ray_t objects, so the rx
    * buffer is free to reuse the moment it returns. */
   q_header_t hdr = cd->hdr;
@@ -1237,6 +1249,7 @@ static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
   bool prev_restricted = ray_eval_get_restricted();
   ray_eval_set_restricted(cd->restricted != 0);
   ray_t *result = NULL;
+  int evaluated = 0; /* result came from evaluating req */
   int journaled = req && !RAY_IS_ERR(req) && hdr.msgtype == Q_MSG_SYNC &&
                   ray_journal_is_open() && !q_readonly_request(req);
   /* Source text is a much wider authority than a subscriber or restricted
@@ -1255,6 +1268,7 @@ static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
 #else
     (void)journaled;
 #endif
+    evaluated = req != NULL && !RAY_IS_ERR(req);
     result = req ? eval_request(req, hdr.msgtype)
                  : ray_error("q server: malformed request", "%s",
                              err[0] ? err : "q server: decode failed");
@@ -1273,7 +1287,7 @@ static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
      * its slot before the reply is queued: the slot id alone would send this
      * reply to the newcomer, or drop it on a send failure. */
     ray_selector_t *cur = q_conn_selector(poll, id, gen);
-    if (cur && q_send_result(poll, cur, result) < 0 &&
+    if (cur && q_send_result(poll, cur, result, evaluated) < 0 &&
         q_conn_selector(poll, id, gen) != NULL) /* may be closed already */
       ray_poll_deregister(poll, id);
   } else if (result != NULL && RAY_IS_ERR(result)) {
@@ -1283,6 +1297,9 @@ static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
   }
   if (result)
     q_release_any(result);
+  /* The reply (or the async drop) consumed the request's raise. */
+  if (q_current_handle < 0)
+    q_raise_clear();
   return NULL;
 }
 
