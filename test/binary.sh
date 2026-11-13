@@ -27,14 +27,15 @@ can_connect() {  # PORT — a TCP connect succeeds
   python3 -c "import socket,sys; socket.create_connection(('127.0.0.1',int(sys.argv[1])),0.5).close()" "$1" 2>/dev/null
 }
 
-# serves FLAG [SCRIPT] — start the binary with listener FLAG on a free port
-# (stdin from /dev/null, stdout to a file, no -i), optionally with a startup
-# script. ok when the port accepts a connection and the process is still alive
+# serves FLAG [ARG...] — start the binary with listener FLAG on a free port
+# (stdin from /dev/null, stdout to a file, no -i), optionally with more
+# arguments (a startup script, other flags). ok when the port accepts a connection and the process is still alive
 # a second after that.
 serves() {
-  local flag="$1" script="${2:-}" port pid i up=no
+  local flag="$1" port pid i up=no
+  shift
   port="$(free_port)"
-  "$BIN" "$flag" "$port" ${script:+"$script"} </dev/null >"$WORK/out.log" 2>&1 &
+  "$BIN" "$flag" "$port" "$@" </dev/null >"$WORK/out.log" 2>&1 &
   pid=$!
   for i in $(seq 1 50); do
     if can_connect "$port"; then up=yes; break; fi
@@ -81,6 +82,14 @@ check "-q takes the server-only path (no REPL on a closed stdin)" "$st"
 echo "listener plus a startup script that fails:"
 check "-p exits non-zero" "$(fails_fast -p "$WORK/bad.rfl")"
 check "-q exits non-zero" "$(fails_fast -q "$WORK/bad.rfl")"
+
+echo "-u/-U next to -q (the q listener checks no password):"
+help="$("$BIN" -h </dev/null 2>&1)"
+case "$help" in *'not checked by -q'*) st=ok ;; *) st=no ;; esac
+check "help says -u is native IPC only" "$st"
+check "-q with -u serves" "$(serves -q -u hunter2)"
+if grep -q 'warning: -u does not password-protect the q listener' "$WORK/out.log" && ! grep -q hunter2 "$WORK/out.log"; then st=ok; else st=no; fi
+check "-q with -u warns and does not print the password" "$st"
 
 echo "version (needs the core's tags: network when the binary was built):"
 echo '(println (.sys.build))' > "$WORK/b.rfl"
