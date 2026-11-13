@@ -27,3 +27,4 @@
 (.q.on 'sync 0) -- null
 (.q.on 'async 0) -- null
 (.q.on 'close 0) -- null
+(.q.on 'open 0) -- null

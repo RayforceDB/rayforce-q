@@ -56,7 +56,9 @@ An empty (or whitespace-only) request answers `(::)`, like kdb's `h ""`. An erro
 ;;                     queued, never waits; null on success, `handle`/`io` errors otherwise
 ;; (.q.on 'sync  fn)   hook: gets the decoded request, REPLACES the default eval, its value is the reply
 ;; (.q.on 'async fn)   hook: gets the request, no reply
+;; (.q.on 'open fn)    hook: gets the handle, once per inbound connection, when its handshake completes
 ;; (.q.on 'close fn)   hook: gets the handle, once per inbound connection, just before teardown
+;; (.q.handles)        table of the open inbound connections: handle, queued_bytes, limit_bytes
 ;; (.q.on 'sync 0)     any non-lambda clears the hook
 (.q.on 'sync (fn [r]
   (if (== (first r) '.net.sub)               ;; q: h(`.net.sub;5) -- a name the default eval could not call
@@ -92,7 +94,9 @@ of its columns and the supplied schema. Every schema name must nevertheless
 match at least one table in that collection, so a misspelled column fails the
 encode instead of silently using the default wire kind everywhere.
 
-`.q.on.*` cannot be `set` from Rayfall (dotted names are reserved), hence the verb; semantics mirror the core's `.ipc.on.*`. A char-vector request reaches the sync/async hook as an unparsed string (`(eval (parse r))` reproduces the default), a hook error is encoded to the client (sync) or logged (async, close). `(.q.handle)` is valid inside all three hooks. Hooks are process-global and live as long as the runtime: `ray_poll_destroy` releases them after the open connections' close hooks have run, a runtime destroyed without a poll needs `q_hooks_release()` first, and `q_env_register()` (once per runtime) drops what an earlier runtime left.
+`.q.on.*` cannot be `set` from Rayfall (dotted names are reserved), hence the verb; semantics mirror the core's `.ipc.on.*`. A char-vector request reaches the sync/async hook as an unparsed string (`(eval (parse r))` reproduces the default), a hook error is encoded to the client (sync) or logged (async, open, close). `(.q.handle)` is valid inside all four hooks. Hooks are process-global and live as long as the runtime: `ray_poll_destroy` releases them after the open connections' close hooks have run, a runtime destroyed without a poll needs `q_hooks_release()` first, and `q_env_register()` (once per runtime) drops what an earlier runtime left.
+
+**Seeing the connections.** `'open` fires when the login handshake of an inbound connection completes, before any frame of it is read, so a script learns of a peer that has connected but not yet sent anything; its `(.q.handle)` is the value every later hook and frame of that connection sees. An error raised by the hook is logged and does not close the connection or stop the listener (as for `'close`). `(.q.handles)` returns one row per open, established inbound q connection (a login in progress, a connection being closed, and connections made with `.q.connect` are not listed), with the columns of the core's `(.ipc.handle h)` that mean the same thing: `handle` (what `(.q.handle)` yields for it), `queued_bytes` (bytes of `.q.post`ed or reply frames the socket has not taken yet) and `limit_bytes` (the cap on that queue, 256 MiB), all i64; with no connection it is an empty table with the same columns. Like `.q.post`, whose handles it lists, it is refused for a restricted (`-U`) peer; hooks and the embedding script can call it.
 
 **Hooks and the WAL.** With a sync hook installed, a sync request that is journaled is recorded as `(.q.dispatch_sync (quote <request>))`; `.q.dispatch_sync` applies the sync hook installed at that moment, or evaluates by default when there is none. A replay therefore reproduces the live run if the application installs its hooks (`.q.on`) before `.log.replay`, which is the natural order, since it loads its code first; a replay without the hook evaluates the requests by default.
 
@@ -161,7 +165,8 @@ int64_t q_serve_at(ray_poll_t *poll, const char *host, int port);  /* one IPv4 a
 
 /* Push, hooks (see the Rayfall verbs above). */
 ray_t  *q_conn_post(ray_poll_t *poll, int64_t id, ray_t *msg);  /* async frame; NULL or error */
-int     q_hook_set(int which, ray_t *fn);   /* Q_HOOK_SYNC / _ASYNC / _CLOSE; non-lambda clears */
+int     q_hook_set(int which, ray_t *fn);   /* Q_HOOK_SYNC / _ASYNC / _CLOSE / _OPEN; non-lambda clears */
+ray_t  *q_conn_table(ray_poll_t *poll);  /* open inbound connections: handle, queued_bytes, limit_bytes */
 void    q_hooks_release(void);              /* release every hook; heap still alive */
 ```
 
