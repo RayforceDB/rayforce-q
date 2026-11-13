@@ -38,6 +38,8 @@ make test
 RAYFORCE_LOCAL_PATH=/path/to/rayforce make test
 ```
 
+The suite above never runs the patched `main()` of the `rayforce` binary. After `make rayforce`, `make check-binary` runs [`binary.sh`](binary.sh) against `./rayforce`: a `-p`/`-q` listener keeps serving after its startup script and with no script or terminal, and a failing startup script exits non-zero.
+
 ## The `.rfl` assertion DSL
 
 ```

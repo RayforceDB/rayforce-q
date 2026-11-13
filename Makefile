@@ -3,14 +3,22 @@
 #   make test       # build the rayfall test driver and run the .rfl suite
 #   make recheck    # re-run the suite against an already-built core
 #   make rayforce   # build a rayforce binary with the Q IPC client+server in
+#   make check-binary  # run the checks on ./rayforce (after `make rayforce`)
 #   make lint       # clang-format the sources
+#   make check-core-ref   # RAYFORCE_REF takes a branch, a tag and a commit hash
 #
 #   RAYFORCE_LOCAL_PATH=/path/to/core make test   # use a local core checkout
 #
 # Variables:
 #   RAYFORCE_GITHUB      core git URL (default: public repo)
-#   RAYFORCE_REF         branch/tag to check out (optional)
+#   RAYFORCE_REF         branch, tag or full commit hash (40 hex digits) to
+#                        check out (optional; default: the core's default branch);
+#                        a hash needs a server that serves commits by hash
 #   RAYFORCE_LOCAL_PATH  rsync this checkout instead of cloning
+#   RAY_VERSION          version `(.sys.build)` reports. Default: RAYFORCE_REF
+#                        when it is a vX.Y.Z tag, else the newest vX.Y.Z tag of
+#                        the core's repository (what the core's own Makefile
+#                        picks in a full clone); 0.0.0 if no tag can be read
 
 UNAME_S := $(shell uname -s)
 ROOT    := $(shell pwd)
@@ -45,9 +53,21 @@ pull_core:
 			"$(RAYFORCE_LOCAL_PATH)/" "$(CORE)/"; \
 	else \
 		echo "⬇️  Cloning rayforce core from $(RAYFORCE_GITHUB)..."; \
-		git clone $(if $(RAYFORCE_REF),--branch $(RAYFORCE_REF)) \
-			--depth 1 $(RAYFORCE_GITHUB) "$(CORE)"; \
+		if printf '%s' "$(RAYFORCE_REF)" | grep -Eq '^([0-9a-f]{40}|[0-9a-f]{64})$$'; then \
+			git init -q "$(CORE)" && \
+			git -C "$(CORE)" fetch -q --depth 1 $(RAYFORCE_GITHUB) "$(RAYFORCE_REF)" && \
+			git -C "$(CORE)" checkout -q FETCH_HEAD; \
+		else \
+			git clone $(if $(RAYFORCE_REF),--branch $(RAYFORCE_REF)) \
+				--depth 1 $(RAYFORCE_GITHUB) "$(CORE)"; \
+		fi; \
 	fi
+
+# RAYFORCE_REF must reach a branch, a tag and a commit hash (needs network)
+check-core-ref:
+	@./test/core_ref.sh
+
+.PHONY: check-core-ref
 
 test: pull_core
 	@echo "🔨 Building librayforce.a..."
@@ -69,15 +89,38 @@ rayforce: pull_core
 	@echo "🔧 Embedding Q IPC into the rayforce binary..."
 	@mkdir -p $(CORE)/src/q
 	@cp q.c q.h q_server.c q_server.h embed/rayforce_q.c $(CORE)/src/q/
-	@sed -e 's@ray_runtime_t\* rt = ray_runtime_create(argc, argv);@& extern void q_env_register(void); if (rt) q_env_register();@' \
+	@sed -e 's@ray_runtime_t\* rt = ray_runtime_create(argc, argv);@& extern void q_env_register(void); extern int q_serve_active(void); if (rt) q_env_register();@' \
 	     -e 's@        else if (strcmp(argv\[i\], "--") == 0)@        else if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--q-serve") == 0) { if (i + 1 < argc) i++; } &@' \
+	     -e 's@rc != 0 && !interactive && port > 0@rc != 0 \&\& !interactive \&\& (port > 0 || q_serve_active())@' \
+	     -e 's@!interactive && !(port > 0)@!interactive \&\& !(port > 0 || q_serve_active())@' \
+	     -e 's@server_only = poll && port > 0@server_only = poll \&\& (port > 0 || q_serve_active())@' \
+	     -e 's@} else if (poll && port > 0) {@} else if (poll \&\& (port > 0 || q_serve_active())) {@' \
+	     -e 's@set plain auth password\\n@set plain auth password (native IPC only; not checked by -q)\\n@' \
+	     -e 's@set restricted auth password\\n@set restricted auth password (native IPC only; -q does not check it, but -U still restricts q requests)\\n  -q, --q-serve [HOST:]PORT  serve Rayfall over the q wire (loopback unless HOST given)\\n@' \
 	     -e 's@if (poll) ray_runtime_set_poll(poll);@if (poll) { ray_runtime_set_poll(poll); extern int64_t q_serve_from_args(ray_poll_t*, int, char**); if (q_serve_from_args(poll, argc, argv) < 0) { rc = 2; goto done; } }@' \
 		$(CORE)/src/app/main.c > $(CORE)/src/app/main.c.q && \
 		mv $(CORE)/src/app/main.c.q $(CORE)/src/app/main.c
-	@$(MAKE) -C $(CORE) release
+	@test "$$(grep -c 'q_serve_active())' $(CORE)/src/app/main.c)" -eq 4 || \
+		{ echo "main.c: the -q keep-alive patch did not apply to this core" >&2; exit 1; }
+	@grep -q 'not checked by -q' $(CORE)/src/app/main.c || \
+		echo "note: core help text changed; the -u/-U help qualification did not apply" >&2
+	@ver='$(RAY_VERSION)'; ref='$(RAYFORCE_REF)'; \
+	if [ -z "$$ver" ] && [ -z "$(RAYFORCE_LOCAL_PATH)" ] && printf '%s' "$$ref" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$$'; then \
+		ver=$${ref#v}; \
+	fi; \
+	if [ -z "$$ver" ]; then \
+		ver=$$(git ls-remote --tags --refs "$(or $(RAYFORCE_LOCAL_PATH),$(RAYFORCE_GITHUB))" 'v[0-9]*.[0-9]*.[0-9]*' 2>/dev/null | \
+			sed 's@.*refs/tags/v@@' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$$' | \
+			sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1); \
+	fi; \
+	[ -n "$$ver" ] || echo "warning: no core version tag readable, the binary will report 0.0.0" >&2; \
+	$(MAKE) -C $(CORE) release $${ver:+RAY_VERSION=$$ver}
 	@cp $(CORE)/rayforce ./rayforce
 	@if [ "$(UNAME_S)" = "Darwin" ]; then codesign --force --sign - ./rayforce >/dev/null 2>&1 || true; fi
 	@echo './rayforce is ready'
+
+check-binary:
+	@./test/binary.sh ./rayforce
 
 lint:
 	clang-format -i $(addprefix ./,$(FMT_SRCS))
@@ -85,4 +128,4 @@ lint:
 clean:
 	@rm -rf test/tmp test/driver rayforce *.o
 
-.PHONY: pull_core core_lib driver test recheck rayforce lint hooks clean
+.PHONY: pull_core core_lib driver test recheck rayforce check-binary lint hooks clean

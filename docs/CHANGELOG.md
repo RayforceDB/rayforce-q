@@ -69,6 +69,14 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
 
 ### Changed
 
+- **`make rayforce` / `make test` accept a core commit in `RAYFORCE_REF`.**
+  `RAYFORCE_REF` was handed to `git clone --branch`, which takes a branch or a
+  tag only. A value of 40 (or 64) hex digits is now fetched at depth 1 and
+  checked out instead, so a build can be pinned to a core commit
+  (`make rayforce RAYFORCE_REF=<full hash>`). A branch or a tag is cloned as
+  before, and so is the unset case (the tip of the core's default branch). The
+  server must allow fetching a commit by hash (GitHub does).
+  `make check-core-ref` checks a branch, a tag and a hash against the network.
 - **`-q` listens on loopback by default.** The q listener bound every
   interface. `rayforce -q [HOST:]PORT` now binds `HOST` (mirroring the core's
   `--port HOST:PORT`), else `$RAYFORCE_Q_BIND_HOST`, else `127.0.0.1`; pass
@@ -79,6 +87,38 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
 
 ### Fixed
 
+- **`(.sys.build)` reports the core's version, not `0.0.0`.** The core takes its
+  version from the newest `vX.Y.Z` tag of the checkout it is built in; the
+  shallow clone has no tags and `RAYFORCE_LOCAL_PATH` copies without `.git`, so
+  every `make rayforce` binary said `0.0.0`. `make rayforce` now passes the core
+  its own `RAY_VERSION` override: `RAYFORCE_REF=vX.Y.Z` gives that version, any
+  other ref (a branch or a commit) gives the newest `vX.Y.Z` tag of the core's
+  repository, as the core's own Makefile picks in a full clone, read with
+  `git ls-remote` from `RAYFORCE_GITHUB` (or from `RAYFORCE_LOCAL_PATH` when it
+  is a git checkout). `make rayforce RAY_VERSION=X.Y.Z` sets it explicitly. If no
+  tag can be read (offline, or a local copy without `.git`) the build warns and
+  the version stays `0.0.0`. The tags are read only by `make rayforce`, not by
+  `make test`, `lint` or `clean`. `make check-binary` asserts the version.
+- **A `-q` listener with a startup script no longer ends with the script.**
+  The core's `main()` keeps a process running for its own `-p` listener only,
+  so `rayforce -q 127.0.0.1:PORT script.rfl </dev/null` ran the script and
+  exited 0 unless `-i` was given, taking the listener with it. `make rayforce`
+  now patches the same conditions to count a `-q` listener too (a failed
+  startup script is fatal, a script is followed by the event loop, and with no
+  terminal and no script the process serves without a REPL), and fails the
+  build if the patch no longer applies. `make check-binary` runs
+  `test/binary.sh` against the built binary.
+- **`-u`/`-U` with `-q` now warns that the q listener is not password-protected.**
+  The passwords belong to the native IPC listener (`-p`); the q handshake
+  reads the login but never checks it, so `-q 5000 -u secret` left the port
+  open while the core help said only "set ... auth password". Startup now
+  prints one value-free line on stderr (the password is never printed) saying
+  so, and for `-U` that it still restricts q request evaluation; the help text
+  and README say the flags are native IPC only. The option scan stops at `--`
+  and skips option values, so a script argument or a `-q`/`-f` value spelled
+  `-u` does not trigger it. Authentication and the `-U` restriction are
+  unchanged; password checking on the q handshake needs a core API and is not
+  part of this change.
 - **A password with an empty username reaches the q handshake.**
   `q_connect(..., "", "password", ...)` sized space for `:password` but copied
   it only when the username was non-empty, silently sending the anonymous
