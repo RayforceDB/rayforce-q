@@ -162,6 +162,40 @@ PY
   echo "bind address checks ok (loopback by default)"
 fi
 
+# ---- -u/-U next to the `-q` listener: a value-free warning on stderr.
+# The listener never checks the password; the warning says so, and the secret
+# must not appear in it. --serve-args runs the same q_serve_from_args the
+# rayforce binary does, so these arguments reach the real warning path.
+echo "checking the -u/-U warning on the -q listener..."
+check_warn() {  # WANT(1|0) EXPECT-TEXT -- args...  start a listener, read its stderr
+  local want="$1" text="$2" port err; shift 2
+  port="$(free_port)"
+  err="$(mktemp)"
+  "$DRIVER" --serve-args -q "$port" "$@" 2>"$err" &
+  local pid=$!
+  PIDS+=("$pid")
+  wait_for_port 127.0.0.1 "$port" || { echo "warning test: -q $port did not listen" >&2; exit 1; }
+  # the line is printed just after the socket starts listening
+  for _ in $(seq 1 40); do grep -q "warning" "$err" && break; sleep 0.05; done
+  kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+  if grep -q "warning" "$err"; then got=1; else got=0; fi
+  if [[ "$got" != "$want" ]]; then
+    echo "warning test: args '$*' warned=$got, expected $want" >&2; cat "$err" >&2; exit 1
+  fi
+  if [[ -n "$text" ]] && ! grep -q -- "$text" "$err"; then
+    echo "warning test: args '$*' stderr lacks '$text'" >&2; cat "$err" >&2; exit 1
+  fi
+  if grep -q "hunter2" "$err"; then
+    echo "warning test: the password leaked into stderr" >&2; cat "$err" >&2; exit 1
+  fi
+  rm -f "$err"
+}
+check_warn 1 "-u does not password-protect" -u hunter2
+check_warn 1 "-U still restricts" -U hunter2
+check_warn 0 "" -f -u hunter2
+check_warn 0 "" -- -u hunter2
+echo "warning checks ok"
+
 # ---- Leg 1: Rayforce server
 SERVERPORT="${SERVERPORT:-$(free_port)}"
 "$DRIVER" --serve "$SERVERPORT" &

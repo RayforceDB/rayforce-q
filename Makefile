@@ -95,11 +95,15 @@ rayforce: pull_core
 	     -e 's@!interactive && !(port > 0)@!interactive \&\& !(port > 0 || q_serve_active())@' \
 	     -e 's@server_only = poll && port > 0@server_only = poll \&\& (port > 0 || q_serve_active())@' \
 	     -e 's@} else if (poll && port > 0) {@} else if (poll \&\& (port > 0 || q_serve_active())) {@' \
+	     -e 's@set plain auth password\\n@set plain auth password (native IPC only; not checked by -q)\\n@' \
+	     -e 's@set restricted auth password\\n@set restricted auth password (native IPC only; -q does not check it, but -U still restricts q requests)\\n  -q, --q-serve [HOST:]PORT  serve Rayfall over the q wire (loopback unless HOST given)\\n@' \
 	     -e 's@if (poll) ray_runtime_set_poll(poll);@if (poll) { ray_runtime_set_poll(poll); extern int64_t q_serve_from_args(ray_poll_t*, int, char**); if (q_serve_from_args(poll, argc, argv) < 0) { rc = 2; goto done; } }@' \
 		$(CORE)/src/app/main.c > $(CORE)/src/app/main.c.q && \
 		mv $(CORE)/src/app/main.c.q $(CORE)/src/app/main.c
 	@test "$$(grep -c 'q_serve_active())' $(CORE)/src/app/main.c)" -eq 4 || \
 		{ echo "main.c: the -q keep-alive patch did not apply to this core" >&2; exit 1; }
+	@grep -q 'not checked by -q' $(CORE)/src/app/main.c || \
+		echo "note: core help text changed; the -u/-U help qualification did not apply" >&2
 	@ver='$(RAY_VERSION)'; ref='$(RAYFORCE_REF)'; \
 	if [ -z "$$ver" ] && [ -z "$(RAYFORCE_LOCAL_PATH)" ] && printf '%s' "$$ref" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$$'; then \
 		ver=$${ref#v}; \
