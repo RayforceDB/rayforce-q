@@ -26,6 +26,7 @@
 
 #include "core/poll.h"    /* ray_poll_create / run / destroy        */
 #include "core/runtime.h" /* ray_runtime_set_poll                   */
+#include "lang/eval.h"    /* ray_eval_set_restricted                */
 #include "q.h"            /* q_decode / q_connect / q_exchange      */
 #include "q_server.h"     /* q_serve                                */
 
@@ -2098,7 +2099,7 @@ static void pump_poll(ray_poll_t *poll, int ms) {
 
 static int hooks_clear(void) {
   return !q_hook_installed(Q_HOOK_SYNC) && !q_hook_installed(Q_HOOK_ASYNC) &&
-         !q_hook_installed(Q_HOOK_CLOSE);
+         !q_hook_installed(Q_HOOK_CLOSE) && !q_hook_installed(Q_HOOK_OPEN);
 }
 
 static int64_t eval_i64(const char *src) {
@@ -2585,6 +2586,227 @@ static int run_partial_send_selftest(void) {
   return failures ? 1 : 0;
 }
 
+/* ---- 'open hook and (.q.handles) ----------------------------------------- */
+
+/* eval `src` (a boolean expression) as 1/0. */
+static int eval_true(const char *src) {
+  char buf[512];
+  snprintf(buf, sizeof buf, "(if %s 1 0)", src);
+  return eval_i64(buf) == 1;
+}
+
+static int introspect_check(int ok, const char *what) {
+  if (!ok)
+    fprintf(stderr, "conn introspection selftest: %s\n", what);
+  return !ok;
+}
+
+/* A client that logs in and then stays silent. */
+static int idle_client(ray_poll_t *poll, int port) {
+  const uint8_t login[] = {'u', 3, 0};
+  uint8_t cap[8];
+  int fd = tcp_connect_local(port);
+  if (fd >= 0 && send(fd, login, sizeof login, 0) != (ssize_t)sizeof login) {
+    close(fd);
+    return -1;
+  }
+  pump_poll(poll, 100);
+  if (fd >= 0 && drain_now(fd, cap, sizeof cap) != 1) {
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+/* Connections on the `-q` listener are visible before their first frame:
+ * 'open fires once each, after the handshake and before any request, with the
+ * handle (.q.handle) gives; (.q.handles) lists the established ones with
+ * their queue and limit, and drops one at close. */
+static int run_conn_introspection_selftest(void) {
+  int failures = 0;
+  signal(SIGPIPE, SIG_IGN);
+  ray_runtime_t *rt = ray_runtime_create(0, NULL);
+  if (rt == NULL)
+    return 1;
+  q_env_register();
+  ray_poll_t *poll = ray_poll_create();
+  if (poll == NULL)
+    return 1;
+  ray_runtime_set_poll(poll);
+  int port = free_tcp_port();
+  if (q_serve(poll, port) < 0) {
+    fprintf(stderr, "conn introspection selftest: cannot listen\n");
+    return 1;
+  }
+  uint8_t buf[512], frame[128];
+
+  /* nobody connected: an empty table with the final column types */
+  failures += introspect_check(eval_i64("(count (.q.handles))") == 0,
+                               "not empty with no connection");
+  failures += introspect_check(
+      eval_true("(== (type (at (.q.handles) 'handle)) (type [1 2]))") &&
+          eval_true("(== (type (at (.q.handles) 'queued_bytes)) "
+                    "(type [1 2]))") &&
+          eval_true("(== (type (at (.q.handles) 'limit_bytes)) "
+                    "(type [1 2]))"),
+      "empty table columns are not i64");
+
+  eval_setup("(set nopen 0)", NULL);
+  eval_setup("(set oh -1)", NULL);
+  eval_setup("(set oh2 -2)", NULL);
+  eval_setup("(set ocnt -1)", NULL);
+  eval_setup("(set at_frame -1)", NULL);
+  eval_setup("(set fh -1)", NULL);
+  eval_setup("(.q.on 'open (fn [h] (do (set nopen (+ nopen 1)) (set oh h) "
+             "(set oh2 (.q.handle)) (set ocnt (count (.q.handles))))))",
+             NULL);
+  eval_setup("(.q.on 'sync (fn [r] (do (set at_frame nopen) "
+             "(set fh (.q.handle)) r)))",
+             NULL);
+
+  /* an idle connection: opened, listed, no frame sent */
+  int a = idle_client(poll, port);
+  failures += introspect_check(a >= 0, "client a did not log in");
+  int64_t ah = eval_i64("oh");
+  failures += introspect_check(eval_i64("nopen") == 1, "'open not run once");
+  failures += introspect_check(ah >= 0 && eval_i64("oh2") == ah,
+                               "(.q.handle) in 'open differs from its arg");
+  failures += introspect_check(eval_i64("ocnt") == 1,
+                               "the opening connection is not listed in 'open");
+  failures += introspect_check(eval_i64("(count (.q.handles))") == 1,
+                               "idle connection not listed");
+  failures += introspect_check(eval_i64("(.q.handle)") == -1,
+                               "(.q.handle) leaked out of the hook");
+  failures += introspect_check(
+      eval_true("(== (first (at (.q.handles) 'handle)) oh)") &&
+          eval_i64("(first (at (.q.handles) 'queued_bytes))") == 0 &&
+          eval_i64("(first (at (.q.handles) 'limit_bytes))") > 0,
+      "idle row: handle, queued_bytes 0 and a limit expected");
+  failures += introspect_check(
+      eval_true("(== (type (at (.q.handles) 'handle)) (type [1 2]))") &&
+          eval_true("(== (type (at (.q.handles) 'queued_bytes)) "
+                    "(type [1 2]))") &&
+          eval_true("(== (type (at (.q.handles) 'limit_bytes)) "
+                    "(type [1 2]))"),
+      "column types changed with a row present");
+
+  /* login and first request in one segment: 'open still comes first */
+  int c = tcp_connect_local(port);
+  const uint8_t login[] = {'u', 3, 0};
+  size_t n = str_frame(frame + sizeof login, "7");
+  memcpy(frame, login, sizeof login);
+  if (c < 0 || send(c, frame, sizeof login + n, 0) != (ssize_t)(sizeof login + n))
+    failures++;
+  pump_poll(poll, 200);
+  int64_t ch = eval_i64("oh");
+  failures += introspect_check(eval_i64("nopen") == 2 && ch != ah,
+                               "'open not run for the second connection");
+  failures += introspect_check(eval_i64("at_frame") == 2 &&
+                                   eval_i64("fh") == ch,
+                               "'open did not run before the first request");
+  failures += introspect_check(drain_now(c, buf, sizeof buf) > 0,
+                               "the first request was not answered");
+  failures += introspect_check(eval_i64("(count (.q.handles))") == 2,
+                               "two connections not listed");
+
+  /* closed: gone from the table, and 'open did not fire again */
+  close(a);
+  pump_poll(poll, 100);
+  failures += introspect_check(
+      eval_i64("(count (.q.handles))") == 1 &&
+          eval_true("(== (first (at (.q.handles) 'handle)) oh)") &&
+          eval_i64("nopen") == 2,
+      "closed connection still listed");
+
+  /* a hook that raises: logged, the connection and the listener carry on */
+  eval_setup("(.q.on 'open (fn [h] (do (set nopen (+ nopen 1)) "
+             "(raise \"boom\"))))",
+             NULL);
+  int d = idle_client(poll, port);
+  failures += introspect_check(d >= 0 && eval_i64("nopen") == 3,
+                               "raising 'open hook: client refused");
+  n = str_frame(frame, "7");
+  if (d < 0 || send(d, frame, n, 0) != (ssize_t)n)
+    failures++;
+  pump_poll(poll, 200);
+  failures += introspect_check(drain_now(d, buf, sizeof buf) > 0,
+                               "connection did not survive a raising hook");
+  failures += introspect_check(eval_i64("(count (.q.handles))") == 2,
+                               "connection dropped after a raising hook");
+  int c2 = idle_client(poll, port);
+  failures += introspect_check(c2 >= 0 && eval_i64("nopen") == 4,
+                               "listener stopped serving after a raising hook");
+  close(c2);
+  close(d);
+  pump_poll(poll, 100);
+
+  /* a peer that does not read: its queue is seen, then drains */
+  close(c);
+  pump_poll(poll, 100);
+  eval_setup("(.q.on 'open (fn [h] (set oh h)))", NULL);
+  int e = idle_client(poll, port);
+  int64_t eh = eval_i64("oh");
+  const int64_t big = 32LL << 20;
+  char *text = (char *)malloc((size_t)big);
+  ray_t *msg = NULL;
+  if (text != NULL) {
+    memset(text, 'x', (size_t)big);
+    msg = ray_str(text, (size_t)big);
+    free(text);
+  }
+  ray_t *perr = msg != NULL ? q_conn_post(poll, eh, msg) : NULL;
+  failures += introspect_check(e >= 0 && msg != NULL && perr == NULL,
+                               "could not post to the idle peer");
+  release_any(perr);
+  release_any(msg);
+  failures += introspect_check(
+      eval_i64("(count (.q.handles))") == 1 &&
+          eval_true("(== (first (at (.q.handles) 'handle)) oh)") &&
+          eval_true("(> (first (at (.q.handles) 'queued_bytes)) 0)") &&
+          eval_true("(< (first (at (.q.handles) 'queued_bytes)) 33554432)"),
+      "unread post left no queued_bytes");
+  uint8_t *rx = (uint8_t *)malloc((size_t)big + 64);
+  int64_t declared = 0;
+  int64_t got = rx != NULL ? read_frame_pumping(poll, e, rx, big + 64, &declared)
+                           : -1;
+  failures += introspect_check(got == declared && declared > big,
+                               "queued frame not delivered whole");
+  failures += introspect_check(
+      eval_i64("(first (at (.q.handles) 'queued_bytes))") == 0,
+      "queued_bytes did not return to 0");
+  free(rx);
+  close(e);
+
+  /* the hook-name error lists every hook; handles needs no arguments */
+  ray_t *r = ray_eval_str("(.q.on 'nonsense 0)");
+  const char *msgtxt = r != NULL && RAY_IS_ERR(r) ? ray_error_msg() : NULL;
+  failures += introspect_check(
+      msgtxt != NULL &&
+          strstr(msgtxt, "'sync, 'async, 'close or 'open") != NULL,
+      "bad .q.on name: error text does not list the hooks");
+  release_any(r);
+  r = ray_eval_str("(.q.handles 1)");
+  failures += introspect_check(r != NULL && RAY_IS_ERR(r),
+                               "(.q.handles 1) was accepted");
+  release_any(r);
+
+  /* refused for a restricted evaluator, like .q.post */
+  ray_eval_set_restricted(true);
+  r = ray_eval_str("(.q.handles)");
+  failures += introspect_check(r != NULL && RAY_IS_ERR(r),
+                               "(.q.handles) allowed when restricted");
+  release_any(r);
+  ray_eval_set_restricted(false);
+
+  q_hook_set(Q_HOOK_OPEN, NULL);
+  q_hook_set(Q_HOOK_SYNC, NULL);
+  ray_poll_destroy(poll);
+  ray_runtime_set_poll(NULL);
+  ray_runtime_destroy(rt);
+  printf("conn introspection selftest: %s\n", failures ? "FAIL" : "ok");
+  return failures ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
   if (argc >= 2 && strcmp(argv[1], "--have-timespan") == 0) {
     printf("%d\n", Q_HAVE_TIMESPAN);
@@ -2594,6 +2816,8 @@ int main(int argc, char **argv) {
     return run_partial_send_selftest();
   if (argc >= 2 && strcmp(argv[1], "--conn-identity-selftest") == 0)
     return run_conn_identity_selftest();
+  if (argc >= 2 && strcmp(argv[1], "--conn-introspection-selftest") == 0)
+    return run_conn_introspection_selftest();
   if (argc >= 2 && strcmp(argv[1], "--hooks-teardown-selftest") == 0)
     return run_hooks_teardown_selftest();
   if (argc >= 2 && strcmp(argv[1], "--readonly-selftest") == 0)
