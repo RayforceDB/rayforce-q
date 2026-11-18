@@ -117,6 +117,9 @@ echo "running read-only allow-list selftest..."
 echo "running connection identity selftest..."
 "$DRIVER" --conn-identity-selftest
 
+echo "running connection introspection selftest..."
+"$DRIVER" --conn-introspection-selftest
+
 echo "running partial send selftest..."
 "$DRIVER" --partial-send-selftest
 

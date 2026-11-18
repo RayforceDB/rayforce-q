@@ -988,6 +988,7 @@ static ray_t *q_read_handshake(ray_poll_t *poll, ray_selector_t *sel);
 static ray_t *q_read_header(ray_poll_t *poll, ray_selector_t *sel);
 static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel);
 static void q_on_close(ray_poll_t *poll, ray_selector_t *sel);
+static void q_fire_open_hook(int64_t id);
 
 /* Accept callback on the listener selector. */
 static ray_t *q_accept(ray_poll_t *poll, ray_selector_t *sel) {
@@ -1042,6 +1043,8 @@ static ray_t *q_read_handshake(ray_poll_t *poll, ray_selector_t *sel) {
     ray_sock_send((ray_sock_t)sel->fd, &reply, 1);
     sel->rx.read_fn = q_read_header;
     ray_poll_rx_request(poll, sel, (int64_t)sizeof(q_header_t));
+    /* Last: the hook may close this connection. */
+    q_fire_open_hook(sel->id);
     return NULL;
   }
   cd->cap = b; /* last non-NUL byte wins (the capability byte) */
@@ -1284,6 +1287,29 @@ static ray_t *q_read_body(ray_poll_t *poll, ray_selector_t *sel) {
   if (result)
     q_release_any(result);
   return NULL;
+}
+
+/* `.q.on 'open`: once per inbound connection, as its handshake completes and
+ * before any frame is read, so the hook can read `.q.handle`. Errors are
+ * logged and swallowed, as for 'close: the connection stays open. The hook may
+ * close the connection, so the caller must not touch it afterwards. */
+static void q_fire_open_hook(int64_t id) {
+  ray_t *hook = q_hooks[Q_HOOK_OPEN];
+  if (hook == NULL || __VM == NULL)
+    return;
+  ray_t *arg = ray_i64(id);
+  if (arg == NULL || RAY_IS_ERR(arg))
+    return;
+  int64_t prev = q_current_handle;
+  q_current_handle = id;
+  q_raise_clear();
+  ray_t *r = q_call_hook(hook, arg);
+  q_current_handle = prev;
+  if (r != NULL && RAY_IS_ERR(r))
+    fprintf(stderr, "q: .q.on open hook raised an error (handle=%lld)\n",
+            (long long)id);
+  ray_release(arg);
+  q_release_any(r);
 }
 
 /* `.q.on 'close`: once per established inbound connection, just before its
@@ -1648,6 +1674,78 @@ ray_t *q_conn_post(ray_poll_t *poll, int64_t id, ray_t *msg) {
     return ray_error("io", "q: post queue full or out of memory");
   }
   return NULL;
+}
+
+/* Bytes in `sel`'s outbound queue that the socket has not taken yet, the sum
+ * q_queue_frame bounds by Q_MAX_BODY. */
+static int64_t q_tx_pending(const ray_selector_t *sel) {
+  int64_t queued = 0;
+  for (const ray_poll_buf_t *p = sel->tx.buf; p != NULL; p = p->next)
+    if (p->size > p->offset)
+      queued += p->size - p->offset;
+  return queued;
+}
+
+/* Append `v` to the I64 column `*col`; false (column released) on failure. */
+static int q_col_push(ray_t **col, int64_t v) {
+  ray_t *next = ray_vec_append(*col, &v);
+  if (next == NULL || RAY_IS_ERR(next)) {
+    ray_release(*col);
+    *col = NULL;
+    return 0;
+  }
+  *col = next;
+  return 1;
+}
+
+ray_t *q_conn_table(ray_poll_t *poll) {
+  static const char *const names[3] = {"handle", "queued_bytes",
+                                       "limit_bytes"};
+  ray_t *cols[3];
+  for (int c = 0; c < 3; c++) {
+    cols[c] = ray_vec_new(RAY_I64, 0);
+    if (cols[c] == NULL || RAY_IS_ERR(cols[c])) {
+      for (int j = 0; j < c; j++)
+        ray_release(cols[j]);
+      return ray_error("oom", NULL);
+    }
+  }
+  for (uint32_t i = 0; poll != NULL && i < poll->n_sels; i++) {
+    const ray_selector_t *sel = poll->sels[i];
+    if (sel == NULL || sel->close_fn != q_on_close || sel->data == NULL)
+      continue;
+    const q_conn_t *cd = (const q_conn_t *)sel->data;
+    if (cd->magic != Q_CONN_MAGIC || cd->outbound || !cd->established ||
+        cd->closing)
+      continue;
+    if (!q_col_push(&cols[0], sel->id) ||
+        !q_col_push(&cols[1], q_tx_pending(sel)) ||
+        !q_col_push(&cols[2], Q_MAX_BODY)) {
+      for (int c = 0; c < 3; c++)
+        if (cols[c] != NULL)
+          ray_release(cols[c]);
+      return ray_error("oom", NULL);
+    }
+  }
+  ray_t *tbl = ray_table_new(3);
+  if (tbl == NULL || RAY_IS_ERR(tbl)) {
+    for (int c = 0; c < 3; c++)
+      ray_release(cols[c]);
+    return ray_error("oom", NULL);
+  }
+  for (int c = 0; c < 3; c++) {
+    /* The table retains the column; add_col consumes `tbl` on every path. */
+    ray_t *res = ray_table_add_col(
+        tbl, ray_sym_intern(names[c], strlen(names[c])), cols[c]);
+    ray_release(cols[c]);
+    if (res == NULL || RAY_IS_ERR(res)) {
+      for (int j = c + 1; j < 3; j++)
+        ray_release(cols[j]);
+      return res ? res : ray_error("oom", NULL);
+    }
+    tbl = res;
+  }
+  return tbl;
 }
 
 int q_conn_is_handle(ray_poll_t *poll, int64_t id) {

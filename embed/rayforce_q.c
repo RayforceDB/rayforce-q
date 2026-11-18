@@ -244,11 +244,22 @@ static ray_t *qb_post(ray_t *handle, ray_t *msg) {
   return err ? err : RAY_NULL_OBJ;
 }
 
-/* (.q.on 'sync|'async|'close fn) -> null. Registers (or, for a non-lambda,
- * clears) the hook for inbound q frames; see q_server.h. */
+/* (.q.handles) -> a table of the open inbound q connections: handle,
+ * queued_bytes, limit_bytes. Restricted, like .q.post: the handles it lists
+ * are the means to post to other peers. */
+static ray_t *qb_handles(ray_t **args, int64_t n) {
+  (void)args;
+  if (n != 0)
+    return ray_error("arity", ".q.handles takes no arguments");
+  return q_conn_table(q_poll());
+}
+
+/* (.q.on 'sync|'async|'close|'open fn) -> null. Registers (or, for a
+ * non-lambda, clears) the hook for inbound q frames; see q_server.h. */
 static ray_t *qb_on(ray_t *kind, ray_t *fn) {
   if (kind == NULL || kind->type != -RAY_SYM)
-    return ray_error("type", ".q.on: hook must be 'sync, 'async or 'close");
+    return ray_error("type",
+                     ".q.on: hook must be 'sync, 'async, 'close or 'open");
   ray_t *name = ray_sym_str(kind->i64); /* borrowed */
   const char *s = name ? ray_str_ptr(name) : NULL;
   size_t n = name ? ray_str_len(name) : 0;
@@ -260,9 +271,12 @@ static ray_t *qb_on(ray_t *kind, ray_t *fn) {
       which = Q_HOOK_ASYNC;
     else if (n == 5 && memcmp(s, "close", 5) == 0)
       which = Q_HOOK_CLOSE;
+    else if (n == 4 && memcmp(s, "open", 4) == 0)
+      which = Q_HOOK_OPEN;
   }
   if (which < 0)
-    return ray_error("domain", ".q.on: hook must be 'sync, 'async or 'close");
+    return ray_error("domain",
+                     ".q.on: hook must be 'sync, 'async, 'close or 'open");
   q_hook_set(which, fn);
   return RAY_NULL_OBJ;
 }
@@ -329,6 +343,10 @@ void q_env_register(void) {
 
   f = ray_fn_vary(".q.handle", RAY_FN_NONE, qb_handle);
   q_bind(".q.handle", f);
+  ray_release(f);
+
+  f = ray_fn_vary(".q.handles", RAY_FN_RESTRICTED, qb_handles);
+  q_bind(".q.handles", f);
   ray_release(f);
 
   f = ray_fn_binary(".q.post", RAY_FN_RESTRICTED, qb_post);

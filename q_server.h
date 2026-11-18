@@ -113,6 +113,14 @@ ray_t *q_conn_post(ray_poll_t *poll, int64_t id, ray_t *msg);
 /* Check whether `id` identifies an open Q connection owned by this module. */
 int q_conn_is_handle(ray_poll_t *poll, int64_t id);
 
+/* A table, one row per open established inbound connection (a connection
+ * whose handshake has not finished, an attached outbound one and one being
+ * torn down are not listed): `handle` (the id q_conn_current gives for it),
+ * `queued_bytes` (bytes still waiting in its outbound queue) and
+ * `limit_bytes` (the most the queue may hold), all I64. Empty, with the same
+ * columns, when there are none. Returns an owned table or error. */
+ray_t *q_conn_table(ray_poll_t *poll);
+
 /* The connection (inbound or attached) whose frame, or close, is being
  * handled right now: valid inside a handler such a frame called and inside
  * the hooks below, -1 everywhere else. */
@@ -129,7 +137,10 @@ int64_t q_conn_current(void);
  *          logged.
  *   CLOSE  called with the handle once per established inbound connection,
  *          just before teardown; errors are logged and swallowed.
- * q_conn_current() is the connection inside all three. Returns 0, or -1 for
+ *   OPEN   called with the handle once per inbound connection, when its
+ *          handshake completes and before any frame is read; errors are
+ *          logged and swallowed, the connection stays open.
+ * q_conn_current() is the connection inside all four. Returns 0, or -1 for
  * an unknown hook. The lambda is retained; a hook outlives neither its
  * runtime nor a q_hook_set that replaces it.
  *
@@ -140,7 +151,13 @@ int64_t q_conn_current(void);
  * q_hooks_release() before ray_runtime_destroy(). q_env_register() (call it
  * for every new runtime) drops, without releasing, what an earlier runtime
  * left in the slots. */
-enum { Q_HOOK_SYNC = 0, Q_HOOK_ASYNC = 1, Q_HOOK_CLOSE = 2, Q_HOOK_COUNT = 3 };
+enum {
+  Q_HOOK_SYNC = 0,
+  Q_HOOK_ASYNC = 1,
+  Q_HOOK_CLOSE = 2,
+  Q_HOOK_OPEN = 3,
+  Q_HOOK_COUNT = 4
+};
 int q_hook_set(int which, ray_t *fn);
 int q_hook_installed(int which); /* 1 when the hook is set */
 void q_hooks_release(void);      /* release every hook, heap still alive */

@@ -6,6 +6,21 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
 
 ### Added
 
+- **`.q.on 'open` and `(.q.handles)` for inbound q connections.** A connection
+  accepted by the `-q` listener was invisible to scripts until its first frame:
+  `.q.on` had `'sync`, `'async` and `'close` but no `'open`, and nothing listed
+  the open connections. `(.q.on 'open fn)` runs `fn` with the handle once per
+  inbound connection, when its handshake completes and before any frame is read;
+  `(.q.handle)` is valid inside it, and an error it raises is logged, like one
+  from `'close`, without closing the connection or stopping the listener.
+  `(.q.handles)` returns a table with one row per open, established inbound
+  connection: `handle`, `queued_bytes` (bytes waiting in its outbound queue) and
+  `limit_bytes` (the queue's cap), named as in the core's `(.ipc.handle h)`, and
+  empty with the same columns when nobody is connected. It is refused for a
+  restricted peer, as `.q.post` is. The C side adds `Q_HOOK_OPEN` (so
+  `Q_HOOK_COUNT` is 4) and `q_conn_table`. Registering these connections in the
+  core's handle table, so `.ipc.handle` sees them, needs core changes and is not
+  part of this.
 - **q timespan decoded and encoded as `TIMESPAN`.** A q timespan atom (`-16`)
   or vector (`16`) is i64 nanoseconds, the payload of the core's `TIMESPAN`,
   so it is copied and re-tagged, and `0Nn` decodes to the null timespan (the
