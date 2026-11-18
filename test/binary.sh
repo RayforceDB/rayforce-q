@@ -83,13 +83,13 @@ echo "listener plus a startup script that fails:"
 check "-p exits non-zero" "$(fails_fast -p "$WORK/bad.rfl")"
 check "-q exits non-zero" "$(fails_fast -q "$WORK/bad.rfl")"
 
-echo "-u/-U next to -q (the q listener checks no password):"
+echo "-u/-U next to -q (password-protected q listener):"
 help="$("$BIN" -h </dev/null 2>&1)"
-case "$help" in *'not checked by -q'*) st=ok ;; *) st=no ;; esac
-check "help says -u is native IPC only" "$st"
+case "$help" in *'set q/native IPC password'*) st=ok ;; *) st=no ;; esac
+check "help says -u applies to q and native IPC" "$st"
 check "-q with -u serves" "$(serves -q -u hunter2)"
-if grep -q 'warning: -u does not password-protect the q listener' "$WORK/out.log" && ! grep -q hunter2 "$WORK/out.log"; then st=ok; else st=no; fi
-check "-q with -u warns and does not print the password" "$st"
+if grep -q hunter2 "$WORK/out.log"; then st=no; else st=ok; fi
+check "-q with -u does not print the password" "$st"
 
 echo "version (needs the core's tags: network when the binary was built):"
 echo '(println (.sys.build))' > "$WORK/b.rfl"

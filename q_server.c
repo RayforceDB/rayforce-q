@@ -126,6 +126,7 @@ typedef struct {
   uint64_t gen; /* never reused: tells this connection from the one that takes its slot */
   q_header_t hdr;
   uint8_t cap;
+  uint8_t hs[Q_MAX_HANDSHAKE]; /* login and capability, before the NUL */
   int hs_len;
   uint8_t sync_waiting; /* a q_conn_send is parked on this connection */
   uint8_t sync_ready;   /* its RESPONSE has been deposited below      */
@@ -1034,7 +1035,8 @@ static ray_t *q_accept(ray_poll_t *poll, ray_selector_t *sel) {
   return NULL;
 }
 
-/* Q login: "<user>[:<pass>]" + capability byte + NUL */
+/* Q login: "<user>[:<pass>]" + capability byte + NUL. A configured -u/-U
+ * password is checked by the same core verifier as native IPC. */
 static ray_t *q_read_handshake(ray_poll_t *poll, ray_selector_t *sel) {
   if (!sel->rx.buf || sel->rx.buf->offset < 1)
     return NULL;
@@ -1042,6 +1044,11 @@ static ray_t *q_read_handshake(ray_poll_t *poll, ray_selector_t *sel) {
   uint8_t b = sel->rx.buf->data[0];
 
   if (b == 0x00) {
+    if (cd->hs_len < 1 ||
+        !ray_poll_auth_check(poll, cd->hs, (size_t)(cd->hs_len - 1))) {
+      ray_poll_deregister(poll, sel->id);
+      return NULL;
+    }
     uint8_t reply = cd->cap < Q_CAP_MAX ? cd->cap : Q_CAP_MAX;
     cd->established = 1;
     ray_sock_send((ray_sock_t)sel->fd, &reply, 1);
@@ -1051,11 +1058,12 @@ static ray_t *q_read_handshake(ray_poll_t *poll, ray_selector_t *sel) {
     q_fire_open_hook(sel->id);
     return NULL;
   }
-  cd->cap = b; /* last non-NUL byte wins (the capability byte) */
-  if (++cd->hs_len > Q_MAX_HANDSHAKE) {
+  if (cd->hs_len >= Q_MAX_HANDSHAKE) {
     ray_poll_deregister(poll, sel->id);
     return NULL;
   }
+  cd->hs[cd->hs_len++] = b;
+  cd->cap = b; /* last non-NUL byte wins (the capability byte) */
   ray_poll_rx_request(poll, sel, 1);
   return NULL;
 }
