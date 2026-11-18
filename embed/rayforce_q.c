@@ -380,6 +380,28 @@ void q_env_register(void) {
 static int q_listening;
 int q_serve_active(void) { return q_listening; }
 
+#ifndef RAY_POLL_AUTH_API
+/* A core without the public verifier cannot enforce -u/-U here. Refuse the
+ * listener rather than starting a port that silently ignores its password. */
+static int q_auth_unavailable(int argc, char **argv) {
+  static const char *const with_value[] = {
+      "-p", "--port", "-c", "--cores", "-t", "--timeit", "-Q",
+      "--querylog", "-f", "--file", "-u", "-U", "-l", "-L",
+      "-m", "--mem", "-q", "--q-serve", NULL};
+  int password = 0;
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--") == 0) break;
+    if (strcmp(argv[i], "-u") == 0 || strcmp(argv[i], "-U") == 0)
+      password = 1;
+    for (int k = 0; with_value[k]; k++)
+      if (strcmp(argv[i], with_value[k]) == 0) { i++; break; }
+  }
+  if (password)
+    fprintf(stderr, "q: -u/-U with -q needs a core with RAY_POLL_AUTH_API\n");
+  return password;
+}
+#endif
+
 /* Folded entry point, called from the rayforce binary's main().
  * Returns the listener id on success, 0 when no Q-server flag is present,
  * or -1 when a Q-server flag is malformed or cannot be started. */
@@ -417,6 +439,9 @@ int64_t q_serve_from_args(ray_poll_t *poll, int argc, char **argv) {
         fprintf(stderr, "q: invalid port %s (expected 1..65535)\n", spec);
         return -1;
       }
+#ifndef RAY_POLL_AUTH_API
+      if (q_auth_unavailable(argc, argv)) return -1;
+#endif
       const char *bind_host = arg_host;
       if (bind_host == NULL || *bind_host == '\0')
         bind_host = getenv("RAYFORCE_Q_BIND_HOST");

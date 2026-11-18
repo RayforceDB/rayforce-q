@@ -1036,7 +1036,7 @@ static ray_t *q_accept(ray_poll_t *poll, ray_selector_t *sel) {
 }
 
 /* Q login: "<user>[:<pass>]" + capability byte + NUL. A configured -u/-U
- * password is checked by the same core verifier as native IPC. */
+ * password is checked by the same core verifier as native IPC when available. */
 static ray_t *q_read_handshake(ray_poll_t *poll, ray_selector_t *sel) {
   if (!sel->rx.buf || sel->rx.buf->offset < 1)
     return NULL;
@@ -1044,8 +1044,24 @@ static ray_t *q_read_handshake(ray_poll_t *poll, ray_selector_t *sel) {
   uint8_t b = sel->rx.buf->data[0];
 
   if (b == 0x00) {
-    if (cd->hs_len < 1 ||
-        !ray_poll_auth_check(poll, cd->hs, (size_t)(cd->hs_len - 1))) {
+#ifdef RAY_POLL_AUTH_API
+    if (!ray_poll_auth_check(poll, cd->hs,
+                             (size_t)(cd->hs_len > 0 ? cd->hs_len - 1 : 0))) {
+#else
+    /* An old core has no public verifier, but its poll still has the same
+     * auth fields. This native-compatible check is not used with the new API. */
+    const char *stored = poll->auth_secret;
+    const char *login = (const char *)cd->hs;
+    size_t len = cd->hs_len > 0 ? (size_t)cd->hs_len - 1 : 0;
+    if (len > 0 && login[len - 1] == 0)
+      len--;
+    size_t stored_len = strlen(stored);
+    const char *colon = memchr(login, ':', len);
+    const char *password = colon ? colon + 1 : login;
+    size_t password_len = colon ? len - (size_t)(colon - login) - 1 : len;
+    if (*stored && (password_len != stored_len ||
+                    memcmp(password, stored, stored_len) != 0)) {
+#endif
       ray_poll_deregister(poll, sel->id);
       return NULL;
     }

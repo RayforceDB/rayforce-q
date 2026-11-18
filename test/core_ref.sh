@@ -36,4 +36,30 @@ pull "$branch" "$branch_sha"
 pull "$tag" "$(sha_of "$tag")"
 # a hash that is not the tip of any branch
 pull "$(sha_of "$old_tag")" "$(sha_of "$old_tag")"
+
+# An old released core lacks RAY_POLL_AUTH_API. The server must still build,
+# accept a no-password listener, and refuse -q with -u/-U at startup.
+echo "  old-core password behavior:"
+rm -rf "$WORK/old"
+if (cd "$WORK" && make -s -f "$MAKEFILE" rayforce RAYFORCE_GITHUB="$URL" RAYFORCE_REF=v3.0.2 ROOT="$WORK/old" >"$WORK/old.log" 2>&1); then
+  oldcc="${CC:-cc}"
+  if (cd "$WORK/old" && "$oldcc" -std=c17 -O2 -fPIC -Wall -Wextra -Werror -Wno-unused-function -I. -Itest/tmp/rayforce-c/include -Itest/tmp/rayforce-c/src -o test/driver q.c q_server.c embed/rayforce_q.c test/driver.c test/tmp/rayforce-c/librayforce.a -lm -lpthread && ./test/driver --q-auth-selftest >"$WORK/old-suite.log" 2>&1); then
+    echo "  ok    old-core q authentication selftest"
+  else
+    echo "  FAIL  old-core q authentication selftest" >&2
+    cat "$WORK/old-suite.log" >&2
+    fail=1
+  fi
+  if (cd "$WORK/old" && make -s -f "$MAKEFILE" check-binary ROOT="$WORK/old" RAYFORCE_Q_OLD_CORE=1 >"$WORK/old-binary.log" 2>&1); then
+    echo "  ok    old-core -q -u/-U refuse to start"
+  else
+    echo "  FAIL  old-core -q -u/-U did not fail closed" >&2
+    tail -n 15 "$WORK/old-binary.log" >&2
+    fail=1
+  fi
+else
+  echo "  FAIL  old-core q build" >&2
+  tail -n 15 "$WORK/old.log" >&2
+  fail=1
+fi
 exit "$fail"

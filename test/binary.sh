@@ -83,6 +83,20 @@ echo "listener plus a startup script that fails:"
 check "-p exits non-zero" "$(fails_fast -p "$WORK/bad.rfl")"
 check "-q exits non-zero" "$(fails_fast -q "$WORK/bad.rfl")"
 
+if [[ "${RAYFORCE_Q_OLD_CORE:-}" == 1 ]]; then
+  echo "-u/-U next to -q on an old core (must fail closed):"
+  for flag in -u -U; do
+    err="$(mktemp)"
+    "$BIN" -q "$(free_port)" "$flag" hunter2 </dev/null >"$WORK/out.log" 2>"$err"
+    rc=$?
+    if [[ "$rc" -ne 0 ]] && grep -q RAY_POLL_AUTH_API "$err" && ! grep -q hunter2 "$err"; then st=ok; else st=no; fi
+    check "$flag refuses to start an unauthenticated old-core q listener" "$st"
+    rm -f "$err"
+  done
+  check "-q without a password still serves on an old core" "$(serves -q)"
+  exit "$fail"
+fi
+
 echo "-u/-U next to -q (password-protected q listener):"
 help="$("$BIN" -h </dev/null 2>&1)"
 case "$help" in *'set q/native IPC password'*) st=ok ;; *) st=no ;; esac
