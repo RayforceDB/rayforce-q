@@ -194,7 +194,7 @@ static int run_readonly_selftest(void) {
   return failures ? 1 : 0;
 }
 
-int q_auth_flag_with_listener(int argc, char **argv);
+static int run_q_auth_selftest(void);
 
 static int run_q_cli_selftest(void) {
   ray_runtime_t *rt = ray_runtime_create(0, NULL);
@@ -235,41 +235,6 @@ static int run_q_cli_selftest(void) {
   if (q_serve_from_args(poll, 3, bad_host) >= 0) /* never widens to wildcard */
     failures++;
 
-  /* -u/-U next to the q listener warns; `--`, option values and a lone
-   * native listener do not. */
-  char *a_qu[] = {"rayforce", "-q", "25999", "-u", "x"};
-  char *a_uq[] = {"rayforce", "-u", "x", "--q-serve", "25999"};
-  char *a_qU[] = {"rayforce", "-q", "25999", "-U", "x"};
-  char *a_last[] = {"rayforce", "-U", "x", "-q", "25999", "-u", "y"};
-  char *a_q[] = {"rayforce", "-q", "25999"};
-  char *a_pu[] = {"rayforce", "-p", "25999", "-u", "x"};
-  char *a_dd[] = {"rayforce", "app.rfl", "--", "-q", "1", "-u", "x"};
-  char *a_ddq[] = {"rayforce", "-q", "25999", "--", "-u", "x"};
-  char *a_qval[] = {"rayforce", "-q", "-u", "-p", "25999"};
-  char *a_uval[] = {"rayforce", "-u", "-q", "-p", "25999"};
-  char *a_fval[] = {"rayforce", "-f", "-U", "-q", "25999"};
-  if (q_auth_flag_with_listener(5, a_qu) != 'u')
-    failures++;
-  if (q_auth_flag_with_listener(5, a_uq) != 'u')
-    failures++;
-  if (q_auth_flag_with_listener(5, a_qU) != 'U')
-    failures++;
-  if (q_auth_flag_with_listener(7, a_last) != 'u')
-    failures++;
-  if (q_auth_flag_with_listener(3, a_q) != 0)
-    failures++;
-  if (q_auth_flag_with_listener(5, a_pu) != 0)
-    failures++;
-  if (q_auth_flag_with_listener(7, a_dd) != 0)
-    failures++;
-  if (q_auth_flag_with_listener(6, a_ddq) != 0)
-    failures++;
-  if (q_auth_flag_with_listener(5, a_qval) != 0) /* "-u" is -q's value */
-    failures++;
-  if (q_auth_flag_with_listener(5, a_uval) != 0) /* "-q" is -u's value */
-    failures++;
-  if (q_auth_flag_with_listener(5, a_fval) != 0) /* "-U" is -f's value */
-    failures++;
 
   ray_poll_destroy(poll);
   ray_runtime_destroy(rt);
@@ -2302,6 +2267,153 @@ static ssize_t drain_now(int fd, uint8_t *buf, size_t cap) {
   }
 }
 
+/* Authentication must happen before a capability reply or an evaluation.
+ * Drive the server's poll between each blocking client call: both run on this
+ * thread, as in the other raw-socket selftests, so no extra runtime or Python
+ * helper can hide a handshake failure. */
+static int q_auth_login(ray_poll_t *poll, int port, const char *login,
+                        int capability) {
+  int fd = tcp_connect_local(port);
+  if (fd < 0) return 0;
+  uint8_t hello[512], reply = 0;
+  size_t n = strlen(login);
+  int ok = 0;
+  if (n + 2 <= sizeof hello) {
+    memcpy(hello, login, n);
+    hello[n] = (uint8_t)capability;
+    hello[n + 1] = 0;
+    if (send(fd, hello, n + 2, 0) == (ssize_t)(n + 2)) {
+      pump_poll(poll, 50);
+      ssize_t got = recv(fd, &reply, 1, 0);
+      ok = got == 1 && reply == (uint8_t)capability;
+    }
+  }
+  close(fd);
+  pump_poll(poll, 20);
+  return ok;
+}
+
+static int q_auth_query(ray_poll_t *poll, int port, int restricted) {
+  int fd = tcp_connect_local(port);
+  if (fd < 0) return 1;
+  const char login[] = "alice:hunter2";
+  uint8_t hello[sizeof login + 1];
+  memcpy(hello, login, sizeof login - 1);
+  hello[sizeof login - 1] = 3;
+  hello[sizeof login] = 0;
+  uint8_t reply = 0, frame[128], response[512];
+  int failed = 0;
+  if (send(fd, hello, sizeof hello, 0) != (ssize_t)sizeof hello) failed = 1;
+  pump_poll(poll, 50);
+  if (!failed && (recv(fd, &reply, 1, 0) != 1 || reply != 3)) failed = 1;
+  size_t n = str_frame(frame, "(+ 40 2)");
+  if (!failed && send(fd, frame, n, 0) != (ssize_t)n) failed = 1;
+  pump_poll(poll, 100);
+  ssize_t got = recv(fd, response, sizeof response, 0);
+  if (!failed && got < 17) failed = 1;
+  if (!failed && restricted) {
+    if (response[8] != 128 || got < 37 ||
+        memcmp(response + 9, "access: source text disabled", 28) != 0) {
+      failed = 1;
+    }
+  } else if (!failed) {
+    int64_t answer;
+    memcpy(&answer, response + 9, sizeof answer);
+    if (response[8] != 249 || answer != 42) failed = 1;
+  }
+  if (failed) fprintf(stderr, "q auth selftest: restricted=%d positive query failed\n", restricted);
+  close(fd);
+  pump_poll(poll, 20);
+  return failed;
+}
+
+static int run_q_auth_selftest(void) {
+#ifndef RAY_POLL_AUTH_API
+  /* Without the public verifier, even an embedder that fills poll itself
+   * gets refusal, not a second password implementation. */
+  ray_runtime_t *rt = ray_runtime_create(0, NULL);
+  if (!rt) return 1;
+  q_env_register();
+  ray_poll_t *poll = ray_poll_create();
+  if (!poll) {
+    ray_runtime_destroy(rt);
+    return 1;
+  }
+  ray_runtime_set_poll(poll);
+  int port = free_tcp_port();
+  memcpy(poll->auth_secret, "hunter2", 8);
+  int failures = q_serve_at(poll, "127.0.0.1", port) < 0 ||
+                 q_auth_login(poll, port, "alice:hunter2", 3);
+  ray_poll_destroy(poll);
+  ray_runtime_set_poll(NULL);
+  ray_runtime_destroy(rt);
+  q_hooks_release();
+  printf("q auth selftest: %s\n", failures ? "FAIL" : "ok");
+  return failures ? 1 : 0;
+#else
+  int failures = 0;
+  ray_runtime_t *rt = ray_runtime_create(0, NULL);
+  if (!rt) return 1;
+  q_env_register();
+  ray_poll_t *poll = ray_poll_create();
+  if (poll) ray_runtime_set_poll(poll);
+  int no_auth_port = free_tcp_port();
+  if (!poll || q_serve_at(poll, "127.0.0.1", no_auth_port) < 0 ||
+      !q_auth_login(poll, no_auth_port, "", 0)) {
+    fprintf(stderr, "q auth selftest: no-password bare NUL rejected\n");
+    failures++;
+  }
+  if (poll) ray_poll_auth_set(poll, "hunter2", false);
+  if (!poll) {
+    ray_runtime_destroy(rt);
+    return 1;
+  }
+  int port = free_tcp_port();
+  if (q_serve_at(poll, "127.0.0.1", port) < 0) {
+    ray_poll_destroy(poll);
+    ray_runtime_set_poll(NULL);
+    ray_runtime_destroy(rt);
+    return 1;
+  }
+  const struct { const char *login; int accept; } cases[] = {
+      {"alice:wrong", 0}, {"alice:", 0}, {"alice", 0}, {"", 0},
+      {"alice:hunter2", 1}, {":hunter2", 1}, {"hunter2", 1},
+  };
+  for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+    int accepted = q_auth_login(poll, port, cases[i].login, 3);
+    if (accepted != cases[i].accept) {
+      fprintf(stderr, "q auth selftest: login case %zu accepted=%d expected=%d\n",
+              i, accepted, cases[i].accept);
+      failures++;
+    }
+  }
+  failures += q_auth_query(poll, port, 0);
+  ray_poll_auth_set(poll, "hunter2", true);
+  if (!ray_poll_auth_restricted(poll)) {
+    fprintf(stderr, "q auth selftest: restricted role not selected\n");
+    failures++;
+  }
+  int restricted_port = free_tcp_port();
+  if (q_serve_at(poll, "127.0.0.1", restricted_port) < 0) {
+    failures++;
+  } else {
+    if (!q_auth_login(poll, restricted_port, "alice:wrong", 3)) {
+      /* Expected rejection. */
+    } else {
+      fprintf(stderr, "q auth selftest: restricted wrong password accepted\n");
+      failures++;
+    }
+    failures += q_auth_query(poll, restricted_port, 1);
+  }
+  ray_poll_destroy(poll);
+  ray_runtime_set_poll(NULL);
+  ray_runtime_destroy(rt);
+  q_hooks_release();
+  printf("q auth selftest: %s\n", failures ? "FAIL" : "ok");
+  return failures ? 1 : 0;
+#endif
+}
+
 /* A q server for one connection: answers the login, then copies every byte
  * it receives to `report`. `lfd` is already listening. */
 static pid_t recording_peer(int lfd, int report) {
@@ -2914,6 +3026,8 @@ int main(int argc, char **argv) {
     return run_journal_bound_selftest();
   if (argc >= 2 && strcmp(argv[1], "--q-cli-selftest") == 0)
     return run_q_cli_selftest();
+  if (argc >= 2 && strcmp(argv[1], "--q-auth-selftest") == 0)
+    return run_q_auth_selftest();
 
   if (argc >= 3 && strcmp(argv[1], "--serve-args") == 0)
     return run_server_args(argc - 1, argv + 1);
