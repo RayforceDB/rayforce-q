@@ -2328,6 +2328,29 @@ static int q_auth_query(ray_poll_t *poll, int port, int restricted) {
 }
 
 static int run_q_auth_selftest(void) {
+#ifndef RAY_POLL_AUTH_API
+  /* Without the public verifier, even an embedder that fills poll itself
+   * gets refusal, not a second password implementation. */
+  ray_runtime_t *rt = ray_runtime_create(0, NULL);
+  if (!rt) return 1;
+  q_env_register();
+  ray_poll_t *poll = ray_poll_create();
+  if (!poll) {
+    ray_runtime_destroy(rt);
+    return 1;
+  }
+  ray_runtime_set_poll(poll);
+  int port = free_tcp_port();
+  memcpy(poll->auth_secret, "hunter2", 8);
+  int failures = q_serve_at(poll, "127.0.0.1", port) < 0 ||
+                 q_auth_login(poll, port, "alice:hunter2", 3);
+  ray_poll_destroy(poll);
+  ray_runtime_set_poll(NULL);
+  ray_runtime_destroy(rt);
+  q_hooks_release();
+  printf("q auth selftest: %s\n", failures ? "FAIL" : "ok");
+  return failures ? 1 : 0;
+#else
   int failures = 0;
   ray_runtime_t *rt = ray_runtime_create(0, NULL);
   if (!rt) return 1;
@@ -2340,30 +2363,15 @@ static int run_q_auth_selftest(void) {
     fprintf(stderr, "q auth selftest: no-password bare NUL rejected\n");
     failures++;
   }
-#ifdef RAY_POLL_AUTH_API
   if (poll) ray_poll_auth_set(poll, "hunter2", false);
-#else
-  if (poll) {
-    memcpy(poll->auth_secret, "hunter2", 8);
-    poll->restricted = false;
-  }
-#endif
   if (!poll) {
     ray_runtime_destroy(rt);
     return 1;
   }
-#ifndef RAY_POLL_AUTH_API
-  if (q_serve_from_args(poll, 4,
-                        (char *[]){"rayforce", "-q", "25565", "-u"}) >= 0 ||
-      q_serve_from_args(poll, 5,
-                        (char *[]){"rayforce", "-q", "25565", "-u", "hunter2"}) >= 0) {
-    fprintf(stderr, "q auth selftest: old core accepted password request\n");
-    failures++;
-  }
-#endif
   int port = free_tcp_port();
   if (q_serve_at(poll, "127.0.0.1", port) < 0) {
     ray_poll_destroy(poll);
+    ray_runtime_set_poll(NULL);
     ray_runtime_destroy(rt);
     return 1;
   }
@@ -2380,15 +2388,11 @@ static int run_q_auth_selftest(void) {
     }
   }
   failures += q_auth_query(poll, port, 0);
-#ifdef RAY_POLL_AUTH_API
   ray_poll_auth_set(poll, "hunter2", true);
   if (!ray_poll_auth_restricted(poll)) {
     fprintf(stderr, "q auth selftest: restricted role not selected\n");
     failures++;
   }
-#else
-  poll->restricted = true;
-#endif
   int restricted_port = free_tcp_port();
   if (q_serve_at(poll, "127.0.0.1", restricted_port) < 0) {
     failures++;
@@ -2407,6 +2411,7 @@ static int run_q_auth_selftest(void) {
   q_hooks_release();
   printf("q auth selftest: %s\n", failures ? "FAIL" : "ok");
   return failures ? 1 : 0;
+#endif
 }
 
 /* A q server for one connection: answers the login, then copies every byte
