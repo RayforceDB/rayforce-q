@@ -6,6 +6,45 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
 
 ### Added
 
+- **`.q.on 'open` and `(.q.handles)` for inbound q connections.** A connection
+  accepted by the `-q` listener was invisible to scripts until its first frame:
+  `.q.on` had `'sync`, `'async` and `'close` but no `'open`, and nothing listed
+  the open connections. `(.q.on 'open fn)` runs `fn` with the handle once per
+  inbound connection, when its handshake completes and before any frame is read;
+  `(.q.handle)` is valid inside it, and an error it raises is logged, like one
+  from `'close`, without closing the connection or stopping the listener.
+  `(.q.handles)` returns a table with one row per open, established inbound
+  connection: `handle`, `queued_bytes` (bytes waiting in its outbound queue) and
+  `limit_bytes` (the queue's cap), named as in the core's `(.ipc.handle h)`, and
+  empty with the same columns when nobody is connected. It is refused for a
+  restricted peer, as `.q.post` is. The C side adds `Q_HOOK_OPEN` (so
+  `Q_HOOK_COUNT` is 4) and `q_conn_table`. Registering these connections in the
+  core's handle table, so `.ipc.handle` sees them, needs core changes and is not
+  part of this.
+- **q timespan decoded and encoded as `TIMESPAN`.** A q timespan atom (`-16`)
+  or vector (`16`) is i64 nanoseconds, the payload of the core's `TIMESPAN`,
+  so it is copied and re-tagged, and `0Nn` decodes to the null timespan (the
+  vector null gate is set as for the other i64 types). A `TIMESPAN` atom or
+  vector encodes as `-16` / `16`, in tables, dicts and lists too. Before, a
+  frame holding one was refused with `q: unsupported wire type`, and
+  `(- ts1 ts2)` on timestamps, which yields a `TIMESPAN`, could not be sent
+  or returned (`q: cannot serialize message`). This needs a core that declares
+  `RAY_TIMESPAN` (v3.0.1 and later); `q.h` detects it as `Q_HAVE_TIMESPAN`. On
+  v2.11.x the timespan code is compiled out, the v2.11.0 floor stands, and a
+  timespan is still refused with `q: unsupported wire type`.
+- **Reply-local q temporal wire kinds.** `(.q.as_kind kind value)` emits a
+  TIMESTAMP/DATE/TIME atom or vector as q `datetime`/`month`/`minute`/`second`,
+  and `(.q.with_kinds schema table)` applies an explicit `column -> kind`
+  symbol dict to a table (including a wrapper nested in a larger reply).
+  Values must be exactly representable and typed nulls keep the requested q
+  type; validation errors identify the column and row. The C equivalents are
+  `q_wrap_as_kind` and `q_wrap_with_kinds`. Wrappers are reply-local and
+  adapter-tagged, with no process-global registry or automatic `upd`/dict
+  recognition, and unwrapped replies keep the existing `p`/`d`/`t` mapping.
+  They remain normal owning LIST values and are borrowed by `q_encode`.
+  Schema matching is per-table intersection, but every requested column must
+  occur in at least one wrapped table so misspellings fail explicitly.
+
 - **Inbound q connections: handle, push, hooks.** `(.q.handle)` now also names
   an *inbound* connection while its frame is being handled (it was outbound
   only). `(.q.post h msg)` sends `msg` as a q ASYNC frame on any open q
@@ -26,9 +65,33 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
   (`q_hooks_release()` for a runtime destroyed without a poll), and
   `q_env_register()` drops what an earlier runtime left: a hook no longer
   outlives its runtime.
+- **`.q.readonly`: an allow-list of read-only q requests that are not
+  journaled.** With a WAL open every sync q request is journaled before it is
+  evaluated, polls included (200 one-argument `get_seq` calls added 12 800
+  bytes, and replay re-runs them). The write has to precede the evaluation, so
+  it cannot be skipped afterwards; `(.q.readonly ['get_seq 'app.status])`
+  declares the heads of pure reads up front. A sync request whose head is
+  listed (call list, all-symbol call vector, or a string that is one form
+  headed by the name) is dispatched as before, hooks included, and not written.
+  `(.q.readonly)` returns the list, an empty vector clears it. The embedder
+  promises the heads are reads: a mutation under one is lost on replay, and
+  only the head is examined (a nested call is not). Default empty (unchanged
+  behaviour), process-wide, not persisted: set it at load time. In C:
+  `q_readonly_set`, `q_readonly_get`, `q_readonly_forget`. The names are
+  read through the vector's own symbol domain, so a column loaded from a
+  splayed table (or a slice of one) installs the names it holds. `{` and `}`
+  end a head like `(` does: `(get_seq{})` is recognised.
 
 ### Changed
 
+- **`make rayforce` / `make test` accept a core commit in `RAYFORCE_REF`.**
+  `RAYFORCE_REF` was handed to `git clone --branch`, which takes a branch or a
+  tag only. A value of 40 (or 64) hex digits is now fetched at depth 1 and
+  checked out instead, so a build can be pinned to a core commit
+  (`make rayforce RAYFORCE_REF=<full hash>`). A branch or a tag is cloned as
+  before, and so is the unset case (the tip of the core's default branch). The
+  server must allow fetching a commit by hash (GitHub does).
+  `make check-core-ref` checks a branch, a tag and a hash against the network.
 - **`-q` listens on loopback by default.** The q listener bound every
   interface. `rayforce -q [HOST:]PORT` now binds `HOST` (mirroring the core's
   `--port HOST:PORT`), else `$RAYFORCE_Q_BIND_HOST`, else `127.0.0.1`; pass
@@ -38,6 +101,51 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
   `q_serve` keeps the wildcard bind for bindings.
 
 ### Fixed
+
+- **`(.sys.build)` reports the core's version, not `0.0.0`.** The core takes its
+  version from the newest `vX.Y.Z` tag of the checkout it is built in; the
+  shallow clone has no tags and `RAYFORCE_LOCAL_PATH` copies without `.git`, so
+  every `make rayforce` binary said `0.0.0`. `make rayforce` now passes the core
+  its own `RAY_VERSION` override: `RAYFORCE_REF=vX.Y.Z` gives that version, any
+  other ref (a branch or a commit) gives the newest `vX.Y.Z` tag of the core's
+  repository, as the core's own Makefile picks in a full clone, read with
+  `git ls-remote` from `RAYFORCE_GITHUB` (or from `RAYFORCE_LOCAL_PATH` when it
+  is a git checkout). `make rayforce RAY_VERSION=X.Y.Z` sets it explicitly. If no
+  tag can be read (offline, or a local copy without `.git`) the build warns and
+  the version stays `0.0.0`. The tags are read only by `make rayforce`, not by
+  `make test`, `lint` or `clean`. `make check-binary` asserts the version.
+- **A `-q` listener with a startup script no longer ends with the script.**
+  The core's `main()` keeps a process running for its own `-p` listener only,
+  so `rayforce -q 127.0.0.1:PORT script.rfl </dev/null` ran the script and
+  exited 0 unless `-i` was given, taking the listener with it. `make rayforce`
+  now patches the same conditions to count a `-q` listener too (a failed
+  startup script is fatal, a script is followed by the event loop, and with no
+  terminal and no script the process serves without a REPL), and fails the
+  build if the patch no longer applies. `make check-binary` runs
+  `test/binary.sh` against the built binary.
+- **`-u`/`-U` with `-q` now warns that the q listener is not password-protected.**
+  The passwords belong to the native IPC listener (`-p`); the q handshake
+  reads the login but never checks it, so `-q 5000 -u secret` left the port
+  open while the core help said only "set ... auth password". Startup now
+  prints one value-free line on stderr (the password is never printed) saying
+  so, and for `-U` that it still restricts q request evaluation; the help text
+  and README say the flags are native IPC only. The option scan stops at `--`
+  and skips option values, so a script argument or a `-q`/`-f` value spelled
+  `-u` does not trigger it. Authentication and the `-U` restriction are
+  unchanged; password checking on the q handshake needs a core API and is not
+  part of this change.
+- **A password with an empty username reaches the q handshake.**
+  `q_connect(..., "", "password", ...)` sized space for `:password` but copied
+  it only when the username was non-empty, silently sending the anonymous
+  `03 00` handshake instead. The client now sends the supplied tuple as
+  `:password`, followed by its capability byte and NUL.
+
+- **A hard `.q.post` send failure removes the dead handle.** When the peer had
+  already closed and the first direct send failed before writing any bytes,
+  `.q.post` reported a queue or allocation failure and left the unusable
+  connection registered. It now closes the connection and reports that the
+  post failed because the connection was lost; a recoverable zero-byte queue
+  refusal still leaves an otherwise healthy stream open.
 
 - **A frame left half written closes the connection.** With the direct send, a
   reply or `.q.post` larger than the socket buffer is written in part and its

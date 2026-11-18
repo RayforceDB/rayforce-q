@@ -41,6 +41,18 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Q_HAVE_TIMESPAN: 1 when the core's public header declares RAY_TIMESPAN
+ * (core v3.0.1 and later), else 0. RAY_TIMESPAN is a #define there, so it is
+ * detected directly. On a core without it (v2.11.x) q timespans stay rejected
+ * as an unsupported wire type, and no numeric tag is invented. */
+#ifndef Q_HAVE_TIMESPAN
+#ifdef RAY_TIMESPAN
+#define Q_HAVE_TIMESPAN 1
+#else
+#define Q_HAVE_TIMESPAN 0
+#endif
+#endif
+
 /* q_connect failure codes, returned in place of a connection fd. */
 #define Q_ERR_SOCKET (-1)    /* could not open/connect the TCP socket    */
 #define Q_ERR_HANDSHAKE (-2) /* socket connected but handshake/auth failed */
@@ -83,6 +95,16 @@ int q_close(int fd);
 int q_encode(ray_t *msg, uint8_t **req, int64_t *req_len, char *err,
              size_t errlen);
 
+/* Reply-local q temporal-kind wrappers. The returned value is a normal owning
+ * two-item LIST with adapter-private metadata, so it may be inspected/stored
+ * like a LIST but cannot be confused with an untagged application LIST.
+ * q_encode borrows it; the caller releases it like any other ray_t. Supported
+ * kinds are `datetime`, `month`, `minute`, and `second`. A table schema is a
+ * SYM->SYM dict; every schema key must match a column somewhere in the wrapped
+ * table collection. */
+ray_t *q_wrap_as_kind(ray_t *kind, ray_t *value);
+ray_t *q_wrap_with_kinds(ray_t *schema, ray_t *value);
+
 /* Send a pre-encoded request on `fd` and read the raw response body. A
  * transport or framing failure shuts down the socket because the request or
  * response boundary may be out of sync; the caller still owns and must close
@@ -100,7 +122,7 @@ ray_t *q_decode(uint8_t *resp, int64_t resp_len, int compressed, char *err,
 /* As q_decode, but a table comes back with only the named columns, in the
  * order named (as q's cols#t). The other columns are skipped by their
  * serialized length: not allocated, not interned, and not checked beyond
- * their length, so a column q_decode rejects (a timespan) can be skipped. For
+ * their length, so a column q_decode rejects can be skipped. For
  * a keyed table the key columns always come back and the names pick among
  * the value columns; naming a key column is allowed and changes nothing. A
  * name the table lacks is a RAY_ERROR naming it. A NULL or repeated name

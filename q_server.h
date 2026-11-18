@@ -49,7 +49,10 @@
 #include <stdint.h>
 
 /* Register a Q-protocol listener on `poll`, bound to TCP `port`. Returns the
- * poll selector id (>= 0) on success, or -1 on failure */
+ * poll selector id (>= 0) on success, or -1 on failure. If the poll was put in
+ * restricted mode with ray_poll_set_restricted(), each accepted connection
+ * rejects source-text requests and evaluates expression lists with the core's
+ * restricted builtins disabled. */
 int64_t q_serve(ray_poll_t *poll, int port);
 
 /* Whether a serialized request of `size` bytes may be journaled: the core's
@@ -77,7 +80,11 @@ int64_t q_serve_at(ray_poll_t *poll, const char *host, int port);
  * rx machine. Returns a poll selector id (>= 0) — the handle for the calls
  * below — or -1. The fd is owned by the poll from here on; do not q_close it.
  * The socket's recv timeout (what q_connect's timeout_ms set) is read here
- * and becomes q_conn_send's round-trip budget; none = wait indefinitely.
+ * and becomes q_conn_send's round-trip budget; none = wait indefinitely. A
+ * poll put in restricted mode makes peer-pushed source text fail and applies
+ * the core's restricted evaluator to pushed expression lists. A `.q.on` hook
+ * is trusted embedder code and runs outside that evaluator, with the decoded
+ * request passed as data.
  */
 int64_t q_conn_attach(ray_poll_t *poll, int fd);
 
@@ -106,6 +113,14 @@ ray_t *q_conn_post(ray_poll_t *poll, int64_t id, ray_t *msg);
 /* Check whether `id` identifies an open Q connection owned by this module. */
 int q_conn_is_handle(ray_poll_t *poll, int64_t id);
 
+/* A table, one row per open established inbound connection (a connection
+ * whose handshake has not finished, an attached outbound one and one being
+ * torn down are not listed): `handle` (the id q_conn_current gives for it),
+ * `queued_bytes` (bytes still waiting in its outbound queue) and
+ * `limit_bytes` (the most the queue may hold), all I64. Empty, with the same
+ * columns, when there are none. Returns an owned table or error. */
+ray_t *q_conn_table(ray_poll_t *poll);
+
 /* The connection (inbound or attached) whose frame, or close, is being
  * handled right now: valid inside a handler such a frame called and inside
  * the hooks below, -1 everywhere else. */
@@ -122,7 +137,10 @@ int64_t q_conn_current(void);
  *          logged.
  *   CLOSE  called with the handle once per established inbound connection,
  *          just before teardown; errors are logged and swallowed.
- * q_conn_current() is the connection inside all three. Returns 0, or -1 for
+ *   OPEN   called with the handle once per inbound connection, when its
+ *          handshake completes and before any frame is read; errors are
+ *          logged and swallowed, the connection stays open.
+ * q_conn_current() is the connection inside all four. Returns 0, or -1 for
  * an unknown hook. The lambda is retained; a hook outlives neither its
  * runtime nor a q_hook_set that replaces it.
  *
@@ -133,11 +151,42 @@ int64_t q_conn_current(void);
  * q_hooks_release() before ray_runtime_destroy(). q_env_register() (call it
  * for every new runtime) drops, without releasing, what an earlier runtime
  * left in the slots. */
-enum { Q_HOOK_SYNC = 0, Q_HOOK_ASYNC = 1, Q_HOOK_CLOSE = 2, Q_HOOK_COUNT = 3 };
+enum {
+  Q_HOOK_SYNC = 0,
+  Q_HOOK_ASYNC = 1,
+  Q_HOOK_CLOSE = 2,
+  Q_HOOK_OPEN = 3,
+  Q_HOOK_COUNT = 4
+};
 int q_hook_set(int which, ray_t *fn);
 int q_hook_installed(int which); /* 1 when the hook is set */
 void q_hooks_release(void);      /* release every hook, heap still alive */
 void q_hooks_forget(void);       /* drop the slots, their heap is gone */
+
+/* ===== Read-only allow-list =====
+ *
+ * With a WAL open, every sync q request is journaled before it is evaluated.
+ * A request that only reads (`get_seq`, a status call, a health probe) then
+ * grows the log on every poll and is re-run on replay. The write precedes the
+ * evaluation, so it cannot be dropped afterwards; the embedder declares the
+ * pure reads up front instead.
+ *
+ * q_readonly_set takes a RAY_SYM vector of head symbols (any empty vector or
+ * list, or NULL, clears) and replaces the process-wide list; -1 (nothing
+ * changed) for any other type. A sync request is not journaled when it is a
+ * call list or an all-symbol call vector whose head is in the list, or a
+ * string that is ONE form headed by a listed name; it is dispatched exactly as
+ * before (hooks included). Calls nested inside it are not examined.
+ *
+ * The embedder promises these heads are pure reads: a mutation under a listed
+ * head is not journaled and is lost on replay, by design. The list is empty by
+ * default (today's behaviour), not persisted, and process-wide: set it at load
+ * time, before the listener opens, like the hooks. q_readonly_get returns it
+ * as an owned symbol vector. q_readonly_forget drops it (q_env_register does
+ * this for a new runtime). */
+int q_readonly_set(ray_t *syms);
+ray_t *q_readonly_get(void);
+void q_readonly_forget(void);
 
 /* `.q.dispatch_sync`: the sync request `req` (borrowed) answered by the
  * installed sync hook, or by the default evaluation when there is none. A sync

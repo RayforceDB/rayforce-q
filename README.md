@@ -46,6 +46,10 @@ The server is exposed via the `-q PORT` flag — it shares the REPL's event loop
 RAYFORCE_Q_BIND_HOST=10.0.0.5 ./rayforce -q 25565   # env fallback when -q has no host
 ```
 
+Like `-p`, a `-q` listener keeps the process running after a startup script (`./rayforce -q 25565 init.rfl`); a startup script that fails is fatal (exit 1) unless `-i` is given, and with no script and no terminal the process serves without a REPL.
+
+**The q listener does not authenticate.** `-u PW` / `-U PW` set the password of the native IPC listener (`-p`) only; the q handshake accepts any login, so every client that can reach a `-q` port may connect, whatever `-u`/`-U` say. `-U` still does what it says for evaluation: q requests run in the restricted mode. Starting with `-q` and `-u`/`-U` prints a one-line warning on stderr (never the password); mixed `-p` + `-q` deployments are unchanged. Keep the q port on loopback (the default) or behind your own network controls.
+
 An empty (or whitespace-only) request answers `(::)`, like kdb's `h ""`. An error's text travels with its category, so q sees `'domain: custom failure`. With a journal open (`.log.open`, `-l`/`-L`) every inbound **sync** q frame is journaled before it is evaluated, exactly as the core does for native IPC, and a failed journal write refuses the request with an `io` error; async frames are not journaled.
 
 **Inbound connections** get the same handle, push and hook verbs as outbound ones, enough for a kdb-compatible pub/sub server:
@@ -56,7 +60,9 @@ An empty (or whitespace-only) request answers `(::)`, like kdb's `h ""`. An erro
 ;;                     queued, never waits; null on success, `handle`/`io` errors otherwise
 ;; (.q.on 'sync  fn)   hook: gets the decoded request, REPLACES the default eval, its value is the reply
 ;; (.q.on 'async fn)   hook: gets the request, no reply
+;; (.q.on 'open fn)    hook: gets the handle, once per inbound connection, when its handshake completes
 ;; (.q.on 'close fn)   hook: gets the handle, once per inbound connection, just before teardown
+;; (.q.handles)        table of the open inbound connections: handle, queued_bytes, limit_bytes
 ;; (.q.on 'sync 0)     any non-lambda clears the hook
 (.q.on 'sync (fn [r]
   (if (== (first r) '.net.sub)               ;; q: h(`.net.sub;5) -- a name the default eval could not call
@@ -65,9 +71,40 @@ An empty (or whitespace-only) request answers `(::)`, like kdb's `h ""`. An erro
 (.q.post (first subs) (list 'upd (dict ['a 'b] [1 2])))   ;; q client receives (`upd;`a`b!1 2) async
 ```
 
-`.q.on.*` cannot be `set` from Rayfall (dotted names are reserved), hence the verb; semantics mirror the core's `.ipc.on.*`. A char-vector request reaches the sync/async hook as an unparsed string (`(eval (parse r))` reproduces the default), a hook error is encoded to the client (sync) or logged (async, close). `(.q.handle)` is valid inside all three hooks. Hooks are process-global and live as long as the runtime: `ray_poll_destroy` releases them after the open connections' close hooks have run, a runtime destroyed without a poll needs `q_hooks_release()` first, and `q_env_register()` (once per runtime) drops what an earlier runtime left.
+Rayforce stores q's legacy temporal kinds in the nearest engine type (`z` as
+TIMESTAMP, `m` as DATE, and `u`/`v` as TIME), so replies normally use q
+`p`/`d`/`t`. Reply-local wrappers select the narrower q wire kind explicitly
+without changing the stored value or any unrelated send:
+
+```clojure
+(.q.as_kind 'datetime 2026.07.10D09:30:00.123000000) ; q -15h (`z`)
+(.q.with_kinds
+  (dict ['time 'expiry] ['datetime 'month])
+  trades)                                               ; per-column q kinds
+```
+
+Supported kinds are `'datetime`, `'month`, `'minute`, and `'second`. Values
+must be exactly representable: datetime rejects sub-millisecond timestamps,
+month requires the first day, and minute/second require an in-range whole
+unit. Typed nulls keep the requested q kind. The wrapper may appear inside a
+larger reply such as ``(list 'upd 'trade wrapped-table)`` and is recognized
+only for that encoding; without one the existing `p`/`d`/`t` mapping is
+unchanged. Internally it remains a normal owning two-item LIST, so Rayfall may
+inspect or store it; private adapter metadata, not its LIST shape, makes it an
+encoding directive. Encoding borrows the wrapper and does not consume it.
+
+For a collection of heterogeneous tables, each table applies the intersection
+of its columns and the supplied schema. Every schema name must nevertheless
+match at least one table in that collection, so a misspelled column fails the
+encode instead of silently using the default wire kind everywhere.
+
+`.q.on.*` cannot be `set` from Rayfall (dotted names are reserved), hence the verb; semantics mirror the core's `.ipc.on.*`. A char-vector request reaches the sync/async hook as an unparsed string (`(eval (parse r))` reproduces the default), a hook error is encoded to the client (sync) or logged (async, open, close). `(.q.handle)` is valid inside all four hooks. Hooks are process-global and live as long as the runtime: `ray_poll_destroy` releases them after the open connections' close hooks have run, a runtime destroyed without a poll needs `q_hooks_release()` first, and `q_env_register()` (once per runtime) drops what an earlier runtime left.
+
+**Seeing the connections.** `'open` fires when the login handshake of an inbound connection completes, before any frame of it is read, so a script learns of a peer that has connected but not yet sent anything; its `(.q.handle)` is the value every later hook and frame of that connection sees. An error raised by the hook is logged and does not close the connection or stop the listener (as for `'close`). `(.q.handles)` returns one row per open, established inbound q connection (a login in progress, a connection being closed, and connections made with `.q.connect` are not listed), with the columns of the core's `(.ipc.handle h)` that mean the same thing: `handle` (what `(.q.handle)` yields for it), `queued_bytes` (bytes of `.q.post`ed or reply frames the socket has not taken yet) and `limit_bytes` (the cap on that queue, 256 MiB), all i64; with no connection it is an empty table with the same columns. Like `.q.post`, whose handles it lists, it is refused for a restricted (`-U`) peer; hooks and the embedding script can call it.
 
 **Hooks and the WAL.** With a sync hook installed, a sync request that is journaled is recorded as `(.q.dispatch_sync (quote <request>))`; `.q.dispatch_sync` applies the sync hook installed at that moment, or evaluates by default when there is none. A replay therefore reproduces the live run if the application installs its hooks (`.q.on`) before `.log.replay`, which is the natural order, since it loads its code first; a replay without the hook evaluates the requests by default.
+
+**Read-only requests are not journaled.** `(.q.readonly ['get_seq 'app.status])` declares request heads that are pure reads: a sync request whose head is listed (a call list, an all-symbol call vector, or a string that is one form) is dispatched as usual but not written to the WAL, so polls do not grow the log or replay. The embedder promises the heads are reads (a mutation under one is lost on replay), only the head is examined (nested calls are not), the default is the empty list, and it is process-wide and not persisted, so set it at load time. `(.q.readonly)` returns it; an empty vector clears it. Details in [docs/INTEGRATING.md](docs/INTEGRATING.md).
 
 A Q listener evaluates what it is sent, so it binds **loopback by default**. The address comes from `-q HOST:PORT` (mirroring the core's `--port HOST:PORT`), else `RAYFORCE_Q_BIND_HOST`, else `127.0.0.1`; use `0.0.0.0` for the old all-interfaces behaviour. `HOST` must be an IPv4 address.
 
@@ -132,8 +169,17 @@ int64_t q_serve_at(ray_poll_t *poll, const char *host, int port);  /* one IPv4 a
 
 /* Push, hooks (see the Rayfall verbs above). */
 ray_t  *q_conn_post(ray_poll_t *poll, int64_t id, ray_t *msg);  /* async frame; NULL or error */
-int     q_hook_set(int which, ray_t *fn);   /* Q_HOOK_SYNC / _ASYNC / _CLOSE; non-lambda clears */
+int     q_hook_set(int which, ray_t *fn);   /* Q_HOOK_SYNC / _ASYNC / _CLOSE / _OPEN; non-lambda clears */
+ray_t  *q_conn_table(ray_poll_t *poll);  /* open inbound connections: handle, queued_bytes, limit_bytes */
 void    q_hooks_release(void);              /* release every hook; heap still alive */
 ```
+
+For an untrusted Q peer, call `ray_poll_set_restricted(poll, true)` before
+`q_serve` or `q_conn_attach`. Each connection snapshots that setting: pushed
+source strings are rejected, and expression lists cannot call builtins marked
+`RAY_FN_RESTRICTED`. A handler installed locally with `.q.on` remains trusted
+and receives the decoded request as data, so it can validate and persist an
+allowed update. This is an evaluation boundary, not authentication or
+transport encryption.
 
 A connected Q client (real Q `hopen`, or `q_connect`) sends a char-vector. The server evaluates it as **Rayfall** against the embedded runtime and returns the result Q-encoded.

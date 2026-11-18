@@ -244,11 +244,22 @@ static ray_t *qb_post(ray_t *handle, ray_t *msg) {
   return err ? err : RAY_NULL_OBJ;
 }
 
-/* (.q.on 'sync|'async|'close fn) -> null. Registers (or, for a non-lambda,
- * clears) the hook for inbound q frames; see q_server.h. */
+/* (.q.handles) -> a table of the open inbound q connections: handle,
+ * queued_bytes, limit_bytes. Restricted, like .q.post: the handles it lists
+ * are the means to post to other peers. */
+static ray_t *qb_handles(ray_t **args, int64_t n) {
+  (void)args;
+  if (n != 0)
+    return ray_error("arity", ".q.handles takes no arguments");
+  return q_conn_table(q_poll());
+}
+
+/* (.q.on 'sync|'async|'close|'open fn) -> null. Registers (or, for a
+ * non-lambda, clears) the hook for inbound q frames; see q_server.h. */
 static ray_t *qb_on(ray_t *kind, ray_t *fn) {
   if (kind == NULL || kind->type != -RAY_SYM)
-    return ray_error("type", ".q.on: hook must be 'sync, 'async or 'close");
+    return ray_error("type",
+                     ".q.on: hook must be 'sync, 'async, 'close or 'open");
   ray_t *name = ray_sym_str(kind->i64); /* borrowed */
   const char *s = name ? ray_str_ptr(name) : NULL;
   size_t n = name ? ray_str_len(name) : 0;
@@ -260,9 +271,12 @@ static ray_t *qb_on(ray_t *kind, ray_t *fn) {
       which = Q_HOOK_ASYNC;
     else if (n == 5 && memcmp(s, "close", 5) == 0)
       which = Q_HOOK_CLOSE;
+    else if (n == 4 && memcmp(s, "open", 4) == 0)
+      which = Q_HOOK_OPEN;
   }
   if (which < 0)
-    return ray_error("domain", ".q.on: hook must be 'sync, 'async or 'close");
+    return ray_error("domain",
+                     ".q.on: hook must be 'sync, 'async, 'close or 'open");
   q_hook_set(which, fn);
   return RAY_NULL_OBJ;
 }
@@ -271,6 +285,32 @@ static ray_t *qb_on(ray_t *kind, ray_t *fn) {
  * hook's value, or the default evaluation without one. The journal records a
  * hooked request as a call of this, so a replay re-runs the hook. */
 static ray_t *qb_dispatch_sync(ray_t *req) { return q_dispatch_sync(req); }
+
+/* (.q.as_kind 'datetime value) -> a reply-local q wire-kind wrapper. */
+static ray_t *qb_as_kind(ray_t *kind, ray_t *value) {
+  return q_wrap_as_kind(kind, value);
+}
+
+/* (.q.with_kinds schema table) -> a reply-local per-column wrapper. */
+static ray_t *qb_with_kinds(ray_t *schema, ray_t *value) {
+  return q_wrap_with_kinds(schema, value);
+}
+
+/* (.q.readonly) -> the allow-list of read-only request heads (a symbol vector);
+ * (.q.readonly syms) sets it and returns it, an empty vector clears; see
+ * q_server.h. */
+static ray_t *qb_readonly(ray_t **args, int64_t n) {
+  if (n > 1)
+    return ray_error("arity", ".q.readonly takes zero or one argument");
+  if (n == 1) {
+    ray_t *a = args[0];
+    int ok = a != NULL && !RAY_IS_ERR(a) &&
+             (a->type == RAY_SYM || (a->type >= 0 && ray_len(a) == 0));
+    if (!ok || q_readonly_set(a) != 0)
+      return ray_error("type", ".q.readonly: expected a symbol vector");
+  }
+  return q_readonly_get();
+}
 
 /* Bind a builtin under its reserved-namespace name (`.q.*`): ray_env_bind
  * builds the namespace dict, ray_env_bind_flat registers the flat name for REPL
@@ -287,6 +327,7 @@ void q_env_register(void) {
 
   /* A runtime that is gone took its hooks' heap with it. */
   q_hooks_forget();
+  q_readonly_forget();
 
   f = ray_fn_vary(".q.connect", RAY_FN_RESTRICTED, qb_connect);
   q_bind(".q.connect", f);
@@ -304,6 +345,10 @@ void q_env_register(void) {
   q_bind(".q.handle", f);
   ray_release(f);
 
+  f = ray_fn_vary(".q.handles", RAY_FN_RESTRICTED, qb_handles);
+  q_bind(".q.handles", f);
+  ray_release(f);
+
   f = ray_fn_binary(".q.post", RAY_FN_RESTRICTED, qb_post);
   q_bind(".q.post", f);
   ray_release(f);
@@ -312,9 +357,81 @@ void q_env_register(void) {
   q_bind(".q.on", f);
   ray_release(f);
 
+  f = ray_fn_vary(".q.readonly", RAY_FN_RESTRICTED, qb_readonly);
+  q_bind(".q.readonly", f);
+  ray_release(f);
+
   f = ray_fn_unary(".q.dispatch_sync", RAY_FN_NONE, qb_dispatch_sync);
   q_bind(".q.dispatch_sync", f);
   ray_release(f);
+
+  f = ray_fn_binary(".q.as_kind", RAY_FN_NONE, qb_as_kind);
+  q_bind(".q.as_kind", f);
+  ray_release(f);
+
+  f = ray_fn_binary(".q.with_kinds", RAY_FN_NONE, qb_with_kinds);
+  q_bind(".q.with_kinds", f);
+  ray_release(f);
+}
+
+/* Whether `-q` started a listener. The core's main() keeps a process alive
+ * for its own `-p` listener only; the patched main() asks this too, so a
+ * process serving Q is not taken for a one-shot script. */
+static int q_listening;
+int q_serve_active(void) { return q_listening; }
+
+/* Which core options take a value, mirrored from the core's main() option
+ * table (src/app/main.c): the value is the next argv word, whatever it
+ * looks like, so a "-u" in value position is data, not the flag. `-q` /
+ * `--q-serve` is rayforce-q's own and takes one too. */
+static int q_opt_takes_value(const char *a) {
+  static const char *const with_value[] = {
+      "-p",         "--port", "-c",     "--cores",   "-t", "--timeit", "-Q",
+      "--querylog", "-f",     "--file", "-u",        "-U", "-l",       "-L",
+      "-m",         "--mem",  "-q",     "--q-serve", NULL};
+  for (int k = 0; with_value[k] != NULL; k++)
+    if (strcmp(a, with_value[k]) == 0)
+      return 1;
+  return 0;
+}
+
+/* Whether the command line combines a q listener with a native-IPC
+ * password: 0 when it does not, else 'u' or 'U' for the password flag that
+ * wins (the core keeps the last one). Words after `--` belong to the
+ * script, and an option's value is skipped, so neither can be mistaken for
+ * a flag. Pure: it reads argv and prints nothing, so the password value is
+ * never touched. */
+int q_auth_flag_with_listener(int argc, char **argv) {
+  int listener = 0, flag = 0;
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--") == 0)
+      break;
+    if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--q-serve") == 0)
+      listener = 1;
+    else if (strcmp(argv[i], "-u") == 0)
+      flag = 'u';
+    else if (strcmp(argv[i], "-U") == 0)
+      flag = 'U';
+    if (q_opt_takes_value(argv[i]))
+      i++;
+  }
+  return listener ? flag : 0;
+}
+
+/* One value-free line on stderr: the q listener never checks the -u/-U
+ * password (native IPC, -p, does), but -U still restricts what q requests
+ * may evaluate. */
+static void q_warn_listener_auth(int flag) {
+  if (flag == 'U')
+    fprintf(stderr,
+            "q: warning: -U does not password-protect the q listener: the "
+            "password applies to native IPC (-p) only, any q client can "
+            "connect; -U still restricts what q requests may evaluate\n");
+  else if (flag == 'u')
+    fprintf(stderr,
+            "q: warning: -u does not password-protect the q listener: the "
+            "password applies to native IPC (-p) only, any q client can "
+            "connect\n");
 }
 
 /* Folded entry point, called from the rayforce binary's main().
@@ -359,7 +476,11 @@ int64_t q_serve_from_args(ray_poll_t *poll, int argc, char **argv) {
         bind_host = getenv("RAYFORCE_Q_BIND_HOST");
       if (bind_host == NULL || *bind_host == '\0')
         bind_host = "127.0.0.1";
-      return q_serve_at(poll, bind_host, port);
+      int64_t id = q_serve_at(poll, bind_host, port);
+      q_listening = id >= 0;
+      if (id >= 0)
+        q_warn_listener_auth(q_auth_flag_with_listener(argc, argv));
+      return id;
     }
   }
   return 0;
