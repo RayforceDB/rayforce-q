@@ -2,7 +2,7 @@
 
 All notable changes to `rayforce-q` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/), and the project adheres to [Semantic Versioning](https://semver.org/). Bindings pin a tag, so each release is a stable point they can build against.
 
-## [Unreleased]
+## [2.7.0]
 
 Needs rayforce core v2.11.0 or later, as before. Some features need a newer
 core and are compiled out or refused on an older one: q timespan and the
