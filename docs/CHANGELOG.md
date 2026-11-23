@@ -4,6 +4,16 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+Needs rayforce core v2.11.0 or later, as before. Some features need a newer
+core and are compiled out or refused on an older one: q timespan and the
+raised-error text need v3.0.1 or later; journaling inbound q sync requests
+needs `ray_ipc_set_auto_journal_eval` (absent in v2.11.x, where a journaled q
+request is refused); and `-q` with `-u`/`-U` needs `RAY_POLL_AUTH_API` (core
+#1215, `028e7d7a`), which is on core `master` but in no core release yet,
+v3.0.2 included. Built and tested (`make test` with a real q) against core
+v2.11.5 (`5d5f47c2`), v3.0.2 (`d5a44cdb`) and `master` at `57841b0b`, and
+`make check-binary` passes for a binary built against that `master`.
+
 ### Added
 
 - **`.q.on 'open` and `(.q.handles)` for inbound q connections.** A connection
@@ -123,17 +133,37 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
   terminal and no script the process serves without a REPL), and fails the
   build if the patch no longer applies. `make check-binary` runs
   `test/binary.sh` against the built binary.
-- **`-u`/`-U` with `-q` now warns that the q listener is not password-protected.**
-  The passwords belong to the native IPC listener (`-p`); the q handshake
-  reads the login but never checks it, so `-q 5000 -u secret` left the port
-  open while the core help said only "set ... auth password". Startup now
-  prints one value-free line on stderr (the password is never printed) saying
-  so, and for `-U` that it still restricts q request evaluation; the help text
-  and README say the flags are native IPC only. The option scan stops at `--`
-  and skips option values, so a script argument or a `-q`/`-f` value spelled
-  `-u` does not trigger it. Authentication and the `-U` restriction are
-  unchanged; password checking on the q handshake needs a core API and is not
-  part of this change.
+- **`-u`/`-U` protect the `-q` listener.** The q handshake read the login but
+  never checked it, so `rayforce -q 5000 -u secret` protected native IPC
+  (`-p`) and left the q port open to any login. The q listener now checks the
+  login with the core's own verifier, `ray_poll_auth_check`, as native IPC
+  does: `user:password`, `:password` and a bare `password` are accepted, and a
+  wrong, empty or missing password closes the connection with no capability
+  byte, before the `'open` hook runs. The username is not an authorization
+  identity, as on native IPC. Without `-u`/`-U` the q listener is still
+  unauthenticated. **Behaviour change** for q clients that connected to a
+  password-protected process without the password. This needs a core with
+  `RAY_POLL_AUTH_API`. On an older core `rayforce -q` with `-u`/`-U` refuses
+  to start (`q: -u/-U with -q needs a core with RAY_POLL_AUTH_API`), and a
+  poll with a password set refuses every q login, rather than serving a port
+  that ignores its password.
+- **`-U` restricts evaluation on q connections.** The q listener never turned
+  on the core's restricted evaluator for its frames, so a q peer of a `-U`
+  process (or of a poll set with `ray_poll_set_restricted`) could call `set`,
+  `.q.connect` and the other builtins marked `RAY_FN_RESTRICTED`. Each inbound
+  and attached (`q_conn_attach`) connection now takes the poll's restricted
+  setting when it is created and evaluates its frames under it: a call list
+  cannot reach a restricted builtin (`access` error), and a string request,
+  being source text, is refused with `access` before any hook sees it or the
+  WAL records it. A `.q.on` hook is embedder code and runs unrestricted, with
+  the decoded request as data, so it can validate and store an allowed update.
+  **Behaviour change** for q clients of a `-U` process that sent strings
+  (`h "(+ 1 2)"`): send a call list (`` h (`count;1 2 3) ``) instead.
+- **q tables with string columns decode.** q has no string vector: a text
+  column is a list of char vectors (`([] b:("x";"yy"))`) or, when every cell
+  is one character, one char vector (`([] b:"xy")`). Both shapes were decoded
+  as they are outside a table, a list of strings or a single string, neither
+  of which is a valid table column. They now decode to a `STR` column.
 - **A password with an empty username reaches the q handshake.**
   `q_connect(..., "", "password", ...)` sized space for `:password` but copied
   it only when the username was non-empty, silently sending the anonymous
@@ -172,19 +202,24 @@ All notable changes to `rayforce-q` are documented here. The format follows [Kee
   payload is above the 256 MiB the core's replay accepts is refused with a
   `limit` error before it is written or evaluated. With a core that provides
   `ray_ipc_set_auto_journal_eval`, the eval runs in the core's auto-journal
-  scope and a nested `.log.write` is refused, as for a native frame.
+  scope and a nested `.log.write` is refused, as for a native frame. A core
+  without it (v2.11.x) cannot set that scope, so there a request that would be
+  journaled is refused with a `domain` error before it is written or
+  evaluated.
 
 - **Error text reaches the q client.** A server-side `(raise "custom failure")`
   arrived as `'domain` and `(undefined_fn 1)` as `'name`: only the category was
-  encoded. The error frame now reads `category: message` (the message alone
-  when it already starts with the category), so q sees
-  `'domain: custom failure`; an error with no message is still the bare
-  category. The text of an uncaught `raise` is taken from the pending raised
-  value, as the REPL prints it.
-  The core floor stays v2.11.0: `ray_raise_clear`/`ray_raise_render` (v3.0.1, absent in v2.11.x)
-  are weak references, so on v2.11.x an uncaught `raise` is the bare category.
-  Built and tested (`make test` with a real q) against v2.11.5 (`5d5f47c2`) and
-  the pinned dev core.
+  encoded. An engine error now reads `category: message` (the message alone
+  when it already starts with the category), such as
+  `'type: cannot add i64 and str`; an error with no message is still the bare
+  category. An uncaught `raise` sends the raised value, rendered as the REPL
+  prints it, as the whole text with no category, as kdb+ does:
+  `(raise "custom failure")` arrives as `'custom failure` and `(raise 'TIME)`
+  as `'TIME`, from a called function or a sync hook alike. A raised value
+  belongs to its request: a decode or journal failure, or the next request,
+  never reports an earlier raise. `ray_raise_clear`/`ray_raise_render` (core
+  v3.0.1, absent in v2.11.x) are weak references, so on v2.11.x an uncaught
+  `raise` is still the bare category, and the v2.11.0 floor stands.
 
 - **An empty request returns `(::)`, not `parse`.** q `h ""` (and a
   whitespace-only string) is the ping/flush kdb tools and feeds use; the

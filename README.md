@@ -50,7 +50,7 @@ Like `-p`, a `-q` listener keeps the process running after a startup script (`./
 
 With `-u PW` or `-U PW`, both the q listener and native IPC require the password from the login (`user:password`, or just `password`). A wrong or missing password closes the q handshake without a capability reply. The username is not an authorization identity, matching native IPC. Without a password flag, the q listener remains unauthenticated. `-U` additionally restricts evaluation on that connection; it is not a substitute for a password or transport security. Keep the q port on loopback (the default) or behind your own network controls.
 
-An empty (or whitespace-only) request answers `(::)`, like kdb's `h ""`. An error's text travels with its category, so q sees `'domain: custom failure`. With a journal open (`.log.open`, `-l`/`-L`) every inbound **sync** q frame is journaled before it is evaluated, exactly as the core does for native IPC, and a failed journal write refuses the request with an `io` error; async frames are not journaled.
+An empty (or whitespace-only) request answers `(::)`, like kdb's `h ""`. An engine error's text travels with its category (`'type: cannot add i64 and str`); an uncaught `(raise x)` arrives as the raised value alone, as in kdb+, so `(raise "custom failure")` is `'custom failure`. With a journal open (`.log.open`, `-l`/`-L`) every inbound **sync** q frame is journaled before it is evaluated, exactly as the core does for native IPC, and a failed journal write refuses the request with an `io` error; async frames are not journaled.
 
 **Inbound connections** get the same handle, push and hook verbs as outbound ones, enough for a kdb-compatible pub/sub server:
 
